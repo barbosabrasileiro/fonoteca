@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Fonoteca
+GenericName=Player de música
+Comment=Uma biblioteca musical para descobrir, organizar e ouvir música
+Exec=python3 /CAMINHO/PARA/fonoteca.py
+Icon=fonoteca
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupWMClass=fonoteca
+Keywords=música;player;letras;playlist;
