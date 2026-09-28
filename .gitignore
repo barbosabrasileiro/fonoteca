@@ -1,0 +1,5 @@
+# Arquivos gerados pelo instalador quando ele é usado dentro do próprio clone
+fonoteca.sh
+fonoteca-instalador.sh
+*.bak
+__pycache__/
