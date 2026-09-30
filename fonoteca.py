@@ -49,7 +49,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -531,6 +531,7 @@ class MusicPlayerApp(Gtk.Window):
 
         self.set_default_size(self.config.get("win_w", 1040), self.config.get("win_h", 720))
         self.set_position(Gtk.WindowPosition.CENTER)
+        self.maximize()  # sempre abre maximizado (não é tela cheia); o tamanho acima vale ao restaurar
 
         header = Gtk.HeaderBar()
         header.set_show_close_button(True)
@@ -778,6 +779,7 @@ class MusicPlayerApp(Gtk.Window):
         self.render_playlists()
         self.render_history()
         self.render_favorites()
+        self._select_nav("home")  # destaca "Início" na barra lateral
 
         threading.Thread(target=self._check_ytdlp_update, daemon=True).start()
         GLib.timeout_add(700, self._show_welcome)
@@ -949,6 +951,10 @@ class MusicPlayerApp(Gtk.Window):
         self._build_tab_offline()
         self._build_tab_history()
         self._build_tab_about()
+        # Abre sempre no Início: a aba Offline chama show_all() ao ser criada e, por ser a primeira página
+        # visível do Stack, virava a página inicial. O filho precisa estar visível para ser selecionado.
+        self.home_scroll.show_all()
+        self.main_stack.set_visible_child_name("home")
         center.pack_start(self.main_stack, True, True, 0)
         body.pack_start(center, True, True, 0)
 
@@ -1158,6 +1164,7 @@ class MusicPlayerApp(Gtk.Window):
     # ---------- Início (vitrines estilo Spotify) ----------
     def _build_page_home(self):
         scroll = Gtk.ScrolledWindow()
+        self.home_scroll = scroll
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=22)
         page.set_border_width(20)
@@ -2305,6 +2312,12 @@ class MusicPlayerApp(Gtk.Window):
             del self._nav_history[:-30]
         self.main_stack.set_visible_child_name(name)
         self._after_nav(name)
+        if name == "home":
+            self._home_scroll_top()
+
+    def _home_scroll_top(self):
+        adj = self.home_scroll.get_vadjustment()
+        adj.set_value(adj.get_lower())
 
     def go_back(self, button=None):
         if not self._nav_history:
@@ -4994,47 +5007,64 @@ class MusicPlayerApp(Gtk.Window):
         if not path:
             return
 
-        url = f"https://www.youtube.com/watch?v={item['id']}"
         self.progress_download.set_fraction(0.0)
-        self.progress_download.set_text("Iniciando download...")
         self.progress_download.show()
-        threading.Thread(target=self._download_thread, args=(url, path), daemon=True).start()
+        self._download_pulse("Conectando ao YouTube...")
+        threading.Thread(target=self._download_thread, args=(item, path), daemon=True).start()
 
-    def _download_thread(self, url, path):
+    def _download_thread(self, item, path):
         out_template = path[:-4] if path.lower().endswith(".mp3") else path
         try:
-            cmd = [
-                "yt-dlp",
-                "-x",
-                "--audio-format",
-                "mp3",
-                "--audio-quality",
-                "0",
-                "--newline",
-                "-o",
-                f"{out_template}.%(ext)s",
-                url,
-            ]
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in process.stdout:
-                match = re.search(r"\[download\]\s+(\d+\.\d+)%", line)
-                if match:
-                    pct = float(match.group(1)) / 100.0
-                    GLib.idle_add(self._update_download_progress, pct, f"Baixando... {int(pct*100)}%")
-            process.wait()
-            if process.returncode == 0:
+            final = self._download_track_mp3(
+                item,
+                out_template,
+                lambda pct: GLib.idle_add(self._update_download_progress, pct, f"Baixando... {int(pct*100)}%"),
+                lambda text, stage: GLib.idle_add(self._download_pulse, text),
+            )
+            if final:
                 GLib.idle_add(self._update_download_progress, 1.0, "Download concluído!")
-                GLib.idle_add(self._notify, "Download", f"Salvo em: {path}", "folder-download-symbolic")
+                GLib.idle_add(self._notify, "Download", f"Salvo em: {final}", "folder-download-symbolic")
             else:
-                GLib.idle_add(self.progress_download.set_text, "Erro no download.")
+                GLib.idle_add(self._download_fail, "Erro no download.")
         except Exception as e:
-            GLib.idle_add(self.progress_download.set_text, f"Erro: {e}")
+            GLib.idle_add(self._download_fail, f"Erro: {e}")
         finally:
-            GLib.timeout_add_seconds(3, lambda: (self.progress_download.hide(), False)[1])
+            GLib.timeout_add_seconds(3, self._download_hide)
 
     def _update_download_progress(self, frac, text):
+        self._download_stop_pulse()
         self.progress_download.set_fraction(frac)
         self.progress_download.set_text(text)
+
+    def _download_pulse(self, text):
+        """Etapa sem porcentagem conhecida (conversão, tags...): barra em vai-e-vem + texto da etapa."""
+        self.progress_download.set_text(text)
+        if getattr(self, "_dl_pulse_id", None) is None:
+            self.progress_download.set_pulse_step(0.08)
+            self.progress_download.pulse()
+            self._dl_pulse_id = GLib.timeout_add(120, self._download_pulse_tick)
+
+    def _download_pulse_tick(self):
+        if getattr(self, "_dl_pulse_id", None) is None:
+            return False
+        self.progress_download.pulse()
+        return True
+
+    def _download_stop_pulse(self):
+        pid = getattr(self, "_dl_pulse_id", None)
+        if pid is not None:
+            self._dl_pulse_id = None
+            GLib.source_remove(pid)
+
+    def _download_fail(self, text):
+        self._download_stop_pulse()
+        self.progress_download.set_fraction(0.0)
+        self.progress_download.set_text(text)
+
+    def _download_hide(self):
+        self._download_stop_pulse()
+        self.progress_download.hide()
+        return False
 
     def _download_bulk_dialog(self, items):
         dialog = Gtk.FileChooserDialog(
@@ -5055,39 +5085,313 @@ class MusicPlayerApp(Gtk.Window):
 
     def _download_bulk_thread(self, items, folder):
         total = len(items)
+        ok = 0
         for i, item in enumerate(items, start=1):
             item = self._normalize_track(item)
-            url = f"https://www.youtube.com/watch?v={item['id']}"
             safe_title = re.sub(r'[\\/*?:"<>|]', "", item["title"])
             out_template = os.path.join(folder, safe_title)
+            GLib.idle_add(self._update_download_progress, (i - 1) / total, f"Faixa {i}/{total} · Conectando ao YouTube...")
             try:
-                cmd = [
-                    "yt-dlp",
-                    "-x",
-                    "--audio-format",
-                    "mp3",
-                    "--audio-quality",
-                    "0",
-                    "--newline",
-                    "-o",
-                    f"{out_template}.%(ext)s",
-                    url,
-                ]
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                for line in process.stdout:
-                    match = re.search(r"\[download\]\s+(\d+\.\d+)%", line)
-                    if match:
-                        pct = float(match.group(1)) / 100.0
-                        overall = ((i - 1) + pct) / total
-                        GLib.idle_add(self._update_download_progress, overall, f"Faixa {i}/{total} ({int(pct*100)}%)")
-                process.wait()
+                # O download ocupa 85% da "fatia" da faixa; o restante é conversão, capa e tags.
+                final = self._download_track_mp3(
+                    item,
+                    out_template,
+                    lambda pct, i=i: GLib.idle_add(
+                        self._update_download_progress, ((i - 1) + pct * 0.85) / total,
+                        f"Faixa {i}/{total} · Baixando... {int(pct*100)}%"),
+                    lambda text, stage, i=i: GLib.idle_add(
+                        self._update_download_progress, ((i - 1) + stage) / total,
+                        f"Faixa {i}/{total} · {text}"),
+                )
+                if final:
+                    ok += 1
             except Exception:
                 pass
-            GLib.idle_add(self.progress_download.set_fraction, i / total)
-            GLib.idle_add(self.progress_download.set_text, f"Concluído {i}/{total}")
-        GLib.idle_add(self.progress_download.set_text, "Todos os downloads foram concluídos!")
-        GLib.idle_add(self._notify, "Download", f"{total} faixa(s) salvas em: {folder}", "folder-download-symbolic")
-        GLib.timeout_add_seconds(3, lambda: (self.progress_download.hide(), False)[1])
+            GLib.idle_add(self._update_download_progress, i / total, f"Concluído {i}/{total}")
+        GLib.idle_add(self._update_download_progress, 1.0,
+                      "Todos os downloads foram concluídos!" if ok == total
+                      else f"Concluído: {ok} de {total} faixa(s).")
+        GLib.idle_add(self._notify, "Download", f"{ok} faixa(s) salvas em: {folder}", "folder-download-symbolic")
+        GLib.timeout_add_seconds(3, self._download_hide)
+
+    # ---------- Download: capa de álbum e metadados ----------
+    def _download_track_mp3(self, item, out_template, on_progress, on_phase):
+        """Baixa a faixa como MP3 em '<out_template>.mp3' e grava capa + metadados.
+        Os dados do Deezer são buscados em paralelo ao yt-dlp. Retorna o caminho do MP3 ou None.
+        on_progress(pct 0..1) acompanha o download; on_phase(texto, estágio 0..1) avisa cada etapa
+        seguinte (conversão, capa, tags), que não têm porcentagem."""
+        url = f"https://www.youtube.com/watch?v={item['id']}"
+        result = {}
+
+        def lookup_worker():
+            try:
+                meta = self._lookup_download_meta(item)
+                result["meta"] = meta
+                result["cover"] = self._download_cover_bytes(meta.get("cover_url"))
+            except Exception:
+                pass
+
+        lookup = threading.Thread(target=lookup_worker, daemon=True)
+        lookup.start()
+
+        cmd = [
+            "yt-dlp",
+            "-x",
+            "--audio-format", "mp3",
+            "--audio-quality", "0",
+            "--no-playlist",
+            "--embed-metadata",                # tags do YouTube (fallback caso o Deezer não case)
+            "--embed-thumbnail",               # miniatura do YouTube (fallback caso o Deezer não case)
+            "--convert-thumbnails", "jpg",
+            "--newline",
+            "-o", f"{out_template}.%(ext)s",
+            url,
+        ]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        phase = None
+        for line in process.stdout:
+            match = re.search(r"\[download\]\s+(\d+\.\d+)%", line)
+            if match:
+                on_progress(float(match.group(1)) / 100.0)
+                continue
+            new_phase = None
+            if line.startswith("[ExtractAudio]"):
+                new_phase = ("Convertendo para MP3...", 0.88)
+            elif line.startswith("[Metadata]"):
+                new_phase = ("Gravando metadados...", 0.92)
+            elif line.startswith(("[ThumbnailsConvertor]", "[EmbedThumbnail]")):
+                new_phase = ("Processando capa...", 0.94)
+            if new_phase and new_phase[0] != phase:
+                phase = new_phase[0]
+                on_phase(*new_phase)
+        on_phase("Finalizando arquivo...", 0.95)
+        process.wait()
+
+        final = out_template + ".mp3"
+        if process.returncode != 0 or not os.path.isfile(final):
+            return None
+
+        if lookup.is_alive():
+            on_phase("Buscando dados do álbum...", 0.96)
+            lookup.join(timeout=20)
+        on_phase("Gravando capa e metadados do álbum...", 0.98)
+
+        meta = dict(result.get("meta") or {})
+        if item.get("title"):
+            meta.setdefault("title", item["title"])
+        artist = item.get("artist") or item.get("uploader") or ""
+        if artist:
+            meta.setdefault("artist", self._clean_artist_name(artist) or artist)
+        try:
+            self._embed_tags_mp3(final, meta, result.get("cover"))
+        except Exception:
+            pass  # o MP3 já está salvo; tags e capa são um extra
+        return final
+
+    def _lookup_download_meta(self, item):
+        """Busca no Deezer título, artista, álbum, ano, nº da faixa, gênero e capa.
+        Devolve {} se não houver correspondência segura (mesmo título, mesmo artista, duração próxima)."""
+        title = self._clean_title(item.get("title") or "")
+        artist = self._clean_artist_name(item.get("artist") or item.get("uploader") or "")
+        if not title or not artist:
+            return {}
+        main_title = re.sub(r"[\(\[].*?[\)\]]", " ", title)
+        want_main = self._norm_key(main_title)
+        want_full = self._norm_key(title)
+        want_artist = self._norm_key(artist)
+        if not want_main or not want_artist:
+            return {}
+        want_dur = _clock_to_seconds(item.get("duration") or item.get("duration_fmt"))
+
+        def pick(candidates):
+            best, best_score = None, 0.0
+            for t in candidates:
+                t_artist = self._norm_key((t.get("artist") or {}).get("name", ""))
+                t_main = self._norm_key(re.sub(r"[\(\[].*?[\)\]]", " ", t.get("title", "")))
+                if not t_artist or t_main != want_main:
+                    continue
+                if not (want_artist == t_artist or want_artist in t_artist or t_artist in want_artist):
+                    continue
+                score = 10.0
+                if self._norm_key(t.get("title", "")) == want_full:
+                    score += 5
+                if want_artist == t_artist:
+                    score += 4
+                dz_dur = t.get("duration") or 0
+                if want_dur and dz_dur:
+                    diff = abs(want_dur - dz_dur)
+                    if diff > 20:
+                        continue
+                    score += 6 if diff <= 3 else (3 if diff <= 10 else 0)
+                if score > best_score:
+                    best, best_score = t, score
+            return best
+
+        best = None
+        for query in (f'artist:"{artist}" track:"{title}"', f"{artist} {title}"):
+            try:
+                data = self._http_json(
+                    f"{DEEZER_API}/search?q={urllib.parse.quote(query)}&limit=15", timeout=6
+                ).get("data", []) or []
+            except Exception:
+                data = []
+            best = pick(data)
+            if best:
+                break
+        if not best:
+            return {}
+
+        album = best.get("album") or {}
+        urls, kinds = [], []
+        if best.get("id"):
+            urls.append(f"{DEEZER_API}/track/{best['id']}")
+            kinds.append("track")
+        if album.get("id"):
+            urls.append(f"{DEEZER_API}/album/{album['id']}")
+            kinds.append("album")
+        details = dict(zip(kinds, self._http_json_many(urls, timeout=6))) if urls else {}
+        trk = details.get("track") or {}
+        alb = details.get("album") or {}
+
+        names = [c.get("name") for c in (trk.get("contributors") or []) if c.get("name")]
+        if not names:
+            names = [(best.get("artist") or {}).get("name") or artist]
+        release = alb.get("release_date") or trk.get("release_date") or ""
+        genres = (alb.get("genres") or {}).get("data") or []
+        cover_url = (alb.get("cover_xl") or album.get("cover_xl") or alb.get("cover_big")
+                     or album.get("cover_big") or album.get("cover_medium") or "")
+        if "/cover//" in cover_url:  # álbum sem capa (imagem padrão do Deezer)
+            cover_url = ""
+
+        return {
+            "title": best.get("title") or title,
+            "artist": ", ".join(dict.fromkeys(names)),
+            "album": alb.get("title") or album.get("title") or "",
+            "album_artist": (alb.get("artist") or {}).get("name") or (best.get("artist") or {}).get("name") or "",
+            "year": release[:4],
+            "track_no": trk.get("track_position") or 0,
+            "track_total": alb.get("nb_tracks") or 0,
+            "disc_no": trk.get("disk_number") or 0,
+            "genre": genres[0].get("name", "") if genres else "",
+            "isrc": trk.get("isrc") or "",
+            "cover_url": cover_url,
+        }
+
+    def _download_cover_bytes(self, url):
+        """Baixa a capa (JPEG/PNG). None se falhar ou se não for uma imagem válida."""
+        if not url:
+            return None
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = resp.read(8 * 1024 * 1024)
+        except Exception:
+            return None
+        if data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n":
+            return data
+        return None
+
+    def _embed_tags_mp3(self, path, meta, cover):
+        """Grava tags ID3 e capa no MP3: mutagen se estiver instalado, senão ffmpeg.
+        Sempre remove o campo Comentários (o yt-dlp grava ali só a URL do vídeo)."""
+        if mutagen is not None:
+            try:
+                self._embed_tags_mutagen(path, meta, cover)
+                return True
+            except Exception:
+                pass
+        return self._embed_tags_ffmpeg(path, meta, cover)
+
+    def _embed_tags_mutagen(self, path, meta, cover):
+        from mutagen.id3 import (ID3, ID3NoHeaderError, APIC, TALB, TCON, TDRC, TIT2,
+                                 TPE1, TPE2, TPOS, TRCK, TSRC)
+        try:
+            tags = ID3(path)
+        except ID3NoHeaderError:
+            tags = ID3()
+
+        def put(frame_id, frame):
+            tags.delall(frame_id)
+            tags.add(frame)
+
+        tags.delall("COMM")  # Comentários: o yt-dlp coloca só a URL do vídeo
+        for key in [k for k in tags.keys() if k.startswith("TXXX:") and k[5:].strip().lower() == "comment"]:
+            del tags[key]
+
+        if meta.get("title"):
+            put("TIT2", TIT2(encoding=3, text=[meta["title"]]))
+        if meta.get("artist"):
+            put("TPE1", TPE1(encoding=3, text=[meta["artist"]]))
+        if meta.get("album_artist"):
+            put("TPE2", TPE2(encoding=3, text=[meta["album_artist"]]))
+        if meta.get("album"):
+            put("TALB", TALB(encoding=3, text=[meta["album"]]))
+        if meta.get("year"):
+            put("TDRC", TDRC(encoding=3, text=[meta["year"]]))
+        if meta.get("track_no"):
+            trck = str(meta["track_no"])
+            if meta.get("track_total"):
+                trck += f"/{meta['track_total']}"
+            put("TRCK", TRCK(encoding=3, text=[trck]))
+        if meta.get("disc_no"):
+            put("TPOS", TPOS(encoding=3, text=[str(meta["disc_no"])]))
+        if meta.get("genre"):
+            put("TCON", TCON(encoding=3, text=[meta["genre"]]))
+        if meta.get("isrc"):
+            put("TSRC", TSRC(encoding=3, text=[meta["isrc"]]))
+        if cover:
+            mime = "image/png" if cover[:4] == b"\x89PNG" else "image/jpeg"
+            tags.delall("APIC")  # troca a miniatura do YouTube pela capa do álbum
+            tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover))
+        tags.save(path, v2_version=3)  # ID3v2.3: máxima compatibilidade com players e celulares
+
+    def _embed_tags_ffmpeg(self, path, meta, cover):
+        """Fallback sem mutagen: remuxa o MP3 com ffmpeg (sem recodificar) gravando tags e capa."""
+        if not shutil.which("ffmpeg"):
+            return False
+        tmp_out = path + ".tagged.mp3"
+        cover_path = None
+        try:
+            cmd = ["ffmpeg", "-y", "-v", "error", "-i", path]
+            if cover:
+                ext = ".png" if cover[:4] == b"\x89PNG" else ".jpg"
+                fd, cover_path = tempfile.mkstemp(suffix=ext)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(cover)
+                cmd += ["-i", cover_path, "-map", "0:a", "-map", "1:0",
+                        "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
+            else:
+                cmd += ["-map", "0"]
+            cmd += ["-c", "copy", "-id3v2_version", "3", "-write_id3v1", "1", "-metadata", "comment="]
+            track = str(meta.get("track_no") or "")
+            if track and meta.get("track_total"):
+                track += f"/{meta['track_total']}"
+            fields = {
+                "title": meta.get("title"),
+                "artist": meta.get("artist"),
+                "album_artist": meta.get("album_artist"),
+                "album": meta.get("album"),
+                "date": meta.get("year"),
+                "track": track,
+                "disc": str(meta.get("disc_no") or ""),
+                "genre": meta.get("genre"),
+            }
+            for key, val in fields.items():
+                if val:
+                    cmd += ["-metadata", f"{key}={val}"]
+            cmd.append(tmp_out)
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+            os.replace(tmp_out, path)
+            return True
+        except Exception:
+            return False
+        finally:
+            for p in (tmp_out, cover_path):
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
 
     # ---------- Atalhos de Teclado Ampliados ----------
     def on_key_press(self, widget, event):
@@ -5355,7 +5659,7 @@ class MusicPlayerApp(Gtk.Window):
             ("Concorrência", "Buscas, letras, capas e downloads rodam em threads. Os resultados voltam à interface via GLib.idle_add; um token por busca descarta respostas obsoletas.", "threading"),
             ("Metadados limpos", "Cada resultado do YouTube é comparado com faixas do Deezer (palavras do título, artista e duração) para exibir título e artista corretos. Sem correspondência, o título é higienizado por expressões regulares.", "Deezer + regex"),
             ("Persistência", "Dados em arquivos JSON, gravados de forma atômica (arquivo temporário + os.replace) para evitar corrupção. O volume usa debounce para não gravar a cada movimento do slider.", "JSON"),
-            ("Downloads", "Áudio extraído e convertido para MP3 na melhor qualidade pelo yt-dlp, com progresso lido da saída do processo.", "yt-dlp + ffmpeg"),
+            ("Downloads", "Áudio extraído e convertido para MP3 na melhor qualidade pelo yt-dlp, com progresso lido da saída do processo. Capa do álbum, artista, álbum, ano, nº da faixa e gênero (Deezer) são gravados como tags ID3 no arquivo.", "yt-dlp + ffmpeg"),
         ):
             page.pack_start(self._about_card(name, desc, tag), False, False, 0)
 
@@ -5730,7 +6034,8 @@ class MusicPlayerApp(Gtk.Window):
         if self._config_save_id:
             GLib.source_remove(self._config_save_id)
             self._config_save_id = None
-        self.config["win_w"], self.config["win_h"] = self.get_size()
+        if not self.is_maximized():  # maximizada, get_size() devolveria a tela toda e estragaria o "restaurar"
+            self.config["win_w"], self.config["win_h"] = self.get_size()
         self._save_json(CONFIG_FILE, self.config)
         self._save_json(QUEUE_FILE, self.queue)
         self._save_json(PLAYLISTS_FILE, self.playlists)
