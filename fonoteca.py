@@ -35,6 +35,11 @@ import datetime
 import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+try:  # opcional: leitura de tags (ID3, Vorbis, MP4...). Sem ele, usa ffprobe e o nome do arquivo.
+    import mutagen
+except Exception:  # pragma: no cover
+    mutagen = None
+
 gi.require_version("Gtk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
@@ -44,7 +49,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -116,6 +121,9 @@ HISTORY_FILE = os.path.join(CONFIG_DIR, "history.json")
 PLAYLISTS_FILE = os.path.join(CONFIG_DIR, "playlists.json")
 PROFILE_FILE = os.path.join(CONFIG_DIR, "profile.json")
 FAVORITES_FILE = os.path.join(CONFIG_DIR, "favorites.json")
+LIBRARY_FILE = os.path.join(CONFIG_DIR, "library.json")   # índice de tags da biblioteca local
+COVERS_DIR = os.path.join(CONFIG_DIR, "covers")           # capas extraídas dos arquivos
+AUDIO_EXTS = (".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".mp4", ".aac", ".wav", ".wma", ".webm", ".mka")
 
 # Formato do arquivo de backup do perfil (exportar/importar).
 # Backups feitos pelo nome antigo continuam sendo aceitos na importação.
@@ -150,6 +158,208 @@ JUNK_GROUP_RE = re.compile(
 TRANSLATE_CARDS = (
     ("Google Tradutor (endpoint público)", "Traduz para português a biografia obtida da Wikipédia em inglês (até cerca de 1800 caracteres).", "translate.googleapis.com"),
 ) if TRANSLATE_ENABLED else ()
+
+
+# ----------------------------------------------------------------------
+# Biblioteca local: leitura de tags, capa e letra de arquivos de áudio
+# ----------------------------------------------------------------------
+def _fmt_clock(seconds):
+    try:
+        seconds = int(float(seconds or 0))
+    except (TypeError, ValueError):
+        seconds = 0
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _clock_to_seconds(txt):
+    """'3:25' -> 205. Devolve 0 se não der para interpretar."""
+    try:
+        parts = [int(x) for x in str(txt or "").split(":")]
+    except ValueError:
+        return 0
+    sec = 0
+    for x in parts:
+        sec = sec * 60 + x
+    return sec
+
+
+def _first(val):
+    if isinstance(val, (list, tuple)):
+        val = val[0] if val else ""
+    return str(val).strip() if val is not None else ""
+
+
+def _filename_guess(path):
+    """'Artista - Título.mp3' -> (título, artista). Sem ' - ' devolve só o título."""
+    base = os.path.splitext(os.path.basename(path))[0]
+    base = re.sub(r"^\s*\d{1,3}\s*[-._)]\s*", "", base)  # remove número de faixa no início
+    if " - " in base:
+        artist, title = base.split(" - ", 1)
+        return title.strip(), artist.strip()
+    return base.strip(), ""
+
+
+def _tags_from_mutagen(path):
+    f = mutagen.File(path, easy=False)
+    if f is None:
+        return {}
+    out = {}
+    info = getattr(f, "info", None)
+    if info is not None and getattr(info, "length", None):
+        out["seconds"] = info.length
+    tags = f.tags
+    if not tags:
+        return out
+    keys = {k.lower(): k for k in tags.keys()}
+
+    def grab(*names):
+        for n in names:
+            for lk, k in keys.items():
+                if lk == n.lower() or lk.startswith(n.lower() + ":"):
+                    v = tags[k]
+                    if hasattr(v, "text"):          # ID3
+                        v = v.text
+                    return _first(v)
+        return ""
+
+    out["title"] = grab("TIT2", "title", "\xa9nam")
+    out["artist"] = grab("TPE1", "artist", "\xa9ART", "TPE2", "albumartist", "aART")
+    out["album"] = grab("TALB", "album", "\xa9alb")
+    out["year"] = grab("TDRC", "date", "year", "\xa9day", "TYER")[:4]
+    tn = grab("TRCK", "tracknumber")
+    out["track_no"] = tn.split("/")[0].strip() if tn else ""
+    lyr = ""
+    for lk, k in keys.items():                      # USLT (ID3) / LYRICS (Vorbis) / ©lyr (MP4)
+        if "uslt" in lk or lk in ("lyrics", "unsyncedlyrics", "\xa9lyr") or lk.endswith(":lyrics"):
+            v = tags[k]
+            if hasattr(v, "text"):
+                v = v.text
+            lyr = _first(v)
+            if lyr:
+                break
+    out["lyrics"] = lyr
+    return out
+
+
+def _tags_from_ffprobe(path):
+    if not shutil.which("ffprobe"):
+        return {}
+    try:
+        raw = subprocess.check_output(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path],
+            stderr=subprocess.DEVNULL, timeout=15)
+        fmt = json.loads(raw).get("format", {})
+    except Exception:
+        return {}
+    t = {k.lower(): v for k, v in (fmt.get("tags") or {}).items()}
+    tn = str(t.get("track", ""))
+    return {
+        "seconds": fmt.get("duration"),
+        "title": _first(t.get("title")),
+        "artist": _first(t.get("artist") or t.get("album_artist")),
+        "album": _first(t.get("album")),
+        "year": _first(t.get("date") or t.get("year"))[:4],
+        "track_no": tn.split("/")[0].strip(),
+        "lyrics": _first(t.get("lyrics") or t.get("unsyncedlyrics")),
+    }
+
+
+def read_local_track(path):
+    """Metadados de um arquivo local: tags embutidas -> ffprobe -> nome do arquivo."""
+    tags = {}
+    if mutagen is not None:
+        try:
+            tags = _tags_from_mutagen(path)
+        except Exception:
+            tags = {}
+    if not tags.get("title") or not tags.get("seconds"):
+        try:
+            for k, v in _tags_from_ffprobe(path).items():
+                if v and not tags.get(k):
+                    tags[k] = v
+        except Exception:
+            pass
+    g_title, g_artist = _filename_guess(path)
+    title = tags.get("title") or g_title
+    artist = tags.get("artist") or g_artist
+    dur = _fmt_clock(tags.get("seconds"))
+    return {
+        "id": "",
+        "title": title,
+        "uploader": artist,
+        "artist": artist,
+        "album": tags.get("album", ""),
+        "year": tags.get("year", ""),
+        "track_no": tags.get("track_no", ""),
+        "duration": dur,
+        "duration_fmt": dur,
+        "verified": False,
+        "path": os.path.abspath(path),
+        "offline": True,
+        "has_lyrics": bool(tags.get("lyrics")),
+    }
+
+
+def read_local_lyrics(path):
+    """Letra offline: arquivo .lrc/.txt ao lado da faixa -> letra embutida nas tags."""
+    base = os.path.splitext(path)[0]
+    for ext in (".lrc", ".LRC", ".txt", ".TXT"):
+        side = base + ext
+        if os.path.isfile(side):
+            try:
+                with open(side, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+                text = re.sub(r"\[\d+:\d+(?:[.:]\d+)?\]\s*", "", text)      # tempos do .lrc
+                text = re.sub(r"(?m)^\[(?:ar|ti|al|by|offset|length|re|ve):.*\]\s*$", "", text)
+                text = text.strip()
+                if text:
+                    return text
+            except OSError:
+                pass
+    if mutagen is not None:
+        try:
+            return _tags_from_mutagen(path).get("lyrics", "")
+        except Exception:
+            pass
+    return _tags_from_ffprobe(path).get("lyrics", "")
+
+
+def local_cover_bytes(path):
+    """Bytes da capa: imagem embutida -> folder/cover.jpg na pasta -> ffmpeg. None se não houver."""
+    if mutagen is not None:
+        try:
+            f = mutagen.File(path)
+            if f is not None:
+                tags = f.tags
+                pics = getattr(f, "pictures", None)           # FLAC
+                if pics:
+                    return pics[0].data
+                if tags is not None:
+                    for k in tags.keys():
+                        if str(k).startswith("APIC"):          # MP3
+                            return tags[k].data
+                    if "covr" in tags and tags["covr"]:        # MP4/M4A
+                        return bytes(tags["covr"][0])
+        except Exception:
+            pass
+    folder = os.path.dirname(path)
+    for name in ("cover", "folder", "front", "album", "Cover", "Folder"):
+        for ext in (".jpg", ".jpeg", ".png"):
+            cand = os.path.join(folder, name + ext)
+            if os.path.isfile(cand):
+                try:
+                    with open(cand, "rb") as fh:
+                        return fh.read()
+                except OSError:
+                    pass
+    if shutil.which("ffmpeg"):
+        try:
+            return subprocess.check_output(
+                ["ffmpeg", "-v", "quiet", "-i", path, "-an", "-frames:v", "1", "-f", "image2pipe",
+                 "-vcodec", "mjpeg", "-"], stderr=subprocess.DEVNULL, timeout=15) or None
+        except Exception:
+            pass
+    return None
 
 
 class MPVController:
@@ -333,6 +543,15 @@ class MusicPlayerApp(Gtk.Window):
         self.playlists = self._load_json(PLAYLISTS_FILE, {})
         self.favorites = [self._normalize_track(t) for t in self._load_json(FAVORITES_FILE, []) if isinstance(t, dict)]
         self._hearts = weakref.WeakSet()
+        # Biblioteca local (Músicas Offline)
+        _lib = self._load_json(LIBRARY_FILE, {})
+        self.lib_index = _lib.get("tracks", {}) if isinstance(_lib, dict) else {}
+        self.lib_root = self.config.get("library_root", "")
+        self.lib_dir = self.lib_root
+        self._lib_album_cache = {}
+        self._lib_enriching = False
+        self._lib_scan_token = 0
+        self._lib_scanning = False
         self._nav_history = []
         self._panel_lock = False
         self._wiki_forced = None
@@ -381,6 +600,7 @@ class MusicPlayerApp(Gtk.Window):
 
         # Watchdog de reprodução
         self._play_token = 0
+        self._missing_skips = 0
         self._track_started = False
         self._stall_retry_count = 0
         self._stall_check_id = None
@@ -408,6 +628,7 @@ class MusicPlayerApp(Gtk.Window):
         # Corpo: barra lateral | conteúdo navegável | painel direito (Fila/Letra)
         overlay = Gtk.Overlay()
         self._body_widget = self._build_body()
+        self._wire_selection_tracking()
         overlay.add(self._body_widget)
         overlay.add_overlay(self._build_welcome_overlay())
         overlay.add_overlay(self._build_busy_overlay())
@@ -561,6 +782,7 @@ class MusicPlayerApp(Gtk.Window):
         threading.Thread(target=self._check_ytdlp_update, daemon=True).start()
         GLib.timeout_add(700, self._show_welcome)
         GLib.timeout_add(400, self._startup_discover)
+        GLib.timeout_add(1500, self._lib_startup)
 
     def _check_dependencies(self):
         missing = []
@@ -628,7 +850,8 @@ class MusicPlayerApp(Gtk.Window):
         flow.set_valign(Gtk.Align.START)
         return flow
 
-    def _card(self, title, subtitle="", size=(120, 120), icon="avatar-default-symbolic", url=None, on_click=None):
+    def _card(self, title, subtitle="", size=(120, 120), icon="avatar-default-symbolic", url=None, on_click=None,
+              local_item=None):
         """Cartão de capa (artista, álbum, faixa) para as vitrines."""
         btn = Gtk.Button()
         btn.set_relief(Gtk.ReliefStyle.NONE)
@@ -655,7 +878,10 @@ class MusicPlayerApp(Gtk.Window):
         btn.set_tooltip_text(title)
         if on_click:
             btn.connect("clicked", lambda b: on_click())
-        if url:
+        if local_item:
+            threading.Thread(target=self._load_local_artwork_into, args=(local_item, img, size[0], size[1]),
+                             daemon=True).start()
+        elif url:
             threading.Thread(target=self._load_artwork_into, args=(url, img, size[0], size[1]), daemon=True).start()
         return btn
 
@@ -720,6 +946,7 @@ class MusicPlayerApp(Gtk.Window):
         self.main_stack.add_named(self._build_wiki_album_page(), "album")
         self.main_stack.add_named(self._build_page_playlist(), "playlist")
         self._build_tab_favorites()
+        self._build_tab_offline()
         self._build_tab_history()
         self._build_tab_about()
         center.pack_start(self.main_stack, True, True, 0)
@@ -753,6 +980,7 @@ class MusicPlayerApp(Gtk.Window):
         for key, icon, label in (
             ("home", "⌂", "Início"),
             ("favorites", '<span foreground="#e0245e">♥</span>', "Favoritas"),
+            ("offline", '<span foreground="#2e9e5b">⬇</span>', "Músicas Offline"),
             ("history", "◷", "Recentes"),
             ("about", "ⓘ", "Sobre"),
         ):
@@ -1036,6 +1264,12 @@ class MusicPlayerApp(Gtk.Window):
         n = len(self.favorites)
         tiles = [tile('<span foreground="#e0245e">♥</span>', "Músicas curtidas",
                       "1 música" if n == 1 else f"{n} músicas", lambda: self.navigate("favorites"))]
+        nl = len(self.lib_index) if self.lib_root else 0
+        tiles.append(tile('<span foreground="#2e9e5b">⬇</span>', "Músicas offline",
+                          ("1 música" if nl == 1 else f"{nl} músicas") if nl
+                          else ("Indexando..." if self._lib_scanning else "Escolha uma pasta" if not self.lib_root
+                                else "Nenhuma música"),
+                          lambda: self.navigate("offline")))
         self._fill_flow(self.home_tiles, tiles)
 
     def _render_home_recents(self):
@@ -1046,6 +1280,7 @@ class MusicPlayerApp(Gtk.Window):
             cards.append(self._card(
                 item.get("title", ""), item.get("uploader", ""), (160, 90), icon="audio-x-generic",
                 url=f"https://i.ytimg.com/vi/{item['id']}/mqdefault.jpg" if item.get("id") else None,
+                local_item=item if item.get("path") else None,
                 on_click=lambda it=item: self.play_item(it)))
         self._fill_flow(self.home_recent_flow, cards)
         self._set_shown(self.home_recent_box, bool(cards))
@@ -1340,6 +1575,625 @@ class MusicPlayerApp(Gtk.Window):
 
         self.main_stack.add_named(tab_box, "favorites")
 
+    # ======================================================================
+    # Músicas Offline (biblioteca local)
+    # ======================================================================
+    def _build_tab_offline(self):
+        tab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        tab.set_border_width(20)
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        title = Gtk.Label(xalign=0)
+        title.set_markup('<span size="xx-large" weight="bold"><span foreground="#2e9e5b">⬇</span> Músicas Offline</span>')
+        head.pack_start(title, False, False, 0)
+        self.lib_count_label = Gtk.Label(xalign=0)
+        self.lib_count_label.get_style_context().add_class("dim-label")
+        self.lib_count_label.set_valign(Gtk.Align.END)
+        head.pack_start(self.lib_count_label, True, True, 0)
+        tab.pack_start(head, False, False, 0)
+
+        # Cabeçalho de ações (fixo): mesmo estilo dos botões das playlists
+        btns = Gtk.Box(spacing=8)
+        btn_play = Gtk.Button(label="▶  Tocar pasta")
+        btn_play.get_style_context().add_class("suggested-action")
+        btn_play.set_tooltip_text("Toca a pasta atual, incluindo subpastas")
+        btn_play.connect("clicked", lambda b: self._lib_play(shuffle=False))
+        btn_shuffle = Gtk.Button(label="Aleatório")
+        btn_shuffle.set_image(Gtk.Image.new_from_icon_name("media-playlist-shuffle-symbolic", Gtk.IconSize.BUTTON))
+        btn_shuffle.set_always_show_image(True)
+        btn_shuffle.connect("clicked", lambda b: self._lib_play(shuffle=True))
+        btn_queue = Gtk.Button(label="+ Fila")
+        btn_queue.set_tooltip_text("Adiciona as selecionadas (ou a pasta inteira, se nada estiver selecionado)")
+        btn_queue.connect("clicked", self.on_lib_add_to_queue)
+        btn_pl = Gtk.Button(label="+ Playlist")
+        btn_pl.set_tooltip_text("Adiciona as selecionadas (ou a pasta inteira) a uma playlist")
+        btn_pl.connect("clicked", self.on_lib_add_to_playlist)
+        for b in (btn_play, btn_shuffle, btn_queue, btn_pl):
+            btns.pack_start(b, False, False, 0)
+        btn_choose = Gtk.Button(label="Escolher pasta local")
+        btn_choose.connect("clicked", self.on_lib_choose_folder)
+        btn_refresh = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        btn_refresh.set_tooltip_text("Reindexar a biblioteca (detecta arquivos novos e tags alteradas)")
+        btn_refresh.connect("clicked", lambda b: self._lib_scan_start(force=False))
+        btns.pack_end(btn_choose, False, False, 0)
+        btns.pack_end(btn_refresh, False, False, 0)
+        tab.pack_start(btns, False, False, 0)
+
+        # Caminho (migalhas clicáveis)
+        crumb_scroll = Gtk.ScrolledWindow()
+        crumb_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        crumb_scroll.set_propagate_natural_height(True)
+        self.lib_crumbs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        crumb_scroll.add(self.lib_crumbs)
+        tab.pack_start(crumb_scroll, False, False, 0)
+
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.lib_status = Gtk.Label(xalign=0)
+        self.lib_status.get_style_context().add_class("dim-label")
+        self.lib_status.set_ellipsize(3)
+        status_row.pack_start(self.lib_status, True, True, 0)
+        self.lib_online_check = Gtk.CheckButton(label="Completar dados online")
+        self.lib_online_check.set_tooltip_text(
+            "Para músicas sem artista/álbum/ano/capa nas tags, busca no Deezer (envia só título e artista).\n"
+            "Nunca altera seus arquivos nem sobrescreve tags existentes.")
+        self.lib_online_check.set_active(bool(self.config.get("library_online_meta", True)))
+        self.lib_online_check.connect("toggled", self._on_lib_online_toggled)
+        status_row.pack_end(self.lib_online_check, False, False, 0)
+        tab.pack_start(status_row, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+
+        self.lib_empty = Gtk.Label()
+        self.lib_empty.set_line_wrap(True)
+        self.lib_empty.set_justify(Gtk.Justification.CENTER)
+        self.lib_empty.get_style_context().add_class("dim-label")
+        self.lib_empty.set_margin_top(40)
+        inner.pack_start(self.lib_empty, False, False, 0)
+
+        self.lib_folders_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.lib_folders_box.pack_start(self._h2("Pastas"), False, False, 0)
+        self.lib_folders_list = Gtk.ListBox()
+        self.lib_folders_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.lib_folders_list.set_activate_on_single_click(True)       # pastas: um clique navega
+        self.lib_folders_list.connect("row-activated", self.on_lib_folder_activated)
+        fr = Gtk.Frame()
+        fr.add(self.lib_folders_list)
+        self.lib_folders_box.pack_start(fr, False, False, 0)
+        inner.pack_start(self.lib_folders_box, False, False, 0)
+
+        self.lib_tracks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.lib_tracks_box.pack_start(self._h2("Músicas"), False, False, 0)
+        self.offline_tracks_list = Gtk.ListBox()
+        self.offline_tracks_list.set_activate_on_single_click(False)   # músicas: duplo clique toca
+        self.offline_tracks_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        self.offline_tracks_list.connect("row-activated", self.on_lib_track_activated)
+        self.offline_tracks_list.connect("button-press-event", self.on_lib_tracks_button_press)
+        fr2 = Gtk.Frame()
+        fr2.add(self.offline_tracks_list)
+        self.lib_tracks_box.pack_start(fr2, False, False, 0)
+        inner.pack_start(self.lib_tracks_box, False, False, 0)
+
+        scroll.add(inner)
+        tab.pack_start(scroll, True, True, 0)
+        self.main_stack.add_named(tab, "offline")
+        tab.show_all()
+        for w in (self.lib_empty, self.lib_folders_box, self.lib_tracks_box):
+            w.set_no_show_all(True)
+
+    # ---------- dados ----------
+    def _lib_valid_root(self):
+        return bool(self.lib_root) and os.path.isdir(self.lib_root)
+
+    def _lib_item(self, path):
+        """Faixa da biblioteca (do índice; se ainda não indexada, palpite pelo nome do arquivo)."""
+        entry = self.lib_index.get(path)
+        if entry:
+            return self._normalize_track(entry)
+        title, artist = _filename_guess(path)
+        return self._normalize_track({"title": title, "uploader": artist, "path": path, "offline": True,
+                                      "duration": "--:--"})
+
+    def _lib_sort_key(self, item):
+        tn = str(item.get("track_no") or "")
+        return (int(tn) if tn.isdigit() else 9999, os.path.basename(item["path"]).lower())
+
+    def _lib_tracks_under(self, folder, recursive=True):
+        """Faixas de uma pasta. Recursivo usa o índice; se ele estiver vazio, lê a pasta direto."""
+        out = []
+        if recursive:
+            prefix = folder.rstrip(os.sep) + os.sep
+            out = [self._normalize_track(e) for pth, e in self.lib_index.items()
+                   if pth.startswith(prefix) and os.path.isfile(pth)]
+            out.sort(key=lambda it: (os.path.dirname(it["path"]).lower(),) + self._lib_sort_key(it))
+        if not out:
+            try:
+                names = sorted(os.listdir(folder), key=str.lower)
+            except OSError:
+                names = []
+            out = [self._lib_item(os.path.join(folder, n)) for n in names
+                   if n.lower().endswith(AUDIO_EXTS) and os.path.isfile(os.path.join(folder, n))]
+            out.sort(key=self._lib_sort_key)
+        return out
+
+    # ---------- renderização ----------
+    def _lib_render(self):
+        if not hasattr(self, "lib_folders_list"):
+            return
+        self._clear(self.lib_folders_list)
+        self._clear(self.offline_tracks_list)
+        self._clear(self.lib_crumbs)
+
+        if not self._lib_valid_root():
+            msg = ("A pasta escolhida não está acessível (disco desconectado ou pasta movida).\n"
+                   f"{self.lib_root}\nClique em “Escolher pasta local” para indicar outra."
+                   if self.lib_root else
+                   "Nenhuma pasta local escolhida ainda.\n"
+                   "Clique em “Escolher pasta local” (canto superior direito) e aponte sua pasta de músicas.\n"
+                   "Suas faixas tocam sem internet, com artista, álbum, capa e letra.")
+            self.lib_empty.set_text(msg)
+            self._set_shown(self.lib_empty, True)
+            self._set_shown(self.lib_folders_box, False)
+            self._set_shown(self.lib_tracks_box, False)
+            self.lib_count_label.set_text("")
+            self.lib_status.set_text("")
+            return
+        self._set_shown(self.lib_empty, False)
+
+        root = os.path.abspath(self.lib_root)
+        cur = os.path.abspath(self.lib_dir or root)
+        if not (cur == root or cur.startswith(root + os.sep)) or not os.path.isdir(cur):
+            cur = root
+        self.lib_dir = cur
+
+        # migalhas
+        rel = os.path.relpath(cur, root)
+        parts = [] if rel == "." else rel.split(os.sep)
+        trail = [(os.path.basename(root) or root, root)]
+        acc = root
+        for part in parts:
+            acc = os.path.join(acc, part)
+            trail.append((part, acc))
+        for i, (name, pth) in enumerate(trail):
+            if i:
+                sep = Gtk.Label(label="›")
+                sep.get_style_context().add_class("dim-label")
+                self.lib_crumbs.pack_start(sep, False, False, 2)
+            b = Gtk.Button()
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            lbl = Gtk.Label()
+            last = i == len(trail) - 1
+            esc = GLib.markup_escape_text(name)
+            lbl.set_markup(f"<b>{esc}</b>" if last else esc)
+            b.add(lbl)
+            b.set_tooltip_text(pth)
+            b.connect("clicked", lambda w, d=pth: self._lib_go(d))
+            self.lib_crumbs.pack_start(b, False, False, 0)
+        self.lib_crumbs.show_all()
+
+        # conteúdo da pasta
+        dirs, files = [], []
+        try:
+            with os.scandir(cur) as it:
+                for e in it:
+                    if e.name.startswith("."):
+                        continue
+                    if e.is_dir(follow_symlinks=True):
+                        dirs.append(e.path)
+                    elif e.is_file() and e.name.lower().endswith(AUDIO_EXTS):
+                        files.append(e.path)
+        except OSError:
+            pass
+        dirs.sort(key=lambda d: os.path.basename(d).lower())
+
+        for d in dirs:
+            row = Gtk.ListBoxRow()
+            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            hb.set_border_width(6)
+            hb.pack_start(Gtk.Image.new_from_icon_name("folder-symbolic", Gtk.IconSize.BUTTON), False, False, 0)
+            nm = Gtk.Label(label=os.path.basename(d), xalign=0)
+            nm.set_ellipsize(3)
+            hb.pack_start(nm, True, True, 0)
+            hb.pack_end(Gtk.Label(label="›"), False, False, 0)
+            row.add(hb)
+            row.folder_path = d
+            self.lib_folders_list.add(row)
+
+        items = sorted((self._lib_item(f) for f in files), key=self._lib_sort_key)
+        for item in items:
+            row = Gtk.ListBoxRow()
+            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            hb.set_border_width(4)
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            t = Gtk.Label(xalign=0)
+            t.set_ellipsize(3)
+            t.set_markup(f"<b>{GLib.markup_escape_text(item['title'])}</b>")
+            sub_bits = [x for x in (item.get("uploader"), item.get("album"), item.get("year")) if x]
+            s_lbl = Gtk.Label(label="  ·  ".join(sub_bits) if sub_bits else "Artista desconhecido", xalign=0)
+            s_lbl.set_ellipsize(3)
+            s_lbl.get_style_context().add_class("dim-label")
+            vb.pack_start(t, False, False, 0)
+            vb.pack_start(s_lbl, False, False, 0)
+            hb.pack_start(vb, True, True, 6)
+            dur = Gtk.Label(label=item.get("duration", ""))
+            dur.get_style_context().add_class("dim-label")
+            hb.pack_start(dur, False, False, 4)
+            hb.pack_start(self._make_heart(item), False, False, 0)
+            row.add(hb)
+            row.item = item
+            online = (self.lib_index.get(item["path"]) or {}).get("online_fields") or []
+            if online:
+                names = {"artist": "artista", "album": "álbum", "year": "ano"}
+                row.set_tooltip_text("Obtido online (Deezer): " + ", ".join(names.get(x, x) for x in online)
+                                     + ". As tags do arquivo não foram alteradas.")
+            self.offline_tracks_list.add(row)
+
+        self.lib_folders_list.show_all()
+        self.offline_tracks_list.show_all()
+        self._set_shown(self.lib_folders_box, bool(dirs))
+        self._set_shown(self.lib_tracks_box, bool(items))
+        if not dirs and not items:
+            self.lib_empty.set_text("Nenhuma música ou subpasta aqui.")
+            self._set_shown(self.lib_empty, True)
+
+        total = len(self.lib_index)
+        self.lib_count_label.set_text(f"{len(items)} nesta pasta · {total} na biblioteca" if total else
+                                      f"{len(items)} nesta pasta")
+        if not self._lib_scanning:
+            hint = ""
+            if mutagen is None and not shutil.which("ffprobe"):
+                hint = "  ·  Dica: instale python3-mutagen (ou ffmpeg) para ler artista, álbum e capa."
+            self.lib_status.set_text(f"Biblioteca: {root}{hint}")
+
+    def _lib_go(self, path):
+        self.lib_dir = path
+        self._lib_render()
+
+    def on_lib_folder_activated(self, listbox, row):
+        if hasattr(row, "folder_path"):
+            self._lib_go(row.folder_path)
+
+    def on_lib_track_activated(self, listbox, row):
+        if hasattr(row, "item"):
+            self.play_item(row.item)
+
+    # ---------- ações do cabeçalho ----------
+    def _lib_action_items(self):
+        rows = self.offline_tracks_list.get_selected_rows()
+        if rows:
+            return [r.item for r in rows if hasattr(r, "item")]
+        if self._lib_valid_root():
+            return self._lib_tracks_under(self.lib_dir, recursive=True)
+        return []
+
+    def _lib_play(self, shuffle=False):
+        if not self._lib_valid_root():
+            self.mostrar_mensagem("Escolha uma pasta local primeiro.")
+            return
+        items = self._lib_tracks_under(self.lib_dir, recursive=True)
+        label = os.path.basename(self.lib_dir.rstrip(os.sep)) or "Músicas Offline"
+        self._play_tracks(items, label, shuffle=shuffle)
+
+    def on_lib_add_to_queue(self, button=None):
+        items = self._lib_action_items()
+        if not items:
+            self.mostrar_mensagem("Não há músicas para adicionar.")
+            return
+        self.add_items_bulk(items)
+
+    def on_lib_add_to_playlist(self, button=None):
+        items = self._lib_action_items()
+        if not items:
+            self.mostrar_mensagem("Não há músicas para adicionar.")
+            return
+        self.on_add_selection_to_playlist(items_to_add=items)
+
+    def on_lib_tracks_button_press(self, widget, event):
+        if event.button != 3:
+            return False
+        row = widget.get_row_at_y(int(event.y))
+        if row is None or not hasattr(row, "item"):
+            return False
+        self._ensure_row_selected(widget, row)
+        sel = [r.item for r in widget.get_selected_rows()]
+        menu = Gtk.Menu()
+        item_play = Gtk.MenuItem(label="Reproduzir")
+        item_play.connect("activate", lambda w: self.play_item(row.item))
+        item_q = Gtk.MenuItem(label="Adicionar à Fila")
+        item_q.connect("activate", lambda w: self.add_items_bulk(sel))
+        item_pl = Gtk.MenuItem(label="Adicionar à Playlist")
+        item_pl.connect("activate", lambda w: self.on_add_selection_to_playlist(items_to_add=sel))
+        item_like = self._like_menu_item(sel)
+        item_meta = Gtk.MenuItem(label="Buscar dados online")
+        item_meta.connect("activate", lambda w: self._lib_enrich_start([i["path"] for i in sel], force=True))
+        item_open = Gtk.MenuItem(label="Mostrar no gerenciador de arquivos")
+
+        def _open(w):
+            try:
+                subprocess.Popen(["xdg-open", os.path.dirname(row.item["path"])],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                self.mostrar_mensagem("Não foi possível abrir o gerenciador de arquivos.")
+        item_open.connect("activate", _open)
+        for it in (item_play, item_q, item_pl, item_like, Gtk.SeparatorMenuItem(), item_meta, item_open):
+            menu.append(it)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
+
+    # ---------- escolher pasta e indexar ----------
+    def on_lib_choose_folder(self, button=None):
+        dialog = Gtk.FileChooserDialog(title="Escolher pasta de músicas", parent=self,
+                                       action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Escolher", Gtk.ResponseType.OK)
+        start = self.lib_root if self._lib_valid_root() else None
+        if not start:
+            for cand in ("~/Música", "~/Músicas", "~/Music", "~"):
+                c = os.path.expanduser(cand)
+                if os.path.isdir(c):
+                    start = c
+                    break
+        if start:
+            dialog.set_current_folder(start)
+        response = dialog.run()
+        folder = dialog.get_filename() if response == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        if not folder:
+            return
+        self.lib_root = os.path.abspath(folder)
+        self.lib_dir = self.lib_root
+        self.config["library_root"] = self.lib_root
+        self._schedule_config_save()
+        self.lib_index = {}
+        self._lib_render()
+        self._render_home_tiles()
+        self._lib_scan_start(force=True)
+
+    def _lib_startup(self):
+        if self._lib_valid_root():
+            self._lib_scan_start(force=False)
+        return False
+
+    def _lib_scan_start(self, force=False):
+        if not self._lib_valid_root():
+            self.mostrar_mensagem("Escolha uma pasta local primeiro.")
+            return
+        if self._lib_scanning and not force:
+            self.show_toast("Indexação já em andamento.")
+            return
+        self._lib_scan_token += 1
+        token = self._lib_scan_token
+        self._lib_scanning = True
+        self.lib_status.set_text("Indexando biblioteca...")
+        threading.Thread(target=self._lib_scan_thread, args=(self.lib_root, dict(self.lib_index), token),
+                         daemon=True).start()
+
+    def _lib_scan_thread(self, root, old, token):
+        """Varre a pasta. Só relê tags de arquivos novos/alterados (mtime+tamanho)."""
+        found = []
+        for base, dirs, names in os.walk(root, followlinks=True):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for n in names:
+                if n.lower().endswith(AUDIO_EXTS) and not n.startswith("."):
+                    found.append(os.path.join(base, n))
+        new_index, todo = {}, []
+        for path in found:
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            prev = old.get(path)
+            if prev and prev.get("mtime") == st.st_mtime and prev.get("size") == st.st_size:
+                new_index[path] = prev
+            else:
+                todo.append((path, st))
+        total, done = len(found), len(new_index)
+
+        def work(pair):
+            path, st = pair
+            meta = read_local_track(path)
+            meta["mtime"], meta["size"] = st.st_mtime, st.st_size
+            return path, meta
+
+        if todo:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(work, pair) for pair in todo]
+                for fut in as_completed(futures):
+                    if token != self._lib_scan_token:
+                        for f in futures:
+                            f.cancel()
+                        return
+                    try:
+                        path, meta = fut.result()
+                        new_index[path] = meta
+                    except Exception:
+                        pass
+                    done += 1
+                    if done % 25 == 0:
+                        GLib.idle_add(self.lib_status.set_text, f"Indexando... {done}/{total}")
+        if token != self._lib_scan_token:
+            return
+        self._save_json(LIBRARY_FILE, {"root": root, "tracks": new_index})
+        GLib.idle_add(self._lib_scan_done, new_index, token)
+
+    def _lib_scan_done(self, index, token):
+        if token != self._lib_scan_token:
+            return False
+        self.lib_index = index
+        self._lib_scanning = False
+        self._lib_render()
+        self._render_home_tiles()
+        self.show_toast(f"Biblioteca atualizada: {len(index)} música(s).")
+        self._lib_enrich_start()
+        return False
+
+    # ---------- completar metadados online (Deezer) ----------
+    def _on_lib_online_toggled(self, btn):
+        self.config["library_online_meta"] = btn.get_active()
+        self._schedule_config_save()
+        if btn.get_active():
+            self._lib_enrich_start()
+
+    def _lib_needs_online(self, e):
+        return not (e.get("uploader") and e.get("album")) and not e.get("online_checked")
+
+    def _lib_enrich_start(self, paths=None, force=False):
+        if not self.config.get("library_online_meta", True) and not force:
+            return
+        if self._lib_scanning or self._lib_enriching or not self.lib_index:
+            if force:
+                self.show_toast("Aguarde: a biblioteca está sendo processada.")
+            return
+        if paths is None:
+            paths = [pth for pth, e in self.lib_index.items() if self._lib_needs_online(e)]
+        paths = [pth for pth in paths if pth in self.lib_index]
+        if not paths:
+            if force:
+                self.show_toast("Nada para buscar.")
+            return
+        self._lib_enriching = True
+        token = self._lib_scan_token
+        threading.Thread(target=self._lib_enrich_thread, args=(paths, token, force), daemon=True).start()
+
+    def _lib_enrich_thread(self, paths, token, force):
+        found = checked = errors = 0
+        total = len(paths)
+        try:
+            for n, path in enumerate(paths, start=1):
+                if token != self._lib_scan_token:
+                    return
+                entry = self.lib_index.get(path)
+                if not entry:
+                    continue
+                if entry.get("online_checked") and not force:
+                    continue
+                GLib.idle_add(self.lib_status.set_text, f"Buscando dados online... {n}/{total}")
+                try:
+                    res = self._lib_lookup_online(entry)
+                except Exception:
+                    errors += 1
+                    if errors >= 3:          # sem internet: para e tenta de novo numa próxima vez
+                        GLib.idle_add(self.show_toast, "Sem conexão: dados online ficam para depois.")
+                        break
+                    continue
+                errors = 0
+                checked += 1
+                if res and self._lib_apply_online(entry, res):
+                    found += 1
+                entry["online_checked"] = True
+                if checked % 20 == 0:
+                    self._save_json(LIBRARY_FILE, {"root": self.lib_root, "tracks": self.lib_index})
+                time.sleep(0.25)             # respeita o limite de requisições do Deezer
+            if checked and token == self._lib_scan_token:
+                self._save_json(LIBRARY_FILE, {"root": self.lib_root, "tracks": self.lib_index})
+                GLib.idle_add(self._lib_enrich_done, found, checked)
+        finally:
+            GLib.idle_add(self._lib_enrich_finished)
+
+    def _lib_enrich_finished(self):
+        self._lib_enriching = False
+        if not self._lib_scanning and self._lib_valid_root():
+            self.lib_status.set_text(f"Biblioteca: {self.lib_root}")
+        return False
+
+    def _lib_enrich_done(self, found, checked):
+        self.show_toast(f"Dados online: {found} de {checked} música(s) completadas.")
+        if self.main_stack.get_visible_child_name() == "offline":
+            self._lib_render()
+        self._render_home_recents()
+        return False
+
+    def _lib_lookup_online(self, entry):
+        """Melhor faixa do Deezer para um arquivo local, ou None. Conservador: exige título parecido,
+        artista compatível e duração próxima, para não trazer a faixa errada."""
+        title = self._clean_title(entry.get("title") or "")
+        artist = (entry.get("uploader") or "").strip()
+        if not title:
+            return None
+        dur = _clock_to_seconds(entry.get("duration"))
+        tkey = self._norm_key(re.sub(r"[\(\[].*?[\)\]]", " ", title))
+        akey = self._norm_key(artist)
+        if not tkey:
+            return None
+        queries = ([f'artist:"{artist}" track:"{title}"'] if artist else []) + [f"{artist} {title}".strip()]
+        seen, best, best_score = set(), None, 0.0
+        for q in queries:
+            data = self._http_json(f"{DEEZER_API}/search?q={urllib.parse.quote(q)}&limit=10").get("data") or []
+            for t in data:
+                if t.get("id") in seen:
+                    continue
+                seen.add(t.get("id"))
+                ck = self._norm_key(re.sub(r"[\(\[].*?[\)\]]", " ", t.get("title", "")))
+                if not ck:
+                    continue
+                ratio = 1.0 if ck == tkey else difflib.SequenceMatcher(None, ck, tkey).ratio()
+                if ratio < 0.85:
+                    continue
+                cak = self._norm_key((t.get("artist") or {}).get("name", ""))
+                if akey:
+                    if not (cak == akey or (len(cak) >= 3 and cak in akey) or (len(akey) >= 3 and akey in cak)):
+                        continue
+                    score, max_diff = 10.0, 10
+                else:                        # sem artista: só aceita casamento quase exato (título + duração)
+                    if ratio < 0.95 or not dur:
+                        continue
+                    score, max_diff = 5.0, 4
+                dz = t.get("duration") or 0
+                if dur and dz:
+                    diff = abs(dur - dz)
+                    if diff > max_diff:
+                        continue
+                    score += 4 if diff <= 3 else 1
+                score += ratio * 3
+                if score > best_score:
+                    best, best_score = t, score
+            if best:
+                break
+        if not best:
+            return None
+        album = best.get("album") or {}
+        year = ""
+        if album.get("id"):
+            year = self._lib_album_cache.get(album["id"])
+            if year is None:
+                try:
+                    year = (self._http_json(f"{DEEZER_API}/album/{album['id']}", timeout=6)
+                            .get("release_date") or "")[:4]
+                except Exception:
+                    year = ""
+                self._lib_album_cache[album["id"]] = year
+        return {
+            "artist": (best.get("artist") or {}).get("name", ""),
+            "album": album.get("title", ""),
+            "year": year or "",
+            "cover_url": album.get("cover_xl") or album.get("cover_big") or album.get("cover_medium") or "",
+        }
+
+    def _lib_apply_online(self, entry, res):
+        """Preenche só o que falta. Álbum/ano/capa só entram se o álbum não contradisser as tags."""
+        filled = []
+        if not entry.get("uploader") and res.get("artist"):
+            entry["uploader"] = entry["artist"] = res["artist"]
+            filled.append("artist")
+        cur_album = self._norm_key(entry.get("album") or "")
+        new_album = self._norm_key(res.get("album") or "")
+        album_ok = not cur_album or (new_album and (cur_album == new_album or cur_album in new_album
+                                                     or new_album in cur_album))
+        if album_ok:
+            if not entry.get("album") and res.get("album"):
+                entry["album"] = res["album"]
+                filled.append("album")
+            if not entry.get("year") and res.get("year"):
+                entry["year"] = res["year"]
+                filled.append("year")
+            if res.get("cover_url"):
+                entry["cover_url"] = res["cover_url"]
+        if filled:
+            entry["online_fields"] = filled
+        return bool(filled or entry.get("cover_url"))
+
     def _build_tab_history(self):
         tab_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         tab_box.set_border_width(20)
@@ -1441,6 +2295,8 @@ class MusicPlayerApp(Gtk.Window):
         self._select_nav(name)
         if name == "home":
             self._refresh_home_greeting()
+        elif name == "offline":
+            self._lib_render()
 
     def navigate(self, name):
         cur = self.main_stack.get_visible_child_name()
@@ -1549,6 +2405,22 @@ class MusicPlayerApp(Gtk.Window):
             except Exception:
                 pass
 
+    def _offline_badge(self, item):
+        """Ícone ⬇ para faixas disponíveis offline (arquivo local). Vazio para as demais."""
+        lbl = Gtk.Label()
+        lbl.set_valign(Gtk.Align.CENTER)
+        if item and item.get("path"):
+            if os.path.isfile(item["path"]):
+                lbl.set_markup('<span size="large" foreground="#2e9e5b">⬇</span>')
+                lbl.set_tooltip_text("Disponível offline")
+            else:
+                lbl.set_markup('<span size="large" foreground="#999999">⬇</span>')
+                lbl.set_tooltip_text("Arquivo offline não encontrado")
+        lbl.set_margin_start(2)
+        lbl.set_margin_end(2)
+        lbl.show()
+        return lbl
+
     def _make_heart(self, item=None):
         """Botão ♡/♥. Com item=None acompanha a faixa que está tocando."""
         btn = Gtk.Button()
@@ -1636,6 +2508,7 @@ class MusicPlayerApp(Gtk.Window):
             lbl = Gtk.Label(label=f"{item['title']}  —  {item.get('uploader','')} ({item.get('duration','')})", xalign=0)
             lbl.set_ellipsize(3)
             box.pack_start(lbl, True, True, 6)
+            box.pack_start(self._offline_badge(item), False, False, 0)
             box.pack_start(self._make_heart(item), False, False, 0)
             row.add(box)
             row.item = item
@@ -1763,6 +2636,8 @@ class MusicPlayerApp(Gtk.Window):
             "duration": duration,
             "duration_fmt": duration,
             "verified": bool(item.get("verified")),
+            **({k: item[k] for k in ("path", "offline", "album", "year", "track_no", "cover_url") if item.get(k)}
+               if item.get("path") else {}),
         }
 
     # ---------- Mensagens e Utilitários ----------
@@ -1938,6 +2813,7 @@ class MusicPlayerApp(Gtk.Window):
         btn_del = Gtk.Button.new_from_icon_name("edit-delete-symbolic", Gtk.IconSize.MENU)
         btn_del.set_relief(Gtk.ReliefStyle.NONE)
         btn_del.connect("clicked", lambda b: self._remove_track_from_playlist(row))
+        box.pack_start(self._offline_badge(item), False, False, 0)
         box.pack_start(self._make_heart(item), False, False, 0)
         box.pack_start(btn_del, False, False, 0)
 
@@ -2419,9 +3295,11 @@ class MusicPlayerApp(Gtk.Window):
         row = Gtk.ListBoxRow()
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
 
-        lbl = Gtk.Label(label=f"{i+1}. {item['title']} ({item.get('duration','')})", xalign=0)
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup(self._queue_label_markup(i, item, i == self.current_index))
         lbl.set_ellipsize(3)
         box.pack_start(lbl, True, True, 6)
+        row.label = lbl
 
         btn_up = Gtk.Button.new_from_icon_name("go-up-symbolic", Gtk.IconSize.MENU)
         btn_up.set_relief(Gtk.ReliefStyle.NONE)
@@ -2435,6 +3313,7 @@ class MusicPlayerApp(Gtk.Window):
         btn_del.set_relief(Gtk.ReliefStyle.NONE)
         btn_del.connect("clicked", lambda b: self._remove_queue_row(row))
 
+        box.pack_start(self._offline_badge(item), False, False, 0)
         box.pack_start(self._make_heart(item), False, False, 0)
         for b in (btn_up, btn_down, btn_del):
             box.pack_start(b, False, False, 0)
@@ -2479,12 +3358,6 @@ class MusicPlayerApp(Gtk.Window):
             self._update_queue_indices()
 
     def _update_queue_indices(self):
-        for i, child in enumerate(self.queue_list.get_children()):
-            if i < len(self.queue):
-                item = self.queue[i]
-                box = child.get_child()
-                lbl = box.get_children()[0]
-                lbl.set_text(f"{i+1}. {item['title']} ({item.get('duration','')})")
         self._highlight_current_row()
 
     def on_delete_selected_queue(self, button):
@@ -2562,7 +3435,7 @@ class MusicPlayerApp(Gtk.Window):
 
     def add_to_history(self, item):
         item = self._normalize_track(item)
-        if not self.history or self.history[0].get("id") != item["id"]:
+        if not self.history or self._track_key(self.history[0]) != self._track_key(item):
             self.history.insert(0, item)
             self.history = self.history[:HISTORY_LIMIT]
             self._save_json(HISTORY_FILE, self.history)
@@ -2580,6 +3453,7 @@ class MusicPlayerApp(Gtk.Window):
             lbl.set_margin_top(4)
             lbl.set_margin_bottom(4)
             hbox.pack_start(lbl, True, True, 0)
+            hbox.pack_start(self._offline_badge(item), False, False, 0)
             hbox.pack_start(self._make_heart(item), False, False, 0)
             row.add(hbox)
             row.item = item
@@ -2641,6 +3515,9 @@ class MusicPlayerApp(Gtk.Window):
             self.lyrics_album_label.set_text("")
             self.lyrics_year_label.set_text("")
             self.lyrics_art_img.set_from_icon_name("audio-x-generic", Gtk.IconSize.DIALOG)
+            if item.get("path"):
+                threading.Thread(target=self._local_lyrics_thread, args=(item, self._play_token), daemon=True).start()
+                return
             threading.Thread(
                 target=self._fetch_lyrics_thread,
                 args=(item["title"], item.get("uploader", "")),
@@ -2687,6 +3564,36 @@ class MusicPlayerApp(Gtk.Window):
 
         meta = self._fetch_track_metadata(clean_t, uploader)
         GLib.idle_add(self._apply_lyrics_result, lyrics_found, clean_t, meta)
+
+    def _local_lyrics_thread(self, item, token):
+        """Faixa offline: tags/.lrc do próprio arquivo primeiro; só vai à internet se faltar algo."""
+        lyrics = read_local_lyrics(item["path"])
+        entry = self.lib_index.get(item["path"]) or {}
+        meta = {"artist": item.get("uploader") or entry.get("uploader", ""),
+                "album": item.get("album") or entry.get("album", ""),
+                "year": item.get("year") or entry.get("year", ""), "artwork": ""}
+        title = item.get("title", "")
+        if not lyrics or not meta["album"]:
+            clean_t = self._clean_title(title)
+            try:
+                if not lyrics:
+                    q = f"{meta['artist']} {clean_t}".strip()
+                    data = self._http_json(f"https://lrclib.net/api/search?q={urllib.parse.quote(q)}")
+                    for res in data:
+                        if res.get("plainLyrics"):
+                            lyrics = res["plainLyrics"]
+                            break
+                        if res.get("syncedLyrics"):
+                            lyrics = re.sub(r"\[\d+:\d+\.\d+\]\s*", "", res["syncedLyrics"])
+                            break
+                if not meta["album"]:
+                    online = self._fetch_track_metadata(clean_t, meta["artist"])
+                    for k in ("album", "year"):
+                        meta[k] = meta[k] or online.get(k, "")
+            except Exception:
+                pass
+        if token == self._play_token:
+            GLib.idle_add(self._apply_lyrics_result, lyrics, title, meta)
 
     def _fetch_track_metadata(self, title, uploader):
         """Artista, álbum, ano e capa exibidos na aba Letra (via Deezer)."""
@@ -3116,6 +4023,8 @@ class MusicPlayerApp(Gtk.Window):
     def _dup_keys(self, t):
         """Chaves de identidade de uma faixa: id do YouTube e/ou título+artista normalizados."""
         keys = set()
+        if t.get("path"):
+            return {"file:" + t["path"]}
         tid = (t.get("id") or "").strip()
         if tid:
             keys.add("id:" + tid)
@@ -3671,11 +4580,26 @@ class MusicPlayerApp(Gtk.Window):
         self.current_index = len(self.queue) - 1
         self.play_current()
 
+    def _media_source(self, item):
+        """Caminho do arquivo (faixa offline) ou URL do YouTube. None se o arquivo sumiu."""
+        if item.get("path"):
+            return item["path"] if os.path.isfile(item["path"]) else None
+        return f"https://www.youtube.com/watch?v={item['id']}"
+
     def play_current(self):
         if not (0 <= self.current_index < len(self.queue)):
             return
         item = self.queue[self.current_index]
-        url = f"https://www.youtube.com/watch?v={item['id']}"
+        url = self._media_source(item)
+        if url is None:
+            self.mostrar_mensagem(f"Arquivo não encontrado: {item['title']} (pasta movida ou disco desconectado?)")
+            self.show_toast("Arquivo offline não encontrado. Pulando.")
+            self._highlight_current_row()
+            self._missing_skips += 1
+            if self._missing_skips <= len(self.queue):
+                GLib.idle_add(self._skip_missing_file)
+            return
+        self._missing_skips = 0
 
         self._play_token += 1
         self._track_started = False
@@ -3690,9 +4614,17 @@ class MusicPlayerApp(Gtk.Window):
 
         self._schedule_stall_watchdog(self._play_token)
 
-        threading.Thread(target=self._fetch_thumbnail, args=(item["id"], item["title"]), daemon=True).start()
+        if item.get("path"):
+            threading.Thread(target=self._load_local_thumbnail, args=(item, self._play_token), daemon=True).start()
+        else:
+            threading.Thread(target=self._fetch_thumbnail, args=(item["id"], item["title"]), daemon=True).start()
         self.search_current_lyrics()
         self._sync_artist_tabs(self._guess_artist(item))
+
+    def _skip_missing_file(self):
+        if self.current_index + 1 < len(self.queue):
+            self.on_next(None)
+        return False
 
     # ---------- Watchdog ----------
     def _schedule_stall_watchdog(self, token, delay_seconds=12):
@@ -3726,7 +4658,10 @@ class MusicPlayerApp(Gtk.Window):
             self.mostrar_mensagem(
                 f"'{item['title']}' não iniciou. Tentando novamente ({self._stall_retry_count}/{max_retries})..."
             )
-            url = f"https://www.youtube.com/watch?v={item['id']}"
+            url = self._media_source(item)
+            if url is None:
+                self.on_next(None)
+                return False
             self.mpv.load(url)
             self._schedule_stall_watchdog(token)
         else:
@@ -3762,12 +4697,85 @@ class MusicPlayerApp(Gtk.Window):
         finally:
             GLib.idle_add(self._notify, APP_NAME, f"Tocando: {title}", icon_path or "audio-x-generic")
 
+    def _local_cover_cached(self, item):
+        """(bytes, caminho_do_cache) da capa de uma faixa offline. Cache por álbum/pasta em COVERS_DIR."""
+        path = item.get("path", "")
+        os.makedirs(COVERS_DIR, exist_ok=True)
+        key = re.sub(r"\W+", "_", f"{os.path.dirname(path)}_{item.get('album') or os.path.basename(path)}")[-120:]
+        cache = os.path.join(COVERS_DIR, key + ".jpg")
+        if os.path.isfile(cache):
+            with open(cache, "rb") as fh:
+                return fh.read(), cache
+        data = local_cover_bytes(path)
+        if not data:
+            url = item.get("cover_url") or (getattr(self, "lib_index", {}).get(path) or {}).get("cover_url")
+            if url:
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = resp.read()
+                except Exception:
+                    data = None
+        if data:
+            with open(cache, "wb") as fh:
+                fh.write(data)
+            return data, cache
+        return None, None
+
+    def _load_local_artwork_into(self, item, image_widget, width, height):
+        """Capa de faixa offline num card. Mantém a proporção (capas são quadradas) e centraliza."""
+        try:
+            data, _ = self._local_cover_cached(item)
+            if not data:
+                return
+            loader = GdkPixbuf.PixbufLoader()
+            loader.write(data)
+            loader.close()
+            pb = loader.get_pixbuf()
+            ratio = min(width / pb.get_width(), height / pb.get_height())
+            w, h = max(1, int(pb.get_width() * ratio)), max(1, int(pb.get_height() * ratio))
+            GLib.idle_add(image_widget.set_from_pixbuf, pb.scale_simple(w, h, GdkPixbuf.InterpType.BILINEAR))
+        except Exception:
+            pass
+
+    def _load_local_thumbnail(self, item, token):
+        """Capa da faixa offline (embutida / folder.jpg), com cache em disco."""
+        icon_path = None
+        try:
+            data, cache = self._local_cover_cached(item)
+            if data:
+                icon_path = cache
+                loader = GdkPixbuf.PixbufLoader()
+                loader.write(data)
+                loader.close()
+                pb = loader.get_pixbuf()
+                if token == self._play_token:
+                    GLib.idle_add(self.thumbnail_img.set_from_pixbuf, pb.scale_simple(48, 48, GdkPixbuf.InterpType.BILINEAR))
+                    GLib.idle_add(self._set_lyrics_cover, pb.scale_simple(80, 80, GdkPixbuf.InterpType.BILINEAR), token)
+            elif token == self._play_token:
+                GLib.idle_add(self.thumbnail_img.set_from_icon_name, "audio-x-generic", Gtk.IconSize.DIALOG)
+        except Exception:
+            if token == self._play_token:
+                GLib.idle_add(self.thumbnail_img.set_from_icon_name, "audio-x-generic", Gtk.IconSize.DIALOG)
+        finally:
+            GLib.idle_add(self._notify, APP_NAME, f"Tocando: {item.get('title', '')}", icon_path or "audio-x-generic")
+
+    def _set_lyrics_cover(self, pixbuf, token):
+        if token == self._play_token:
+            self.lyrics_art_img.set_from_pixbuf(pixbuf)
+        return False
+
+    def _queue_label_markup(self, i, item, current=False):
+        txt = GLib.markup_escape_text(f"{i+1}. {item['title']} ({item.get('duration','')})")
+        return f"<b>▶ {txt}</b>" if current else txt
+
     def _highlight_current_row(self):
+        """Marca a faixa tocando em negrito. Não mexe no estado de seleção das linhas
+        (usar SELECTED aqui fazia a seleção da fila 'sumir' e confundia o download)."""
         for i, row in enumerate(self.queue_list.get_children()):
-            if i == self.current_index:
-                row.set_state_flags(Gtk.StateFlags.SELECTED, True)
-            else:
-                row.unset_state_flags(Gtk.StateFlags.SELECTED)
+            lbl = getattr(row, "label", None)
+            if lbl is not None and i < len(self.queue):
+                lbl.set_markup(self._queue_label_markup(i, self.queue[i], i == self.current_index))
 
     # ---------- Callbacks do MPV ----------
     def on_mpv_time_change(self, pos):
@@ -3917,10 +4925,38 @@ class MusicPlayerApp(Gtk.Window):
         self.on_search(None)
 
     # ---------- Download MP3 (Com Progresso em Real-time) ----------
+    def _selection_lists(self):
+        return [self.results_list, self.queue_list, self.pl_tracks_list, self.history_list,
+                self.favorites_list, self.discover_tracks_list, self.offline_tracks_list]
+
+    def _wire_selection_tracking(self):
+        """Só UMA lista mantém seleção por vez; a última em que você clicou é a 'ativa'.
+        Antes, a lista de resultados/recomendadas guardava a seleção antiga e, por ter
+        prioridade fixa, o botão Baixar (e '+ Playlist') agia sempre nela, nunca na Fila."""
+        self._sel_guard = False
+        self._active_list = None
+        for lb in self._selection_lists():
+            lb.connect("selected-rows-changed", self._on_any_selection_changed)
+
+    def _on_any_selection_changed(self, lb):
+        if self._sel_guard or not lb.get_selected_rows():
+            return
+        self._sel_guard = True
+        try:
+            for other in self._selection_lists():
+                if other is not lb and other.get_selected_rows():
+                    other.unselect_all()
+            self._active_list = lb
+        finally:
+            self._sel_guard = False
+
     def get_active_selection(self):
-        for lb in (self.results_list, self.queue_list, self.pl_tracks_list, self.history_list, self.favorites_list):
-            rows = lb.get_selected_rows()
-            items = [r.item for r in rows if hasattr(r, "item")]
+        lists = self._selection_lists()
+        active = getattr(self, "_active_list", None)
+        if active is not None:
+            lists = [active] + [lb for lb in lists if lb is not active]
+        for lb in lists:
+            items = [r.item for r in lb.get_selected_rows() if hasattr(r, "item")]
             if items:
                 return items
         return []
@@ -3929,6 +4965,16 @@ class MusicPlayerApp(Gtk.Window):
         items = self.get_active_selection()
         if not items:
             self.mostrar_mensagem("Selecione uma ou mais faixas para baixar.")
+            return
+        online = [i for i in items if not i.get("path")]
+        if not online:
+            self.mostrar_mensagem("As faixas selecionadas já estão offline no seu computador.")
+            return
+        if len(online) < len(items):
+            self.show_toast(f"{len(items) - len(online)} faixa(s) offline ignorada(s).")
+        items = online
+        if getattr(self, "_active_list", None) is self.discover_tracks_list:
+            self._download_dtracks(items)  # recomendadas ainda não têm id do YouTube
             return
         if len(items) == 1:
             self._download_single_dialog(items[0])
@@ -4385,6 +5431,8 @@ class MusicPlayerApp(Gtk.Window):
     # ======================================================================
     @staticmethod
     def _track_key(t):
+        if t.get("path"):
+            return "file:" + t["path"]
         tid = (t.get("id") or "").strip()
         return tid or f"{(t.get('title') or '').lower()}|{(t.get('uploader') or '').lower()}"
 
