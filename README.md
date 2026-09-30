@@ -90,41 +90,6 @@ Pronto. Vá para [Como usar](#como-usar-em-1-minuto).
 
 ---
 
-## Como usar em 1 minuto
-
-1. Abra a aba **Buscar**, digite o nome de uma música ou artista e aperte `Enter`.
-2. Dê **duplo clique** numa faixa para tocar. Clique com o **botão direito** para enfileirar, adicionar a uma playlist ou baixar.
-3. Já tem um link? Copie e aperte `Ctrl+V` em qualquer lugar da janela para tocar na hora.
-4. Use as outras abas para explorar:
-
-| Aba | O que faz |
-|---|---|
-| **Buscar** | Pesquisa por texto ou link, com nomes de música e artista limpos. Menu de botão direito e seleção múltipla para tocar, enfileirar, adicionar a playlists ou baixar. |
-| **Fila** | Fila de reprodução com reordenação e seleção múltipla. |
-| **Recentes** | Histórico das últimas faixas tocadas. |
-| **Letra** | Letra da faixa atual, com título, artista, álbum, ano e capa. |
-| **Descobrir** | Artistas similares e faixas recomendadas a partir de um termo ou da música que está tocando. |
-| **Wiki** | Biografia e discografia do artista, com as faixas de cada álbum. |
-| **Playlists** | Crie, renomeie, busque e toque suas playlists. |
-| **Perfil** | Exporte e importe seu perfil (nome, playlists e histórico) para trocar de PC. |
-| **Sobre** | Versão, licença e créditos. |
-
-Também tem notificações de "Tocando agora" e controle de volume com mudo.
-
-### Atalhos de teclado
-
-| Tecla | Ação |
-|---|---|
-| `Espaço` | Play / Pause |
-| `←` / `→` | Voltar / avançar 5 s |
-| `Ctrl+←` / `Ctrl+→` | Faixa anterior / próxima |
-| `M` | Mudo |
-| `Ctrl+V` | Colar link e tocar |
-
-> Os atalhos de tecla única (`Espaço`, `M`, setas) não funcionam enquanto o cursor estiver dentro de um campo de texto, como a caixa de busca. Clique numa lista para devolver o foco.
-
----
-
 ## Manutenção (atualizar, diagnosticar, desinstalar)
 
 Você pode fazer tudo isso **sem digitar nada**, por qualquer um destes caminhos:
