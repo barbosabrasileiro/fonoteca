@@ -49,7 +49,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.4"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -2744,15 +2744,21 @@ class MusicPlayerApp(Gtk.Window):
         return (title or "Sem título"), artist
 
     def _guess_artist(self, item):
-        """Melhor palpite do artista de uma faixa (para Wiki/Descobrir)."""
-        if item.get("verified") and item.get("artist"):
-            return self._clean_artist_name(item["artist"])
+        """Melhor palpite do artista de uma faixa (para Wiki/Descobrir).
+
+        Faixas verificadas (Deezer) e faixas offline (artista vindo das tags do
+        arquivo) têm o campo de artista confiável. Só para itens do YouTube sem
+        correspondência é que se tenta deduzir o artista pelo título "Artista - Música".
+        """
+        known = item.get("artist") or item.get("uploader") or ""
+        if (item.get("verified") or item.get("path")) and known:
+            return self._clean_artist_name(known)
         parts = re.split(r"\s+[-–—]\s+", item.get("title", ""), maxsplit=1)
         if len(parts) == 2 and 0 < len(parts[0]) <= 40:
             name = self._clean_artist_name(parts[0])
             if name:
                 return name
-        return self._clean_artist_name(item.get("uploader") or item.get("artist") or "")
+        return self._clean_artist_name(known)
 
     def _notify(self, title, message, icon="audio-x-generic"):
         try:
