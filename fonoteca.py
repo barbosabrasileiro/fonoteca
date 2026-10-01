@@ -49,7 +49,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.0.4"
+APP_VERSION = "2.0.6"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -422,6 +422,7 @@ class MPVController:
         self._send(["observe_property", 1, "time-pos"])
         self._send(["observe_property", 2, "duration"])
         self._send(["observe_property", 3, "pause"])
+        self._send(["observe_property", 4, "idle-active"])
         return True
 
     def _listen(self):
@@ -456,6 +457,8 @@ class MPVController:
                         GLib.idle_add(self.callbacks["on_duration_change"], val or 0)
                     elif name == "pause" and "on_pause_change" in self.callbacks:
                         GLib.idle_add(self.callbacks["on_pause_change"], val)
+                    elif name == "idle-active" and "on_idle_change" in self.callbacks:
+                        GLib.idle_add(self.callbacks["on_idle_change"], bool(val))
 
                 if "request_id" in msg and "error" in msg:
                     if msg["error"] != "success" and "on_load_error" in self.callbacks:
@@ -476,6 +479,7 @@ class MPVController:
         with self._lock:
             self._request_id += 1
             rid = self._request_id
+        self._send(["set_property", "pause", False])  # escolher uma faixa sempre toca (mesmo se estava pausado)
         self._send(["loadfile", url, "replace"], request_id=rid)
 
     def pause_toggle(self):
@@ -572,6 +576,9 @@ class MusicPlayerApp(Gtk.Window):
         self.is_shuffle = False
         self.track_duration = 0
         self.user_is_seeking = False
+        # Estado do play/pause: ao abrir não há nada tocando (mpv ocioso)
+        self._mpv_idle = True
+        self._mpv_paused = False
         
         # Gerenciamento de timeouts e cancelamento de buscas
         self._toast_timeout_id = None
@@ -765,6 +772,7 @@ class MusicPlayerApp(Gtk.Window):
                 "on_time_change": self.on_mpv_time_change,
                 "on_duration_change": self.on_mpv_duration_change,
                 "on_pause_change": self.on_mpv_pause_change,
+                "on_idle_change": self.on_mpv_idle_change,
             }
         )
         if not self.mpv.start(initial_volume=self.config.get("volume", 100)):
@@ -1422,6 +1430,7 @@ class MusicPlayerApp(Gtk.Window):
     def _build_page_artist(self):
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.artist_scroll = scroll
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         page.set_border_width(20)
         self.wiki_entry = Gtk.Entry()  # apenas guarda o termo pesquisado (não é exibido)
@@ -2314,10 +2323,15 @@ class MusicPlayerApp(Gtk.Window):
         self._after_nav(name)
         if name == "home":
             self._home_scroll_top()
+        elif name == "artist":
+            self._scroll_top(self.artist_scroll)
+
+    def _scroll_top(self, sw):
+        adj = sw.get_vadjustment()
+        adj.set_value(adj.get_lower())
 
     def _home_scroll_top(self):
-        adj = self.home_scroll.get_vadjustment()
-        adj.set_value(adj.get_lower())
+        self._scroll_top(self.home_scroll)
 
     def go_back(self, button=None):
         if not self._nav_history:
@@ -3371,6 +3385,7 @@ class MusicPlayerApp(Gtk.Window):
                 else:
                     self.current_index = -1
                     self.mpv.stop()
+                    self._set_mpv_idle(True)
             elif self.current_index > idx:
                 self.current_index -= 1
 
@@ -3404,6 +3419,7 @@ class MusicPlayerApp(Gtk.Window):
         elif playing_item is not None:
             self.current_index = -1
             self.mpv.stop()
+            self._set_mpv_idle(True)
             self.now_playing_label.set_text("Parado")
 
         self._update_queue_indices()
@@ -3419,6 +3435,7 @@ class MusicPlayerApp(Gtk.Window):
         self._save_json(QUEUE_FILE, self.queue)
         self.current_index = -1
         self.mpv.stop()
+        self._set_mpv_idle(True)
         self.render_queue()
 
     def on_queue_activated(self, listbox, row):
@@ -4625,6 +4642,9 @@ class MusicPlayerApp(Gtk.Window):
         self._stall_retry_count = 0
         self._cancel_stall_watchdog()
 
+        self._mpv_paused = False
+        self._mpv_idle = False
+        self._update_playpause_icon()
         self.mpv.load(url)
         self.now_playing_label.set_text(f"{item['title']}")
         self._highlight_current_row()
@@ -4810,14 +4830,47 @@ class MusicPlayerApp(Gtk.Window):
         self.seek_scale.set_range(0, duration)
 
     def on_mpv_pause_change(self, is_paused):
-        icon = "media-playback-start-symbolic" if is_paused else "media-playback-pause-symbolic"
-        self.btn_playpause.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
+        self._mpv_paused = bool(is_paused)
+        self._update_playpause_icon()
+
+    def on_mpv_idle_change(self, is_idle):
+        self._mpv_idle = bool(is_idle)
+        self._update_playpause_icon()
+
+    def _set_mpv_idle(self, idle):
+        self._mpv_idle = bool(idle)
+        self._update_playpause_icon()
+
+    def _update_playpause_icon(self):
+        """Mostra 'pause' só quando realmente há áudio tocando; caso contrário, 'play'."""
+        playing = not self._mpv_idle and not self._mpv_paused
+        icon = "media-playback-pause-symbolic" if playing else "media-playback-start-symbolic"
+        if icon == getattr(self, "_playpause_icon", None):
+            return False
+        self._playpause_icon = icon
+        self.btn_playpause.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.LARGE_TOOLBAR))
+        return False
+
+    def toggle_playback(self):
+        """Play/Pause: se nada está carregado, começa pela primeira faixa da fila."""
+        if self._mpv_idle:
+            if not self.queue:
+                self.show_toast("Sua fila está vazia. Escolha ou adicione músicas para tocar.")
+                self.mostrar_mensagem("Escolha ou adicione músicas à fila para começar.")
+                return
+            self.current_index = 0
+            self.play_current()
+            return
+        self.mpv.pause_toggle()
 
     def on_track_finished(self):
         if self.is_repeat:
             self.play_current()
-        else:
-            self.on_next(None)
+            return
+        has_next = (self.is_shuffle and len(self.queue) > 1) or self.current_index + 1 < len(self.queue)
+        if not has_next:
+            self._set_mpv_idle(True)  # fila acabou: o botão volta a ser "play"
+        self.on_next(None)
 
     def on_load_error(self, error_msg):
         item = self.queue[self.current_index] if 0 <= self.current_index < len(self.queue) else None
@@ -4829,7 +4882,7 @@ class MusicPlayerApp(Gtk.Window):
 
     # ---------- Ações de Botões e Sliders ----------
     def on_play_pause(self, button):
-        self.mpv.pause_toggle()
+        self.toggle_playback()
 
     def on_prev(self, button):
         if self.current_index > 0:
@@ -5425,7 +5478,7 @@ class MusicPlayerApp(Gtk.Window):
         # Atalhos ativados fora de campos de texto
         if not in_entry:
             if event.keyval == Gdk.KEY_space:
-                self.mpv.pause_toggle()
+                self.toggle_playback()
                 return True
 
             elif not state and event.keyval in (Gdk.KEY_m, Gdk.KEY_M):
