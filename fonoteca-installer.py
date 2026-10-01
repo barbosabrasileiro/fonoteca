@@ -16,6 +16,9 @@ atualizar e diagnosticar a Fonoteca em qualquer distro Linux.
 O instalador se copia para a pasta de instalação e cria o atalho "Instalador da
 Fonoteca" no menu. Também dá para abri-lo pela aba "Sobre" da própria Fonoteca.
 
+Depois de uma atualização, uma Fonoteca que já estava aberta continua rodando o código
+antigo. O instalador percebe isso, avisa para reiniciar e oferece fechar e reabrir.
+
 Se o GTK ainda não estiver instalado (ou não houver ambiente gráfico), o mesmo
 programa funciona no terminal:
 
@@ -38,11 +41,13 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -61,7 +66,7 @@ except Exception:  # sem PyGObject/GTK: cai para o modo terminal
 # ----------------------------------------------------------------------
 # Constantes
 # ----------------------------------------------------------------------
-INSTALLER_VERSION = "1.0.0"
+INSTALLER_VERSION = "1.1.1"
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
@@ -149,7 +154,7 @@ GROUP_LABELS = {
 # Utilidades gerais
 # ----------------------------------------------------------------------
 class Result:
-    """Resultado de uma etapa ou verificação. status: ok | warn | fail | info."""
+    """Resultado de uma etapa ou verificação. status: ok | warn | fail | info | restart."""
 
     __slots__ = ("status", "title", "detail", "fix")
 
@@ -160,8 +165,8 @@ class Result:
         self.fix = fix  # "deps" | "ytdlp" | "socket" | None
 
 
-STATUS_TAG = {"ok": "OK", "warn": "AVISO", "fail": "FALHA", "info": "INFO"}
-STATUS_MARK = {"ok": "✔", "warn": "!", "fail": "✘", "info": "i"}
+STATUS_TAG = {"ok": "OK", "warn": "AVISO", "fail": "FALHA", "info": "INFO", "restart": "REINICIE"}
+STATUS_MARK = {"ok": "✔", "warn": "!", "fail": "✘", "info": "i", "restart": "↻"}
 
 
 def capture(cmd, timeout=15, env=None):
@@ -301,6 +306,110 @@ def is_git_repo(path):
     return bool(path) and os.path.isdir(os.path.join(path, ".git"))
 
 
+def file_sha256(path):
+    """SHA-256 de um arquivo, ou None se não der para ler."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+SELF_HASH = file_sha256(os.path.abspath(__file__))  # código que este instalador carregou ao abrir
+
+
+def running_app_pids():
+    """PIDs das Fonotecas abertas (python rodando fonoteca.py) deste usuário, sem contar este processo."""
+    pids, me, uid = [], os.getpid(), os.getuid()
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return pids
+    for name in names:
+        if not name.isdigit() or int(name) == me:
+            continue
+        try:
+            if os.stat(f"/proc/{name}").st_uid != uid:
+                continue
+            with open(f"/proc/{name}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if len(argv) < 2 or b"python" not in os.path.basename(argv[0]).lower():
+            continue
+        script = next((a for a in argv[1:] if a and not a.startswith(b"-")), b"")
+        if os.path.basename(script) == b"fonoteca.py":
+            pids.append(int(name))
+    return pids
+
+
+def proc_start_time(pid):
+    """Momento (epoch) em que o processo começou, ou None."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            raw = f.read().decode("utf-8", "replace")
+        ticks = int(raw[raw.rindex(")") + 2:].split()[19])
+        with open("/proc/stat", encoding="utf-8") as f:
+            btime = next(int(line.split()[1]) for line in f if line.startswith("btime"))
+        return btime + ticks / os.sysconf("SC_CLK_TCK")
+    except Exception:
+        return None
+
+
+def outdated_app_pids(app_py):
+    """Fonotecas abertas que começaram antes da última alteração do fonoteca.py (rodam código antigo)."""
+    try:
+        mtime = os.path.getmtime(app_py)
+    except OSError:
+        return []
+    out = []
+    for pid in running_app_pids():
+        started = proc_start_time(pid)
+        if started and started + 2 < mtime:
+            out.append(pid)
+    return out
+
+
+def restart_app(install_dir):
+    """Fecha as Fonotecas abertas e abre de novo. Devolve (ok, mensagem)."""
+    launcher = os.path.join(install_dir, "fonoteca.sh")
+    if not os.access(launcher, os.X_OK):
+        return False, f"Launcher não encontrado em {launcher}. Rode Atualizar para recriá-lo."
+    pids = running_app_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            return False, f"Não consegui fechar a Fonoteca (processo {pid}): {e}"
+    deadline = time.time() + 8
+    while time.time() < deadline and set(pids) & set(running_app_pids()):
+        time.sleep(0.2)
+    for pid in set(pids) & set(running_app_pids()):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    # mpv que possa ter sobrado usando o socket da Fonoteca
+    if shutil.which("pkill"):
+        capture(["pkill", "-f", os.path.basename(MPV_SOCKET)], timeout=5)
+        time.sleep(0.3)
+    try:
+        os.remove(MPV_SOCKET)
+    except OSError:
+        pass
+    try:
+        subprocess.Popen([launcher], start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        return False, f"A Fonoteca foi fechada, mas não consegui abri-la de novo: {e}"
+    return True, "Fonoteca reaberta com a versão nova."
+
+
 # ----------------------------------------------------------------------
 # Motor (independe de interface: usado pelo assistente gráfico e pelo terminal)
 # ----------------------------------------------------------------------
@@ -309,6 +418,7 @@ class Engine:
         self.log = log
         self.interactive = interactive  # True no terminal: permite sudo com senha
         self.results = []
+        self.restart_needed = False  # há uma Fonoteca aberta rodando código antigo
 
     # ---------- registro ----------
     def add(self, status, title, detail="", fix=None):
@@ -561,7 +671,7 @@ class Engine:
             os.close(fd)
             size = self._download(YTDLP_URL, tmp, "Baixando yt-dlp")
             expected = self._expected_sha256("yt-dlp")
-            actual = hashlib.sha256(open(tmp, "rb").read()).hexdigest()
+            actual = file_sha256(tmp)
             if expected and actual != expected:
                 self.add("fail", "yt-dlp", "O SHA-256 do arquivo baixado não confere; instalação cancelada.")
                 return
@@ -603,6 +713,11 @@ class Engine:
         if reason:
             self.add("fail", "Pasta de instalação", reason)
             return False
+        src_ok, src_err = syntax_ok(src_py)
+        if not src_ok:
+            self.add("fail", "fonoteca.py novo com erro de sintaxe",
+                     f"{src_err}\nNada foi alterado: a versão instalada continua intacta.")
+            return False
 
         old_version = read_app_version(os.path.join(install_dir, "fonoteca.py"))
         new_version = read_app_version(src_py) or "?"
@@ -610,12 +725,16 @@ class Engine:
             os.makedirs(install_dir, exist_ok=True)
             if not same_path(install_dir, src_dir):
                 target_py = os.path.join(install_dir, "fonoteca.py")
-                if os.path.exists(target_py):
-                    shutil.copy2(target_py, target_py + ".bak")
+                if os.path.exists(target_py) and file_sha256(target_py) != file_sha256(src_py):
+                    shutil.copy2(target_py, target_py + ".bak")  # só quando algo muda: não perde a versão anterior
                 for name in PAYLOAD_FILES:
                     s = os.path.join(src_dir, name)
-                    if os.path.exists(s):
-                        shutil.copy2(s, os.path.join(install_dir, name))
+                    if not os.path.exists(s):
+                        continue
+                    if name == INSTALLER_FILE and not syntax_ok(s)[0]:
+                        self.add("warn", "Instalador novo ignorado", f"{INSTALLER_FILE} da origem tem erro de sintaxe.")
+                        continue
+                    shutil.copy2(s, os.path.join(install_dir, name))
                 for name in PAYLOAD_DIRS:
                     s = os.path.join(src_dir, name)
                     if os.path.isdir(s):
@@ -812,6 +931,7 @@ class Engine:
 
     def run_update(self, app=True, ytdlp=True, system=False):
         self.results = []
+        self.restart_needed = False
         self.log(f"{APP_NAME} · atualização")
         if system:
             self.upgrade_system()
@@ -831,11 +951,36 @@ class Engine:
                              "A pasta de onde a Fonoteca foi instalada não existe mais. Baixe de novo com "
                              "'git clone' e rode 'python3 fonoteca-installer.py --update' dentro dela.")
                 else:
+                    app_py = os.path.join(state["install_dir"], "fonoteca.py")
+                    hash_before = file_sha256(app_py)
+                    ver_before = read_app_version(app_py) or "?"
                     self.refresh_source(src)
-                    self.install_app(state["install_dir"], menu=state.get("menu", True),
-                                     desktop=state.get("desktop", False), update=True,
-                                     installer_menu=state.get("installer_menu", True), source=src)
+                    done = self.install_app(state["install_dir"], menu=state.get("menu", True),
+                                            desktop=state.get("desktop", False), update=True,
+                                            installer_menu=state.get("installer_menu", True), source=src)
+                    if done:
+                        self._check_restart(app_py, hash_before, ver_before, state["install_dir"])
         self._verify_essentials()
+
+    def _check_restart(self, app_py, hash_before, ver_before, install_dir):
+        """Após atualizar pelo git: avisa se a Fonoteca aberta ainda roda o código antigo."""
+        self.step("Conferindo se é preciso reiniciar")
+        hash_after = file_sha256(app_py)
+        ver_after = read_app_version(app_py) or "?"
+        if hash_after and hash_after != hash_before:
+            if running_app_pids():
+                self.restart_needed = True
+                change = f"{ver_before} → {ver_after}" if ver_before != ver_after else f"versão {ver_after} (código alterado)"
+                self.add("restart", "Reinicie a Fonoteca para usar a versão nova",
+                         f"{change}. A janela que está aberta continua na versão antiga até ser fechada e aberta de novo.")
+            else:
+                self.add("ok", "Nada para reiniciar", "A Fonoteca não está aberta; a próxima abertura já usa a versão nova.")
+        else:
+            self.add("ok", "Nada para reiniciar", "O código da Fonoteca não mudou.")
+        inst_new = file_sha256(os.path.join(install_dir, INSTALLER_FILE))
+        if SELF_HASH and inst_new and inst_new != SELF_HASH:
+            self.add("info", "O instalador também foi atualizado",
+                     "Feche e abra o Instalador da Fonoteca de novo para usar a versão nova dele.")
 
     # ---------- origem das atualizações ----------
     def find_source(self, install_dir, state):
@@ -868,7 +1013,7 @@ class Engine:
         return SOURCE_CLONE_DIR if rc == 0 and has_app_source(SOURCE_CLONE_DIR) else None
 
     def refresh_source(self, src):
-        """Baixa novidades (git pull) quando a origem é um repositório git."""
+        """Baixa novidades do GitHub quando a origem é um repositório git."""
         self.step("Buscando novidades da Fonoteca")
         if not is_git_repo(src):
             self.add("info", "Código da Fonoteca",
@@ -878,19 +1023,34 @@ class Engine:
         if not shutil.which("git"):
             self.add("warn", "git não encontrado", "Instale o git para baixar novidades automaticamente.")
             return
-        before = read_app_version(os.path.join(src, "fonoteca.py")) or "?"
         env = dict(os.environ, GIT_TERMINAL_PROMPT="0", LC_ALL="C")
-        rc, out = self.run(["git", "-C", src, "pull", "--ff-only"], timeout=180, env=env)
+
+        def head():
+            rc, out = capture(["git", "-C", src, "rev-parse", "HEAD"], timeout=15, env=env)
+            return out.strip() if rc == 0 else None
+
+        before_rev = head()
+        before = read_app_version(os.path.join(src, "fonoteca.py")) or "?"
+        if same_path(src, SOURCE_CLONE_DIR):
+            # clone privado do instalador (raso): pode ser sobrescrito, o que também resolve histórico reescrito
+            rc, _ = self.run(["git", "-C", src, "fetch", "--depth", "1", "origin", "HEAD"], timeout=180, env=env)
+            if rc == 0:
+                rc, _ = self.run(["git", "-C", src, "reset", "--hard", "FETCH_HEAD"], timeout=60, env=env)
+        else:
+            rc, _ = self.run(["git", "-C", src, "pull", "--ff-only"], timeout=180, env=env)
         if rc != 0:
             self.add("warn", "Não foi possível baixar as novidades",
                      "Verifique a internet ou alterações locais no repositório ('git status'). "
                      "Os arquivos que já estão na pasta serão reaplicados.")
             return
+        after_rev = head()
         after = read_app_version(os.path.join(src, "fonoteca.py")) or "?"
-        if "Already up to date" in out or "Already up-to-date" in out:
+        if before_rev and after_rev and before_rev == after_rev:
             self.add("ok", "Código da Fonoteca", f"já está na versão mais recente ({after})")
-        else:
+        elif before != after:
             self.add("ok", "Novidades baixadas", f"{before} → {after}")
+        else:
+            self.add("ok", "Novidades baixadas", f"versão {after} (código atualizado)")
 
     # ---------- desinstalação ----------
     @staticmethod
@@ -916,8 +1076,7 @@ class Engine:
         state = read_state()
         install_dir = state["install_dir"] if state else DEFAULT_INSTALL_DIR
 
-        rc, _ = capture(["pgrep", "-f", r"fonoteca\.py"], timeout=5)
-        if rc == 0:
+        if running_app_pids():
             self.add("info", f"A {APP_NAME} está aberta",
                      "A janela continua na tela até você fechá-la; os arquivos e atalhos são removidos mesmo assim.")
 
@@ -1040,6 +1199,7 @@ class Engine:
     # ---------- diagnóstico ----------
     def diagnose(self):
         self.results = []
+        self.restart_needed = False
         self.log(f"{APP_NAME} · diagnóstico")
         self.step("Sistema")
         self.add("info", "Sistema", "\n".join(sysinfo_lines()))
@@ -1149,6 +1309,10 @@ class Engine:
             self.add("info", "Há uma versão diferente neste pacote", f"instalada {installed} · pacote {source}. Use Atualizar.")
         else:
             self.add("ok", "Fonoteca instalada", f"versão {installed} em {d}")
+        if outdated_app_pids(app_py):
+            self.restart_needed = True
+            self.add("restart", "A Fonoteca aberta está rodando código antigo",
+                     "Os arquivos foram atualizados depois que ela abriu. Feche e abra de novo para usar a versão nova.")
         launcher = os.path.join(d, "fonoteca.sh")
         if not os.access(launcher, os.X_OK):
             self.add("warn", "Launcher ausente ou sem permissão", launcher + "\nUse Atualizar para recriar.")
@@ -1163,7 +1327,8 @@ class Engine:
             if not os.path.exists(entry):
                 self.add("warn", "Atalho do menu ausente", "Use Atualizar para recriá-lo.")
             else:
-                m = re.search(r'^Exec="?([^"\n]+)"?', open(entry, encoding="utf-8").read(), re.M)
+                with open(entry, encoding="utf-8") as fh:
+                    m = re.search(r'^Exec="?([^"\n]+)"?', fh.read(), re.M)
                 if m and not os.path.exists(m.group(1)):
                     self.add("warn", "O atalho aponta para um arquivo que não existe", m.group(1) + "\nUse Atualizar para corrigir.")
                 else:
@@ -1287,6 +1452,21 @@ def print_summary(engine, title):
     print(engine.report_text(title))
     verdict = {"ok": "Tudo certo.", "warn": "Concluído com avisos.", "fail": "Concluído com problemas."}
     print(verdict[engine.overall()])
+    if engine.restart_needed:
+        print(f"\n↻ Reinicie a {APP_NAME}: a janela aberta ainda roda a versão antiga.")
+
+
+def offer_restart(eng):
+    """No terminal: se a Fonoteca aberta está desatualizada, oferece fechar e reabrir."""
+    if not eng.restart_needed:
+        return
+    state = read_state()
+    if state and sys.stdin.isatty():
+        resp = input("Fechar e reabrir a Fonoteca agora? A música em reprodução será interrompida. [s/N] ")
+        if resp.strip().lower().startswith("s"):
+            ok, msg = restart_app(state["install_dir"])
+            print(("✔ " if ok else "✘ ") + msg)
+            eng.restart_needed = not ok
 
 
 def cli_run(args):
@@ -1298,6 +1478,7 @@ def cli_run(args):
             if input("\nTentar corrigir agora? [s/N] ").strip().lower().startswith("s"):
                 eng.apply_fixes()
                 print_summary(eng, "diagnóstico (após correções)")
+        offer_restart(eng)
         return 1 if eng.overall() == "fail" else 0
     if args.uninstall:
         if not args.yes:
@@ -1322,6 +1503,7 @@ def cli_run(args):
     if args.update:
         eng.run_update(app=not args.no_app, ytdlp=not args.no_ytdlp, system=args.system)
         print_summary(eng, "atualização")
+        offer_restart(eng)
         return 1 if eng.overall() == "fail" else 0
     return 0
 
@@ -1357,6 +1539,7 @@ if HAVE_GTK:
         "warn": "dialog-warning-symbolic",
         "fail": "dialog-error-symbolic",
         "info": "dialog-information-symbolic",
+        "restart": "view-refresh-symbolic",
     }
 
     class InstallerWizard(Gtk.Assistant):
@@ -1585,6 +1768,19 @@ if HAVE_GTK:
         def _build_summary(self):
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
             box.set_border_width(16)
+
+            self.bar_restart = Gtk.InfoBar()
+            self.bar_restart.set_message_type(Gtk.MessageType.WARNING)
+            self.lbl_restart = Gtk.Label(xalign=0)
+            self.lbl_restart.set_line_wrap(True)
+            self.lbl_restart.set_markup(
+                f"<b>Reinicie a {APP_NAME}</b>\nA janela que está aberta ainda usa a versão antiga. "
+                "Feche e abra de novo para aplicar a atualização.")
+            self.bar_restart.get_content_area().add(self.lbl_restart)
+            self.btn_restart = self.bar_restart.add_button("Reiniciar agora", Gtk.ResponseType.ACCEPT)
+            self.bar_restart.connect("response", self.on_restart)
+            self.bar_restart.set_no_show_all(True)
+            box.pack_start(self.bar_restart, False, False, 0)
 
             head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             self.img_overall = Gtk.Image.new_from_icon_name("object-select-symbolic", Gtk.IconSize.DIALOG)
@@ -1853,8 +2049,17 @@ if HAVE_GTK:
             self.btn_save.set_sensitive(True)
             state = read_state()
             can_open = (self.action in ("install", "update") and overall != "fail" and state
-                        and os.access(os.path.join(state["install_dir"], "fonoteca.sh"), os.X_OK))
+                        and os.access(os.path.join(state["install_dir"], "fonoteca.sh"), os.X_OK)
+                        and not running_app_pids())  # já aberta: evita abrir uma segunda janela
+            self.btn_open.set_sensitive(True)
             self.btn_open.set_visible(bool(can_open))
+            if self.engine.restart_needed:
+                self.btn_restart.set_sensitive(True)
+                self.btn_restart.set_label("Reiniciar agora")
+                self.bar_restart.set_no_show_all(False)
+                self.bar_restart.show_all()
+            else:
+                self.bar_restart.hide()
             self.expander.set_expanded(overall == "fail" and not self.engine.has_fixable())
 
         def _result_row(self, r):
@@ -1948,6 +2153,45 @@ if HAVE_GTK:
                                       buttons=Gtk.ButtonsType.OK, text=f"Não foi possível abrir: {e}")
                 m.run()
                 m.destroy()
+
+        def on_restart(self, _bar, response):
+            if response != Gtk.ResponseType.ACCEPT or self.running:
+                return
+            state = read_state()
+            if not state:
+                return
+            m = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.QUESTION,
+                                  buttons=Gtk.ButtonsType.YES_NO, text=f"Fechar e reabrir a {APP_NAME}?",
+                                  secondary_text="A música em reprodução será interrompida.")
+            answer = m.run()
+            m.destroy()
+            if answer != Gtk.ResponseType.YES:
+                return
+            self.running = True  # impede fechar o instalador no meio do reinício
+            self.btn_restart.set_sensitive(False)
+            self.btn_restart.set_label("Reiniciando…")
+
+            def work():
+                ok, msg = restart_app(state["install_dir"])
+                GLib.idle_add(self._after_restart, ok, msg)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _after_restart(self, ok, msg):
+            self.running = False
+            if ok:
+                self.engine.restart_needed = False
+                self.bar_restart.hide()
+                self.btn_open.set_visible(False)
+                self.lbl_overall.set_markup(f'<span size="large" weight="bold">{GLib.markup_escape_text(msg)}</span>')
+            else:
+                self.btn_restart.set_sensitive(True)
+                self.btn_restart.set_label("Reiniciar agora")
+                m = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.ERROR,
+                                      buttons=Gtk.ButtonsType.OK, text=msg)
+                m.run()
+                m.destroy()
+            return False
 
         # ----- fechar -----
         def _busy_message(self):
