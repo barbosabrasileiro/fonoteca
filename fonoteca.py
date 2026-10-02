@@ -49,7 +49,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.0.7"
+APP_VERSION = "2.1.0"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -132,8 +132,9 @@ LEGACY_BACKUP_FORMATS = ("yt_music_player_backup",)
 BACKUP_VERSION = 1
 HISTORY_LIMIT = 50
 
-MPV_SOCKET = os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpv.sock")
-MPV_LOG = os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpv.log")
+# Socket por processo: duas instâncias do app não derrubam o mpv uma da outra.
+MPV_SOCKET = os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpv_{os.getpid()}.sock")
+MPV_LOG = os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpv_{os.getpid()}.log")
 
 DEEZER_API = "https://api.deezer.com"
 WIKIPEDIA_HOSTS = ("https://pt.wikipedia.org", "https://en.wikipedia.org")
@@ -307,6 +308,8 @@ def read_local_lyrics(path):
         side = base + ext
         if os.path.isfile(side):
             try:
+                if os.path.getsize(side) > 1_000_000:   # letra de verdade não passa disso; evita ler arquivo gigante
+                    continue
                 with open(side, "r", encoding="utf-8", errors="replace") as fh:
                     text = fh.read()
                 text = re.sub(r"\[\d+:\d+(?:[.:]\d+)?\]\s*", "", text)      # tempos do .lrc
@@ -373,8 +376,43 @@ class MPVController:
         self._listener_thread = None
         self._request_id = 0
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._last_volume = 100
+
+    def _cleanup(self):
+        """Encerra socket e processo (usado ao reiniciar e ao sair)."""
+        self._running = False
+        sock, self.sock = self.sock, None
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        proc, self.proc = self.proc, None
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        try:
+            os.remove(MPV_SOCKET)
+        except OSError:
+            pass
+
+    def alive(self):
+        return bool(self._running and self.sock and self.proc and self.proc.poll() is None)
+
+    def restart(self):
+        """Reinicia o mpv se ele morreu. Devolve True se voltou a funcionar."""
+        self._cleanup()
+        return self.start(self._last_volume)
 
     def start(self, initial_volume=100):
+        self._last_volume = initial_volume
         if os.path.exists(MPV_SOCKET):
             try:
                 os.remove(MPV_SOCKET)
@@ -383,6 +421,9 @@ class MPVController:
 
         try:
             log_file = open(MPV_LOG, "w")
+        except OSError:
+            log_file = subprocess.DEVNULL
+        try:
             self.proc = subprocess.Popen(
                 [
                     "mpv",
@@ -392,14 +433,19 @@ class MPVController:
                     "--ytdl=yes",
                     "--ytdl-format=bestaudio/best",
                     "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
+                    "--network-timeout=20",      # rede travada vira erro (o watchdog tenta de novo) em vez de pendurar
+                    "--audio-display=no",
                     f"--input-ipc-server={MPV_SOCKET}",
                     f"--volume={initial_volume}",
                 ],
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
             )
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             return False
+        finally:
+            if log_file is not subprocess.DEVNULL:
+                log_file.close()  # o processo filho já tem a própria cópia do descritor
 
         for _ in range(50):
             if os.path.exists(MPV_SOCKET):
@@ -427,14 +473,18 @@ class MPVController:
 
     def _listen(self):
         buf = b""
-        while self._running and self.sock:
+        last_pos = -1.0
+        sock = self.sock
+        while self._running and sock:
             try:
-                data = self.sock.recv(4096)
+                data = sock.recv(8192)
             except OSError:
                 break
             if not data:
                 break
             buf += data
+            if len(buf) > 4_000_000:   # linha absurda sem quebra: descarta em vez de crescer sem limite
+                buf = b""
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 if not line.strip():
@@ -452,7 +502,11 @@ class MPVController:
                     name = msg.get("name")
                     val = msg.get("data")
                     if name == "time-pos" and "on_time_change" in self.callbacks:
-                        GLib.idle_add(self.callbacks["on_time_change"], val or 0)
+                        pos = val or 0
+                        # O mpv avisa a posição muitas vezes por segundo; a interface só precisa de ~4 atualizações/s.
+                        if pos < last_pos or pos - last_pos >= 0.25:
+                            last_pos = pos
+                            GLib.idle_add(self.callbacks["on_time_change"], pos)
                     elif name == "duration" and "on_duration_change" in self.callbacks:
                         GLib.idle_add(self.callbacks["on_duration_change"], val or 0)
                     elif name == "pause" and "on_pause_change" in self.callbacks:
@@ -464,15 +518,21 @@ class MPVController:
                     if msg["error"] != "success" and "on_load_error" in self.callbacks:
                         GLib.idle_add(self.callbacks["on_load_error"], msg["error"])
 
+        # Saiu do laço sem ter sido pedido: o mpv morreu/fechou o socket. Avisa a interface.
+        if self._running and sock is self.sock and "on_died" in self.callbacks:
+            GLib.idle_add(self.callbacks["on_died"])
+
     def _send(self, command, request_id=None):
         if not self.sock:
             return
         payload = {"command": command}
         if request_id is not None:
             payload["request_id"] = request_id
+        data = (json.dumps(payload) + "\n").encode("utf-8")
         try:
-            self.sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-        except OSError:
+            with self._send_lock:
+                self.sock.sendall(data)
+        except (OSError, AttributeError):
             pass
 
     def load(self, url):
@@ -495,6 +555,7 @@ class MPVController:
         self._send(["seek", seconds, "relative"])
 
     def set_volume(self, vol):
+        self._last_volume = vol
         self._send(["set_property", "volume", vol])
 
     def set_mute(self, muted):
@@ -503,17 +564,7 @@ class MPVController:
     def quit(self):
         self._running = False
         self._send(["quit"])
-        if self.sock:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-        if self.proc and self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=2)
-            except Exception:
-                self.proc.kill()
+        self._cleanup()
 
 
 class MusicPlayerApp(Gtk.Window):
@@ -532,6 +583,12 @@ class MusicPlayerApp(Gtk.Window):
             "width": 540,
             "height": 740,
         })
+        if not isinstance(self.config, dict):
+            self.config = {"volume": 100}
+        try:
+            self.config["volume"] = max(0, min(100, int(self.config.get("volume", 100))))
+        except (TypeError, ValueError):
+            self.config["volume"] = 100
 
         self.set_default_size(self.config.get("win_w", 1040), self.config.get("win_h", 720))
         self.set_position(Gtk.WindowPosition.CENTER)
@@ -543,9 +600,12 @@ class MusicPlayerApp(Gtk.Window):
         self.set_titlebar(header)
 
         # Estado da aplicação
-        self.queue = self._load_json(QUEUE_FILE, [])
-        self.history = self._load_json(HISTORY_FILE, [])
-        self.playlists = self._load_json(PLAYLISTS_FILE, {})
+        self._queue_save_id = None
+        self.queue = self._clean_track_list(self._load_json(QUEUE_FILE, []))
+        self.history = self._clean_track_list(self._load_json(HISTORY_FILE, []))[:HISTORY_LIMIT]
+        _pls = self._load_json(PLAYLISTS_FILE, {})
+        self.playlists = ({str(k): self._clean_track_list(v) for k, v in _pls.items()}
+                          if isinstance(_pls, dict) else {})
         self.favorites = [self._normalize_track(t) for t in self._load_json(FAVORITES_FILE, []) if isinstance(t, dict)]
         self._hearts = weakref.WeakSet()
         # Biblioteca local (Músicas Offline)
@@ -562,6 +622,8 @@ class MusicPlayerApp(Gtk.Window):
         self._wiki_forced = None
         self.album_artist_name = ""
         self._art_cache = {}
+        self._art_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="art")  # capas: no máx. 4 downloads simultâneos
+        self._dl_procs = set()
         self._pl_busy = False
         self._busy_pulse_id = None
         self._busy_job = None
@@ -601,6 +663,8 @@ class MusicPlayerApp(Gtk.Window):
         self.is_muted = False
         self._last_volume = max(int(self.config.get("volume", 100) or 100), 1)
         self._config_save_id = None
+        self._queue_save_id = None
+        self._closing = False
         self._mute_icon = ""
 
         # Filtro da lista de playlists
@@ -773,6 +837,7 @@ class MusicPlayerApp(Gtk.Window):
                 "on_duration_change": self.on_mpv_duration_change,
                 "on_pause_change": self.on_mpv_pause_change,
                 "on_idle_change": self.on_mpv_idle_change,
+                "on_died": self.on_mpv_died,
             }
         )
         if not self.mpv.start(initial_volume=self.config.get("volume", 100)):
@@ -889,11 +954,16 @@ class MusicPlayerApp(Gtk.Window):
         if on_click:
             btn.connect("clicked", lambda b: on_click())
         if local_item:
-            threading.Thread(target=self._load_local_artwork_into, args=(local_item, img, size[0], size[1]),
-                             daemon=True).start()
+            self._submit_art(self._load_local_artwork_into, local_item, img, size[0], size[1])
         elif url:
-            threading.Thread(target=self._load_artwork_into, args=(url, img, size[0], size[1]), daemon=True).start()
+            self._submit_art(self._load_artwork_into, url, img, size[0], size[1])
         return btn
+
+    def _submit_art(self, fn, *args):
+        try:
+            self._art_pool.submit(fn, *args)
+        except RuntimeError:   # pool já encerrado (app fechando)
+            pass
 
     def _artist_card(self, a):
         fans = a.get("nb_fan") or 0
@@ -2031,7 +2101,7 @@ class MusicPlayerApp(Gtk.Window):
                         GLib.idle_add(self.lib_status.set_text, f"Indexando... {done}/{total}")
         if token != self._lib_scan_token:
             return
-        self._save_json(LIBRARY_FILE, {"root": root, "tracks": new_index})
+        self._save_json(LIBRARY_FILE, {"root": root, "tracks": new_index}, compact=True)
         GLib.idle_add(self._lib_scan_done, new_index, token)
 
     def _lib_scan_done(self, index, token):
@@ -2100,10 +2170,10 @@ class MusicPlayerApp(Gtk.Window):
                     found += 1
                 entry["online_checked"] = True
                 if checked % 20 == 0:
-                    self._save_json(LIBRARY_FILE, {"root": self.lib_root, "tracks": self.lib_index})
+                    self._save_json(LIBRARY_FILE, {"root": self.lib_root, "tracks": dict(self.lib_index)}, compact=True)
                 time.sleep(0.25)             # respeita o limite de requisições do Deezer
             if checked and token == self._lib_scan_token:
-                self._save_json(LIBRARY_FILE, {"root": self.lib_root, "tracks": self.lib_index})
+                self._save_json(LIBRARY_FILE, {"root": self.lib_root, "tracks": dict(self.lib_index)}, compact=True)
                 GLib.idle_add(self._lib_enrich_done, found, checked)
         finally:
             GLib.idle_add(self._lib_enrich_finished)
@@ -2569,7 +2639,7 @@ class MusicPlayerApp(Gtk.Window):
         if shuffle:
             random.shuffle(tracks)
         self.queue = tracks
-        self._save_json(QUEUE_FILE, self.queue)
+        self._save_queue()
         self.render_queue()
         self.current_index = 0
         self.play_current()
@@ -2637,12 +2707,27 @@ class MusicPlayerApp(Gtk.Window):
                 pass
         return default
 
-    def _save_json(self, path, data):
-        """Salva arquivo JSON de forma atômica para evitar corrupção de dados."""
+    def _save_queue(self):
+        """Grava a fila com atraso (debounce): adicionar muitas faixas seguidas não regrava o arquivo a cada uma."""
+        if self._queue_save_id:
+            GLib.source_remove(self._queue_save_id)
+        self._queue_save_id = GLib.timeout_add(400, self._flush_queue_save)
+
+    def _flush_queue_save(self):
+        self._queue_save_id = None
+        self._save_json(QUEUE_FILE, self.queue, compact=True)
+        return False
+
+    def _save_json(self, path, data, compact=False):
+        """Salva arquivo JSON de forma atômica para evitar corrupção de dados.
+        compact=True (fila, histórico, biblioteca): sem indentação — arquivo menor e gravação mais rápida."""
         tmp_path = path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                if compact:
+                    json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+                else:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, path)
         except Exception:
             if os.path.exists(tmp_path):
@@ -2652,12 +2737,26 @@ class MusicPlayerApp(Gtk.Window):
                     pass
 
     # ---------- Normalização do Esquema de Dados de Faixas ----------
+    def _clean_track_list(self, data):
+        """Lista vinda de um JSON (possivelmente corrompido/editado à mão): só dicionários válidos entram."""
+        out = []
+        if isinstance(data, list):
+            for t in data:
+                if isinstance(t, dict):
+                    try:
+                        out.append(self._normalize_track(t))
+                    except Exception:
+                        pass
+        return out
+
     def _normalize_track(self, item):
-        uploader = item.get("uploader") or item.get("artist") or ""
-        duration = item.get("duration") or item.get("duration_fmt") or "0:00"
+        if not isinstance(item, dict):
+            item = {}
+        uploader = str(item.get("uploader") or item.get("artist") or "")
+        duration = str(item.get("duration") or item.get("duration_fmt") or "0:00")
         return {
-            "id": item.get("id", ""),
-            "title": item.get("title", "Sem título"),
+            "id": str(item.get("id") or ""),
+            "title": str(item.get("title") or "Sem título"),
             "uploader": uploader,
             "artist": uploader,
             "duration": duration,
@@ -2937,7 +3036,7 @@ class MusicPlayerApp(Gtk.Window):
             self.mostrar_mensagem("A playlist selecionada está vazia.")
             return
         self.queue = list(tracks)
-        self._save_json(QUEUE_FILE, self.queue)
+        self._save_queue()
         self.render_queue()
         self.current_index = 0
         self.play_current()
@@ -3286,11 +3385,11 @@ class MusicPlayerApp(Gtk.Window):
     def add_to_queue(self, item, notify=True):
         item = self._normalize_track(item)
         self.queue.append(item)
-        self._save_json(QUEUE_FILE, self.queue)
+        self._save_queue()
 
         row = self._create_queue_row(len(self.queue) - 1, item)
         self.queue_list.add(row)
-        self.queue_list.show_all()
+        row.show_all()
 
         if notify:
             self.show_toast(f"Adicionado à fila: {item['title']}")
@@ -3299,13 +3398,12 @@ class MusicPlayerApp(Gtk.Window):
         norm_items = [self._normalize_track(it) for it in items]
         start_idx = len(self.queue)
         self.queue.extend(norm_items)
-        self._save_json(QUEUE_FILE, self.queue)
+        self._save_queue()
 
         for i, item in enumerate(norm_items, start=start_idx):
             row = self._create_queue_row(i, item)
             self.queue_list.add(row)
-
-        self.queue_list.show_all()
+            row.show_all()
 
         if notify:
             if len(norm_items) == 1:
@@ -3360,7 +3458,7 @@ class MusicPlayerApp(Gtk.Window):
         new_idx = idx + delta
         if 0 <= new_idx < len(self.queue):
             self.queue[idx], self.queue[new_idx] = self.queue[new_idx], self.queue[idx]
-            self._save_json(QUEUE_FILE, self.queue)
+            self._save_queue()
 
             if self.current_index == idx:
                 self.current_index = new_idx
@@ -3376,16 +3474,17 @@ class MusicPlayerApp(Gtk.Window):
         idx = row.get_index()
         if 0 <= idx < len(self.queue):
             self.queue.pop(idx)
-            self._save_json(QUEUE_FILE, self.queue)
+            self._save_queue()
             self.queue_list.remove(row)
 
             if self.current_index == idx:
-                if self.queue:
+                if idx < len(self.queue):
                     self.play_current()
-                else:
+                else:  # removeu a última faixa (ou a fila ficou vazia): não há "próxima"
                     self.current_index = -1
                     self.mpv.stop()
                     self._set_mpv_idle(True)
+                    self.now_playing_label.set_text("Parado")
             elif self.current_index > idx:
                 self.current_index -= 1
 
@@ -3412,7 +3511,7 @@ class MusicPlayerApp(Gtk.Window):
             if 0 <= idx < len(self.queue):
                 self.queue.pop(idx)
 
-        self._save_json(QUEUE_FILE, self.queue)
+        self._save_queue()
 
         if playing_item is not None and playing_item in self.queue:
             self.current_index = self.queue.index(playing_item)
@@ -3432,7 +3531,7 @@ class MusicPlayerApp(Gtk.Window):
         if not self._confirm_action("Limpar toda a fila de reprodução?"):
             return
         self.queue.clear()
-        self._save_json(QUEUE_FILE, self.queue)
+        self._save_queue()
         self.current_index = -1
         self.mpv.stop()
         self._set_mpv_idle(True)
@@ -3474,7 +3573,7 @@ class MusicPlayerApp(Gtk.Window):
         if not self.history or self._track_key(self.history[0]) != self._track_key(item):
             self.history.insert(0, item)
             self.history = self.history[:HISTORY_LIMIT]
-            self._save_json(HISTORY_FILE, self.history)
+            self._save_json(HISTORY_FILE, self.history, compact=True)
             self.render_history()
 
     def render_history(self):
@@ -3528,7 +3627,7 @@ class MusicPlayerApp(Gtk.Window):
         if not self._confirm_action("Apagar todo o histórico de reprodução?"):
             return
         self.history.clear()
-        self._save_json(HISTORY_FILE, self.history)
+        self._save_json(HISTORY_FILE, self.history, compact=True)
         self.render_history()
         self.show_toast("Histórico apagado.")
 
@@ -4823,19 +4922,45 @@ class MusicPlayerApp(Gtk.Window):
             self._cancel_stall_watchdog()
         if not self.user_is_seeking:
             self.seek_scale.set_value(pos)
-            self.time_label.set_text(f"{self._fmt_duration(pos)} / {self._fmt_duration(self.track_duration)}")
+            sec = int(pos)
+            if sec != getattr(self, "_shown_sec", None):   # texto só muda 1x por segundo
+                self._shown_sec = sec
+                self.time_label.set_text(f"{self._fmt_duration(pos)} / {self._fmt_duration(self.track_duration)}")
+        return False
 
     def on_mpv_duration_change(self, duration):
-        self.track_duration = duration
-        self.seek_scale.set_range(0, duration)
+        self.track_duration = duration or 0
+        self.seek_scale.set_range(0, max(float(duration or 0), 1.0))
+        self._shown_sec = None
+        return False
 
     def on_mpv_pause_change(self, is_paused):
         self._mpv_paused = bool(is_paused)
         self._update_playpause_icon()
+        return False
+
+    def on_mpv_died(self):
+        """O processo do mpv caiu: tenta reiniciar (no máx. 3 vezes por minuto) em vez de ficar mudo."""
+        if getattr(self, "_closing", False):
+            return False
+        now = time.monotonic()
+        self._mpv_restarts = [t for t in getattr(self, "_mpv_restarts", []) if now - t < 60]
+        self._set_mpv_idle(True)
+        if len(self._mpv_restarts) >= 3:
+            self.mostrar_mensagem("O mpv parou de responder repetidamente. Reinicie o aplicativo.")
+            return False
+        self._mpv_restarts.append(now)
+        if self.mpv.restart():
+            self._apply_volume_ui()
+            self.mostrar_mensagem("O player de áudio foi reiniciado. Aperte play para continuar.")
+        else:
+            self.mostrar_mensagem("Falha ao reiniciar o mpv. Verifique a instalação.")
+        return False
 
     def on_mpv_idle_change(self, is_idle):
         self._mpv_idle = bool(is_idle)
         self._update_playpause_icon()
+        return False
 
     def _set_mpv_idle(self, idle):
         self._mpv_idle = bool(idle)
@@ -4866,19 +4991,21 @@ class MusicPlayerApp(Gtk.Window):
     def on_track_finished(self):
         if self.is_repeat:
             self.play_current()
-            return
+            return False
         has_next = (self.is_shuffle and len(self.queue) > 1) or self.current_index + 1 < len(self.queue)
         if not has_next:
             self._set_mpv_idle(True)  # fila acabou: o botão volta a ser "play"
         self.on_next(None)
+        return False
 
     def on_load_error(self, error_msg):
         item = self.queue[self.current_index] if 0 <= self.current_index < len(self.queue) else None
         titulo = item["title"] if item else "faixa"
         self.mostrar_mensagem(f"Falha ao carregar '{titulo}': {error_msg}")
-        if not self._track_started:
+        if not self._track_started and item is not None:
             self._cancel_stall_watchdog()
             self._check_playback_stall(self._play_token)
+        return False
 
     # ---------- Ações de Botões e Sliders ----------
     def on_play_pause(self, button):
@@ -5207,6 +5334,7 @@ class MusicPlayerApp(Gtk.Window):
             url,
         ]
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self._dl_procs.add(process)
         phase = None
         for line in process.stdout:
             match = re.search(r"\[download\]\s+(\d+\.\d+)%", line)
@@ -5224,7 +5352,12 @@ class MusicPlayerApp(Gtk.Window):
                 phase = new_phase[0]
                 on_phase(*new_phase)
         on_phase("Finalizando arquivo...", 0.95)
-        process.wait()
+        try:
+            process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        finally:
+            self._dl_procs.discard(process)
 
         final = out_template + ".mp3"
         if process.returncode != 0 or not os.path.isfile(final):
@@ -6073,7 +6206,7 @@ class MusicPlayerApp(Gtk.Window):
                 self.profile["name"] = data["name"]
 
         self._save_json(PLAYLISTS_FILE, self.playlists)
-        self._save_json(HISTORY_FILE, self.history)
+        self._save_json(HISTORY_FILE, self.history, compact=True)
         self._save_json(FAVORITES_FILE, self.favorites)
         self._save_profile()
 
@@ -6089,17 +6222,34 @@ class MusicPlayerApp(Gtk.Window):
 
     # ---------- Encerramento ----------
     def on_destroy(self, widget):
+        self._closing = True
         self._cancel_stall_watchdog()
+        for pid_name in ("_queue_save_id", "_toast_timeout_id", "_msg_timeout_id", "_dl_pulse_id", "_busy_pulse_id"):
+            sid = getattr(self, pid_name, None)
+            if sid:
+                try:
+                    GLib.source_remove(sid)
+                except Exception:
+                    pass
+                setattr(self, pid_name, None)
+        for proc in list(getattr(self, "_dl_procs", ())):   # não deixa yt-dlp órfão rodando depois de fechar
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+        self._art_pool.shutdown(wait=False)
         if self._config_save_id:
             GLib.source_remove(self._config_save_id)
             self._config_save_id = None
         if not self.is_maximized():  # maximizada, get_size() devolveria a tela toda e estragaria o "restaurar"
             self.config["win_w"], self.config["win_h"] = self.get_size()
         self._save_json(CONFIG_FILE, self.config)
-        self._save_json(QUEUE_FILE, self.queue)
+        self._save_json(QUEUE_FILE, self.queue, compact=True)
         self._save_json(PLAYLISTS_FILE, self.playlists)
         self._save_json(FAVORITES_FILE, self.favorites)
         self._save_json(PROFILE_FILE, self.profile)
+        self._save_json(HISTORY_FILE, self.history, compact=True)
         self.mpv.quit()
         Gtk.main_quit()
 
