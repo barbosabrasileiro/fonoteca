@@ -42,14 +42,14 @@ except Exception:  # pragma: no cover
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
+from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Gio
 
 # ----------------------------------------------------------------------
 # Identidade do aplicativo
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -567,6 +567,310 @@ class MPVController:
         self._cleanup()
 
 
+# ----------------------------------------------------------------------
+# MPRIS2 (D-Bus): faz o Fonoteca aparecer nos controles de mídia do sistema
+# (applet de som/PulseAudio, GNOME, KDE, teclas multimídia, playerctl...)
+# ----------------------------------------------------------------------
+_MPRIS_XML = """
+<node>
+  <interface name="org.mpris.MediaPlayer2">
+    <method name="Raise"/>
+    <method name="Quit"/>
+    <property name="CanQuit" type="b" access="read"/>
+    <property name="CanRaise" type="b" access="read"/>
+    <property name="HasTrackList" type="b" access="read"/>
+    <property name="Identity" type="s" access="read"/>
+    <property name="DesktopEntry" type="s" access="read"/>
+    <property name="SupportedUriSchemes" type="as" access="read"/>
+    <property name="SupportedMimeTypes" type="as" access="read"/>
+  </interface>
+  <interface name="org.mpris.MediaPlayer2.Player">
+    <method name="Next"/>
+    <method name="Previous"/>
+    <method name="Pause"/>
+    <method name="PlayPause"/>
+    <method name="Stop"/>
+    <method name="Play"/>
+    <method name="Seek"><arg direction="in" name="Offset" type="x"/></method>
+    <method name="SetPosition">
+      <arg direction="in" name="TrackId" type="o"/>
+      <arg direction="in" name="Position" type="x"/>
+    </method>
+    <method name="OpenUri"><arg direction="in" name="Uri" type="s"/></method>
+    <signal name="Seeked"><arg name="Position" type="x"/></signal>
+    <property name="PlaybackStatus" type="s" access="read"/>
+    <property name="LoopStatus" type="s" access="readwrite"/>
+    <property name="Rate" type="d" access="readwrite"/>
+    <property name="Shuffle" type="b" access="readwrite"/>
+    <property name="Metadata" type="a{sv}" access="read"/>
+    <property name="Volume" type="d" access="readwrite"/>
+    <property name="Position" type="x" access="read"/>
+    <property name="MinimumRate" type="d" access="read"/>
+    <property name="MaximumRate" type="d" access="read"/>
+    <property name="CanGoNext" type="b" access="read"/>
+    <property name="CanGoPrevious" type="b" access="read"/>
+    <property name="CanPlay" type="b" access="read"/>
+    <property name="CanPause" type="b" access="read"/>
+    <property name="CanSeek" type="b" access="read"/>
+    <property name="CanControl" type="b" access="read"/>
+  </interface>
+</node>
+"""
+
+_MPRIS_PATH = "/org/mpris/MediaPlayer2"
+_MPRIS_ROOT = "org.mpris.MediaPlayer2"
+_MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+_MPRIS_NO_TRACK = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+
+
+class MprisService:
+    """Expõe o player via MPRIS2 usando só Gio (sem dependências extras).
+
+    Tudo roda no loop principal do GTK, então chamar os métodos do app é seguro.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.conn = None
+        self._reg_ids = []
+        self._owner_id = 0
+        self._art_url = ""
+        self._art_key = None
+        self._art_toggle = 0
+        try:
+            self._info = Gio.DBusNodeInfo.new_for_xml(_MPRIS_XML)
+            self._owner_id = Gio.bus_own_name(
+                Gio.BusType.SESSION, f"org.mpris.MediaPlayer2.{APP_ID}",
+                Gio.BusNameOwnerFlags.NONE, self._on_bus_acquired, None, None)
+        except Exception:
+            self._owner_id = 0  # sem D-Bus de sessão: o player segue funcionando normalmente
+
+    # ---------- registro no barramento ----------
+    def _on_bus_acquired(self, connection, name):
+        self.conn = connection
+        try:
+            for iface in self._info.interfaces:
+                rid = connection.register_object(
+                    _MPRIS_PATH, iface, self._on_method_call, self._on_get_property, self._on_set_property)
+                self._reg_ids.append(rid)
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            if self.conn is not None:
+                for rid in self._reg_ids:
+                    self.conn.unregister_object(rid)
+            if self._owner_id:
+                Gio.bus_unown_name(self._owner_id)
+        except Exception:
+            pass
+        self._reg_ids = []
+        self._owner_id = 0
+        self.conn = None
+
+    # ---------- estado lido do app ----------
+    def _item(self):
+        a = self.app
+        if 0 <= a.current_index < len(a.queue):
+            return a.queue[a.current_index]
+        return None
+
+    def _status(self):
+        a = self.app
+        if a._mpv_idle:
+            return "Stopped"
+        return "Paused" if a._mpv_paused else "Playing"
+
+    def _loop(self):
+        return "Track" if self.app.is_repeat else "None"
+
+    def _volume(self):
+        a = self.app
+        if a.is_muted:
+            return 0.0
+        return max(0.0, min(1.0, a.vol_scale.get_value() / 100.0))
+
+    def _position_us(self):
+        return int(max(0.0, float(getattr(self.app, "_mpris_pos", 0) or 0)) * 1_000_000)
+
+    def _can_next(self):
+        a = self.app
+        if not a.queue:
+            return False
+        return (a.is_shuffle and len(a.queue) > 1) or a.current_index + 1 < len(a.queue)
+
+    def _can_prev(self):
+        return self.app.current_index > 0
+
+    def _metadata(self):
+        item = self._item()
+        if item is None:
+            return {"mpris:trackid": GLib.Variant("o", _MPRIS_NO_TRACK)}
+        a = self.app
+        md = {"mpris:trackid": GLib.Variant("o", f"/org/{APP_ID}/track/{max(a._play_token, 0)}")}
+        dur = a.track_duration
+        if not dur:
+            dur = _clock_to_seconds(item.get("duration", "")) if item.get("duration") else 0
+        if dur:
+            md["mpris:length"] = GLib.Variant("x", int(float(dur) * 1_000_000))
+        md["xesam:title"] = GLib.Variant("s", str(item.get("title", "")))
+        artist = a._guess_artist(item)
+        if artist:
+            md["xesam:artist"] = GLib.Variant("as", [artist])
+        if item.get("album"):
+            md["xesam:album"] = GLib.Variant("s", str(item["album"]))
+        if self._art_url and self._art_key == (item.get("id") or item.get("path")):
+            md["mpris:artUrl"] = GLib.Variant("s", self._art_url)
+        return md
+
+    def _prop(self, iface, name):
+        """Devolve o GLib.Variant da propriedade ou None se não existir."""
+        if iface == _MPRIS_ROOT:
+            table = {
+                "CanQuit": ("b", False), "CanRaise": ("b", True), "HasTrackList": ("b", False),
+                "Identity": ("s", APP_NAME), "DesktopEntry": ("s", APP_ID),
+                "SupportedUriSchemes": ("as", []), "SupportedMimeTypes": ("as", []),
+            }
+            if name in table:
+                t, v = table[name]
+                return GLib.Variant(t, v)
+            return None
+        if iface == _MPRIS_PLAYER:
+            if name == "Metadata":
+                return GLib.Variant("a{sv}", self._metadata())
+            table = {
+                "PlaybackStatus": lambda: ("s", self._status()),
+                "LoopStatus": lambda: ("s", self._loop()),
+                "Rate": lambda: ("d", 1.0),
+                "Shuffle": lambda: ("b", bool(self.app.is_shuffle)),
+                "Volume": lambda: ("d", self._volume()),
+                "Position": lambda: ("x", self._position_us()),
+                "MinimumRate": lambda: ("d", 1.0),
+                "MaximumRate": lambda: ("d", 1.0),
+                "CanGoNext": lambda: ("b", self._can_next()),
+                "CanGoPrevious": lambda: ("b", self._can_prev()),
+                "CanPlay": lambda: ("b", True),
+                "CanPause": lambda: ("b", True),
+                "CanSeek": lambda: ("b", not self.app._mpv_idle),
+                "CanControl": lambda: ("b", True),
+            }
+            if name in table:
+                t, v = table[name]()
+                return GLib.Variant(t, v)
+        return None
+
+    # ---------- callbacks do D-Bus ----------
+    def _on_get_property(self, connection, sender, path, iface, name):
+        try:
+            return self._prop(iface, name)
+        except Exception:
+            return None
+
+    def _on_set_property(self, connection, sender, path, iface, name, value):
+        a = self.app
+        try:
+            if iface != _MPRIS_PLAYER:
+                return False
+            if name == "LoopStatus":
+                a.btn_repeat.set_active(value.get_string() == "Track")
+                return True
+            if name == "Shuffle":
+                a.btn_shuffle.set_active(bool(value.get_boolean()))
+                return True
+            if name == "Volume":
+                a.vol_scale.set_value(max(0.0, min(1.0, value.get_double())) * 100.0)
+                return True
+            if name == "Rate":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _on_method_call(self, connection, sender, path, iface, method, params, invocation):
+        a = self.app
+        try:
+            if iface == _MPRIS_ROOT:
+                if method == "Raise":
+                    a.present()
+            elif iface == _MPRIS_PLAYER:
+                if method == "Next":
+                    a.on_next(None)
+                elif method == "Previous":
+                    a.on_prev(None)
+                elif method == "PlayPause":
+                    a.toggle_playback()
+                elif method == "Play":
+                    if a._mpv_idle or a._mpv_paused:
+                        a.toggle_playback()
+                elif method == "Pause":
+                    if not a._mpv_idle and not a._mpv_paused:
+                        a.toggle_playback()
+                elif method == "Stop":
+                    a.mpv.stop()
+                    a._set_mpv_idle(True)
+                elif method == "Seek":
+                    off = params.unpack()[0]
+                    a.mpv.seek_relative(off / 1_000_000.0)
+                    GLib.timeout_add(150, self._emit_seeked_later)
+                elif method == "SetPosition":
+                    tid, pos = params.unpack()
+                    if tid == f"/org/{APP_ID}/track/{a._play_token}":
+                        a.mpv.seek(pos / 1_000_000.0)
+                        a._mpris_pos = pos / 1_000_000.0
+                        self.seeked(a._mpris_pos)
+                # OpenUri: ignorado de propósito
+            invocation.return_value(None)
+        except Exception as e:
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.Failed", str(e))
+
+    def _emit_seeked_later(self):
+        self.seeked(getattr(self.app, "_mpris_pos", 0))
+        return False
+
+    # ---------- avisos para o sistema ----------
+    def notify(self, *names):
+        """Emite PropertiesChanged para as propriedades do Player listadas."""
+        if self.conn is None or not names:
+            return
+        try:
+            changed = {}
+            for n in names:
+                v = self._prop(_MPRIS_PLAYER, n)
+                if v is not None:
+                    changed[n] = v
+            if changed:
+                self.conn.emit_signal(
+                    None, _MPRIS_PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                    GLib.Variant("(sa{sv}as)", (_MPRIS_PLAYER, changed, [])))
+        except Exception:
+            pass
+
+    def seeked(self, seconds):
+        if self.conn is None:
+            return
+        try:
+            self.conn.emit_signal(
+                None, _MPRIS_PATH, _MPRIS_PLAYER, "Seeked",
+                GLib.Variant("(x)", (int(max(0.0, float(seconds or 0)) * 1_000_000),)))
+        except Exception:
+            pass
+
+    def set_art(self, src_path, key):
+        """Copia a capa para um arquivo alternado (a URL muda a cada faixa) e atualiza o Metadata."""
+        try:
+            if not src_path or not os.path.isfile(src_path):
+                return
+            self._art_toggle ^= 1
+            dst = os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpris_art_{os.getpid()}_{self._art_toggle}.jpg")
+            shutil.copyfile(src_path, dst)
+            self._art_url = "file://" + urllib.parse.quote(dst)
+            self._art_key = key
+        except Exception:
+            return
+        self.notify("Metadata")
+
+
 class MusicPlayerApp(Gtk.Window):
     def __init__(self):
         super().__init__(title=APP_NAME)
@@ -844,6 +1148,9 @@ class MusicPlayerApp(Gtk.Window):
             self.mostrar_mensagem("Erro ao iniciar o MPV. Verifique se está instalado.")
 
         self._apply_volume_ui()
+
+        self._mpris_pos = 0
+        self.mpris = MprisService(self)   # controles de mídia do sistema (MPRIS2)
 
         self.connect("destroy", self.on_destroy)
         self.connect("key-press-event", self.on_key_press)
@@ -4709,6 +5016,19 @@ class MusicPlayerApp(Gtk.Window):
             self._discover_for(name)
 
     # ---------- Controle de Reprodução ----------
+    def _mpris_notify(self, *props):
+        m = getattr(self, "mpris", None)
+        if m is not None:
+            m.notify(*props)
+
+    def _mpris_art(self, src_path, key):
+        m = getattr(self, "mpris", None)
+        if m is not None and src_path:
+            cur = self._current_item()
+            if cur is not None and (cur.get("id") or cur.get("path")) == key:
+                m.set_art(src_path, key)
+        return False
+
     def play_item(self, item):
         item = self._normalize_track(item)
         self.add_to_queue(item, notify=False)
@@ -4749,6 +5069,8 @@ class MusicPlayerApp(Gtk.Window):
         self._highlight_current_row()
         self.add_to_history(item)
         self._update_now_playing_card(item)
+        self._mpris_pos = 0
+        self._mpris_notify("Metadata", "PlaybackStatus", "CanGoNext", "CanGoPrevious", "CanSeek")
 
         self._schedule_stall_watchdog(self._play_token)
 
@@ -4834,6 +5156,7 @@ class MusicPlayerApp(Gtk.Window):
             GLib.idle_add(self.thumbnail_img.set_from_icon_name, "audio-x-generic", Gtk.IconSize.DIALOG)
         finally:
             GLib.idle_add(self._notify, APP_NAME, f"Tocando: {title}", icon_path or "audio-x-generic")
+            GLib.idle_add(self._mpris_art, icon_path, video_id)
 
     def _local_cover_cached(self, item):
         """(bytes, caminho_do_cache) da capa de uma faixa offline. Cache por álbum/pasta em COVERS_DIR."""
@@ -4897,6 +5220,7 @@ class MusicPlayerApp(Gtk.Window):
                 GLib.idle_add(self.thumbnail_img.set_from_icon_name, "audio-x-generic", Gtk.IconSize.DIALOG)
         finally:
             GLib.idle_add(self._notify, APP_NAME, f"Tocando: {item.get('title', '')}", icon_path or "audio-x-generic")
+            GLib.idle_add(self._mpris_art, icon_path, item.get("id") or item.get("path"))
 
     def _set_lyrics_cover(self, pixbuf, token):
         if token == self._play_token:
@@ -4917,6 +5241,7 @@ class MusicPlayerApp(Gtk.Window):
 
     # ---------- Callbacks do MPV ----------
     def on_mpv_time_change(self, pos):
+        self._mpris_pos = pos or 0
         if pos and pos > 0.5 and not self._track_started:
             self._track_started = True
             self._cancel_stall_watchdog()
@@ -4932,6 +5257,7 @@ class MusicPlayerApp(Gtk.Window):
         self.track_duration = duration or 0
         self.seek_scale.set_range(0, max(float(duration or 0), 1.0))
         self._shown_sec = None
+        self._mpris_notify("Metadata")
         return False
 
     def on_mpv_pause_change(self, is_paused):
@@ -4968,6 +5294,7 @@ class MusicPlayerApp(Gtk.Window):
 
     def _update_playpause_icon(self):
         """Mostra 'pause' só quando realmente há áudio tocando; caso contrário, 'play'."""
+        self._mpris_notify("PlaybackStatus", "CanSeek")
         playing = not self._mpv_idle and not self._mpv_paused
         icon = "media-playback-pause-symbolic" if playing else "media-playback-start-symbolic"
         if icon == getattr(self, "_playpause_icon", None):
@@ -5033,9 +5360,11 @@ class MusicPlayerApp(Gtk.Window):
 
     def on_toggle_shuffle(self, button):
         self.is_shuffle = button.get_active()
+        self._mpris_notify("Shuffle", "CanGoNext")
 
     def on_toggle_repeat(self, button):
         self.is_repeat = button.get_active()
+        self._mpris_notify("LoopStatus")
 
     def on_volume_changed(self, scale):
         vol = int(scale.get_value())
@@ -5092,6 +5421,7 @@ class MusicPlayerApp(Gtk.Window):
             self.mute_img.set_from_icon_name(icon, Gtk.IconSize.BUTTON)
         self.btn_mute.set_tooltip_text("Ativar som (M)" if silent else "Silenciar (M)")
         self.vol_scale.set_tooltip_text("Mudo" if self.is_muted else f"Volume: {vol}%")
+        self._mpris_notify("Volume")
 
     def _schedule_config_save(self):
         # Debounce: evita gravar o config a cada pixel arrastado no slider
@@ -5111,6 +5441,9 @@ class MusicPlayerApp(Gtk.Window):
         val = self.seek_scale.get_value()
         self.mpv.seek(val)
         self.user_is_seeking = False
+        self._mpris_pos = val
+        if getattr(self, "mpris", None) is not None:
+            self.mpris.seeked(val)
 
     # ---------- Colar Link Manual ----------
     def on_paste_link(self, button=None):
@@ -6250,6 +6583,8 @@ class MusicPlayerApp(Gtk.Window):
         self._save_json(FAVORITES_FILE, self.favorites)
         self._save_json(PROFILE_FILE, self.profile)
         self._save_json(HISTORY_FILE, self.history, compact=True)
+        if getattr(self, "mpris", None) is not None:
+            self.mpris.close()
         self.mpv.quit()
         Gtk.main_quit()
 
