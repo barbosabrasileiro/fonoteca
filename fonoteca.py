@@ -50,7 +50,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Gio
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.1.3"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -5022,12 +5022,109 @@ class MusicPlayerApp(Gtk.Window):
         ], timeout=10)
         t_bio.join(timeout=12)
 
+        # /top falha às vezes (timeout, quota, lista vazia): tenta de novo e cai pra busca
+        top_tracks = self._deezer_top_tracks(artist, top_r, limit=10, albums=(albums_r or {}).get("data", []) or [])
+
         if token == self.wiki_token:
             GLib.idle_add(
                 self._populate_wiki, artist,
                 (albums_r or {}).get("data", []) or [], box.get("bio", "Biografia não encontrada."),
-                (top_r or {}).get("data", []) or [], (rel_r or {}).get("data", []) or [],
+                top_tracks, (rel_r or {}).get("data", []) or [],
             )
+
+    def _deezer_top_tracks(self, artist, first=None, limit=10, albums=None):
+        """Faixas populares de um artista no Deezer, completando por etapas até `limit`.
+
+        O /artist/{id}/top do Deezer pode vir vazio ou truncado (ex.: só 4 faixas), então
+        cada etapa ADICIONA faixas (sem repetir títulos) até atingir o limite:
+        1) /artist/{id}/top (first, ou nova tentativa se veio vazio)
+        2) busca artist:"nome" ordenada por ranking (filtrada pelo id do artista)
+        3) /artist/{id}/radio (filtrada pelo id do artista)
+        4) faixas dos álbuns mais populares do artista, ordenadas pelo campo rank
+        O log em stderr mostra quais etapas contribuíram.
+        """
+        aid = artist.get("id")
+        name = artist.get("name", "")
+        out, seen, used = [], set(), []
+
+        def _data(r):
+            if isinstance(r, dict):
+                d = r.get("data")
+                if isinstance(d, list):
+                    return d
+            return []
+
+        def _own(tracks):
+            return [t for t in tracks if (t.get("artist") or {}).get("id") == aid]
+
+        def _add(step, tracks):
+            added = 0
+            for t in tracks:
+                if len(out) >= limit:
+                    break
+                k = self._norm_key(t.get("title_short") or t.get("title") or "")
+                if k and k not in seen:
+                    seen.add(k)
+                    out.append(t)
+                    added += 1
+            if added:
+                used.append(f"{step}(+{added})")
+            return len(out) >= limit
+
+        def _finish():
+            if out:
+                print(f"[populares] {name}: {len(out)} faixa(s) via {', '.join(used)}", file=sys.stderr)
+            else:
+                print(f"[populares] {name}: nenhuma etapa devolveu faixas", file=sys.stderr)
+            return out[:limit]
+
+        # 1) /top
+        tracks = _data(first)
+        if not tracks:
+            try:
+                tracks = _data(self._http_json(f"{DEEZER_API}/artist/{aid}/top?limit={limit}", timeout=12))
+            except Exception:
+                tracks = []
+        if _add("/top", tracks):
+            return _finish()
+
+        # 2) busca por ranking
+        try:
+            q = urllib.parse.quote(f'artist:"{name}"')
+            tracks = _own(_data(self._http_json(f"{DEEZER_API}/search?q={q}&order=RANKING&limit=50", timeout=12)))
+        except Exception:
+            tracks = []
+        if _add("busca", tracks):
+            return _finish()
+
+        # 3) rádio do artista
+        try:
+            tracks = _own(_data(self._http_json(f"{DEEZER_API}/artist/{aid}/radio?limit=40", timeout=12)))
+        except Exception:
+            tracks = []
+        if _add("radio", tracks):
+            return _finish()
+
+        # 4) faixas dos álbuns mais populares
+        try:
+            top_albums = sorted(albums or [], key=lambda a: a.get("fans") or 0, reverse=True)[:4]
+            tracks = []
+            if top_albums:
+                results = self._http_json_many(
+                    [f"{DEEZER_API}/album/{a.get('id')}/tracks?limit=60" for a in top_albums], timeout=12)
+                pool = []
+                for r in results:
+                    for t in _data(r):
+                        t = dict(t)
+                        t.setdefault("artist", {"id": aid, "name": name})
+                        pool.append(t)
+                pool = _own(pool) or pool
+                pool.sort(key=lambda t: t.get("rank") or 0, reverse=True)
+                tracks = pool
+        except Exception:
+            tracks = []
+        _add("albuns", tracks)
+        return _finish()
 
     def _wiki_failed(self, msg):
         self.wiki_spinner.stop()
