@@ -50,7 +50,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Gio
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.2"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -1060,18 +1060,17 @@ class MusicPlayerApp(Gtk.Window):
         self._toast_timeout_id = None
         self._msg_timeout_id = None
         self.search_token = 0
-        self.discover_token = 0
         self.wiki_token = 0
+        self._chart_token = 0           # descarta respostas antigas do "Em alta" ao trocar de país
 
-        self.discover_current_artist = None
         self.album_token = 0
         self._album_cache = {}
         self.wiki_artist_name = ""
 
-        # Sincronização do artista tocando com a vitrine Descobrir
+        # Artista da faixa tocando (usado pela Wiki)
         self.now_artist = ""
-        self._artist_stale = {"wiki": False, "discover": False}
-        self._loaded_key = {"wiki": "", "discover": ""}
+        self._artist_stale = {"wiki": False}
+        self._loaded_key = {"wiki": ""}
 
         # Volume / mute
         self.is_muted = False
@@ -1279,7 +1278,7 @@ class MusicPlayerApp(Gtk.Window):
 
         GLib.timeout_add_seconds(25, self._start_ytdlp_check)    # depois que a interface assentou
         GLib.timeout_add(700, self._show_welcome)
-        GLib.timeout_add(400, self._startup_discover)
+        GLib.timeout_add(400, self._startup_chart)
         GLib.timeout_add(1500, self._lib_startup)
 
     def _check_dependencies(self):
@@ -1687,40 +1686,46 @@ class MusicPlayerApp(Gtk.Window):
         self.home_recent_box.pack_start(self.home_recent_flow, False, False, 0)
         page.pack_start(self.home_recent_box, False, False, 0)
 
-        # Artistas em alta
+        # Em alta (por país): artistas + músicas mais ouvidas
         self.chart_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.chart_box.pack_start(self._h2("Artistas em alta"), False, False, 0)
+        chart_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.chart_title_lbl = self._h2("Em alta no Brasil")
+        chart_head.pack_start(self.chart_title_lbl, True, True, 0)
+        self.chart_combo = Gtk.ComboBoxText()
+        for _code, _label, _aliases, _phrase in self.CHART_COUNTRIES:
+            self.chart_combo.append(_code, _label)
+        saved = self.config.get("chart_country")
+        self.chart_combo.set_active_id(saved if any(c[0] == saved for c in self.CHART_COUNTRIES) else "BR")
+        self.chart_combo.set_tooltip_text("Escolher o país do ranking")
+        self.chart_combo.connect("changed", self.on_chart_country_changed)
+        chart_head.pack_end(self.chart_combo, False, False, 0)
+        lbl_pais = Gtk.Label(label="País:")
+        lbl_pais.get_style_context().add_class("dim-label")
+        chart_head.pack_end(lbl_pais, False, False, 0)
+        self.chart_box.pack_start(chart_head, False, False, 0)
+
+        self.chart_artists_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.chart_artists_box.pack_start(self._section_label("Artistas"), False, False, 0)
         self.chart_flow = self._make_flow(2, 8)
-        self.chart_box.pack_start(self.chart_flow, False, False, 0)
-        page.pack_start(self.chart_box, False, False, 0)
+        self.chart_artists_box.pack_start(self.chart_flow, False, False, 0)
+        self.chart_box.pack_start(self.chart_artists_box, False, False, 0)
 
-        # Descobrir: artistas parecidos
-        self.discover_related_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.discover_related_lbl = self._h2("Artistas parecidos")
-        self.discover_related_box.pack_start(self.discover_related_lbl, False, False, 0)
-        self.discover_related_flow = self._make_flow(2, 8)
-        self.discover_related_box.pack_start(self.discover_related_flow, False, False, 0)
-        page.pack_start(self.discover_related_box, False, False, 0)
-
-        # Descobrir: faixas recomendadas
-        tracks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        tracks_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        tracks_head.pack_start(self._section_label("Músicas mais ouvidas"), True, True, 0)
         btn_add_all_pl = Gtk.Button(label="Adicionar todas à Playlist")
         btn_add_all_pl.connect("clicked", self.on_discover_add_all_to_playlist)
-        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.discover_title_lbl = self._h2("Músicas em alta")
-        head.pack_start(self.discover_title_lbl, True, True, 0)
-        head.pack_end(btn_add_all_pl, False, False, 0)
-        tracks_box.pack_start(head, False, False, 0)
+        tracks_head.pack_end(btn_add_all_pl, False, False, 0)
+        self.chart_box.pack_start(tracks_head, False, False, 0)
 
         self.discover_tracks_list = Gtk.ListBox()
         self.discover_tracks_list.set_activate_on_single_click(False)
         self.discover_tracks_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
         self.discover_tracks_list.connect("row-activated", self.on_discover_track_activated)
         self.discover_tracks_list.connect("button-press-event", self.on_discover_tracks_button_press)
-        self.discover_tracks_list.set_placeholder(self._placeholder("Carregando recomendações..."))
+        self.discover_tracks_list.set_placeholder(self._placeholder("Carregando..."))
         frame = Gtk.Frame()
         frame.add(self.discover_tracks_list)
-        tracks_box.pack_start(frame, False, False, 0)
+        self.chart_box.pack_start(frame, False, False, 0)
 
         track_btns = Gtk.Box(spacing=8)
         btn_t_play = Gtk.Button(label="Reproduzir")
@@ -1732,11 +1737,11 @@ class MusicPlayerApp(Gtk.Window):
         btn_t_dl.connect("clicked", lambda w: self.on_discover_track_button("download"))
         for b in (btn_t_play, btn_t_add, btn_t_dl):
             track_btns.pack_start(b, False, False, 0)
-        tracks_box.pack_start(track_btns, False, False, 0)
-        page.pack_start(tracks_box, False, False, 0)
+        self.chart_box.pack_start(track_btns, False, False, 0)
+        page.pack_start(self.chart_box, False, False, 0)
 
         scroll.add(page)
-        for w in (self.home_recent_box, self.chart_box, self.discover_related_box):
+        for w in (self.home_recent_box, self.chart_artists_box):
             self._set_shown(w, False)
         self._refresh_home_greeting()
         return scroll
@@ -1796,27 +1801,161 @@ class MusicPlayerApp(Gtk.Window):
         self._fill_flow(self.home_recent_flow, cards)
         self._set_shown(self.home_recent_box, bool(cards))
 
-    def _chart_artists_thread(self):
-        try:
-            data = self._http_json(f"{DEEZER_API}/chart/0/artists?limit=12").get("data", []) or []
-        except Exception:
-            data = []
-        GLib.idle_add(self._populate_chart_artists, data)
+    # ---------- Em alta (por país) ----------
+    # (código, nome, títulos "Top <nome>" usados pelo Deezer Charts, frase do título)
+    CHART_COUNTRIES = (
+        ("BR", "Brasil", ("Brazil",), "no Brasil"),
+        ("WW", "Mundo", ("Worldwide",), "no mundo"),
+        ("US", "Estados Unidos", ("USA", "United States", "US"), "nos Estados Unidos"),
+        ("GB", "Reino Unido", ("UK", "United Kingdom"), "no Reino Unido"),
+        ("PT", "Portugal", ("Portugal",), "em Portugal"),
+        ("AR", "Argentina", ("Argentina",), "na Argentina"),
+        ("MX", "México", ("Mexico",), "no México"),
+        ("CO", "Colômbia", ("Colombia",), "na Colômbia"),
+        ("CL", "Chile", ("Chile",), "no Chile"),
+        ("ES", "Espanha", ("Spain",), "na Espanha"),
+        ("FR", "França", ("France",), "na França"),
+        ("DE", "Alemanha", ("Germany",), "na Alemanha"),
+        ("IT", "Itália", ("Italy",), "na Itália"),
+        ("TR", "Turquia", ("Turkey",), "na Turquia"),
+        ("CA", "Canadá", ("Canada",), "no Canadá"),
+    )
+    CHART_PRESET_IDS = {"BR": 1111141961}     # "Top Brazil" (Deezer Charts); os demais são achados e guardados
 
-    def _populate_chart_artists(self, artists):
-        self._fill_flow(self.chart_flow, [self._artist_card(a) for a in artists])
-        self._set_shown(self.chart_box, bool(artists))
+    def _chart_info(self, code):
+        for c in self.CHART_COUNTRIES:
+            if c[0] == code:
+                return c
+        return self.CHART_COUNTRIES[0]
+
+    def on_chart_country_changed(self, combo):
+        code = combo.get_active_id()
+        if not code:
+            return
+        self.config["chart_country"] = code
+        self._schedule_config_save()
+        self._chart_load(code)
+
+    def _chart_load(self, code=None):
+        code = code or self.config.get("chart_country") or "BR"
+        info = self._chart_info(code)
+        self._chart_token += 1
+        token = self._chart_token
+        self._set_h2(self.chart_title_lbl, f"Em alta {info[3]}")
+        self._fill_flow(self.chart_flow, [])
+        self._set_shown(self.chart_artists_box, False)
+        for child in list(self.discover_tracks_list.get_children()):
+            self.discover_tracks_list.remove(child)
+        self.discover_tracks_list.set_placeholder(self._placeholder("Carregando..."))
+        threading.Thread(target=self._chart_thread, args=(info[0], token), daemon=True).start()
+
+    def _chart_thread(self, code, token):
+        tracks = []
+        try:
+            if code == "WW":
+                tracks = self._http_json(f"{DEEZER_API}/chart/0/tracks?limit=50").get("data", []) or []
+            else:
+                tracks = self._chart_country_tracks(code)
+        except Exception:
+            tracks = []
+        tracks = [t for t in tracks if isinstance(t, dict) and t.get("readable", True)]
+        if token == self._chart_token:
+            GLib.idle_add(self._populate_chart, code, tracks, token)
+
+    def _chart_country_tracks(self, code):
+        """Faixas do chart oficial 'Top <país>' (Deezer Charts). O id é guardado após a 1ª busca."""
+        cache = self.config.get("chart_ids")
+        cache = cache if isinstance(cache, dict) else {}
+        pid = cache.get(code) or self.CHART_PRESET_IDS.get(code)
+
+        def fetch(playlist_id):
+            return self._http_json(f"{DEEZER_API}/playlist/{playlist_id}/tracks?limit=50", timeout=10).get("data", []) or []
+
+        tracks = []
+        if pid:
+            try:
+                tracks = fetch(pid)
+            except Exception:
+                tracks = []
+        if not tracks:
+            found = self._chart_find_playlist(code)
+            if found and found != pid:
+                tracks = fetch(found)
+                if tracks:
+                    GLib.idle_add(self._chart_remember, code, found)
+        return tracks
+
+    def _chart_remember(self, code, pid):
+        ids = self.config.get("chart_ids")
+        if not isinstance(ids, dict):
+            ids = {}
+        ids[code] = pid
+        self.config["chart_ids"] = ids
+        self._schedule_config_save()
         return False
 
-    def _startup_discover(self):
-        seed = ""
-        for lst in (self.history, self.favorites, self.queue):
-            if lst:
-                seed = self._guess_artist(lst[0])
-            if seed:
+    def _chart_find_playlist(self, code):
+        """Procura a playlist oficial 'Top <país>' do Deezer Charts (só aceita a conta oficial)."""
+        aliases = self._chart_info(code)[2]
+        wanted = {self._norm_key("Top " + a) for a in aliases}
+        best, best_score = None, None
+        for alias in aliases:
+            q = urllib.parse.quote(f"Top {alias}")
+            data = self._http_json(f"{DEEZER_API}/search/playlist?q={q}&limit=25", timeout=10).get("data", []) or []
+            for pl in data:
+                if self._norm_key(pl.get("title", "")) not in wanted:
+                    continue
+                owner = ((pl.get("user") or pl.get("creator") or {}).get("name") or "").lower()
+                if "deezer" not in owner:
+                    continue
+                score = ((pl.get("nb_tracks") or 0) >= 40, pl.get("fans") or pl.get("nb_fan") or 0)
+                if best_score is None or score > best_score:
+                    best, best_score = pl.get("id"), score
+            if best:
                 break
-        self._discover_for(seed)
-        threading.Thread(target=self._chart_artists_thread, daemon=True).start()
+        return best
+
+    def _populate_chart(self, code, tracks, token):
+        if token != self._chart_token:
+            return False
+        info = self._chart_info(code)
+        for child in list(self.discover_tracks_list.get_children()):
+            self.discover_tracks_list.remove(child)
+        if not tracks:
+            self.discover_tracks_list.set_placeholder(
+                self._placeholder(f"Não encontrei o ranking {info[3]} agora (sem internet ou sem chart para esse país)."))
+            self._fill_flow(self.chart_flow, [])
+            self._set_shown(self.chart_artists_box, False)
+            return False
+
+        # artistas em ordem de aparição no ranking, com quantas músicas cada um tem nele
+        order, counts = [], {}
+        for t in tracks:
+            a = t.get("artist") or {}
+            aid = a.get("id")
+            if not aid:
+                continue
+            if aid not in counts:
+                order.append(a)
+                counts[aid] = 0
+            counts[aid] += 1
+        cards = []
+        for i, a in enumerate(order[:12], start=1):
+            n = counts[a["id"]]
+            sub = f"#{i} · {n} no top" if n > 1 else f"#{i}"
+            cards.append(self._card(a.get("name", ""), sub, (120, 120),
+                                    url=a.get("picture_medium") or a.get("picture"),
+                                    on_click=lambda a=a: self._open_artist_in_wiki(a.get("name", ""), a)))
+        self._fill_flow(self.chart_flow, cards)
+        self._set_shown(self.chart_artists_box, bool(cards))
+
+        for i, t in enumerate(tracks, start=1):
+            self.discover_tracks_list.add(self._dtrack_row(t, i))
+        self.discover_tracks_list.show_all()
+        return False
+
+    def _startup_chart(self):
+        self._chart_load()
         return False
 
     # ---------- Busca unificada ----------
@@ -4418,7 +4557,7 @@ class MusicPlayerApp(Gtk.Window):
 
         return best if best and score >= 6 else None
 
-    # ---------- Descobrir (vitrine da página inicial) ----------
+    # ---------- Faixas do Deezer em listas (Em alta, Wiki) ----------
     def _dtrack_row(self, t, index=None):
         artist_name = (t.get("artist") or {}).get("name", "")
         dur = self._fmt_duration(t.get("duration"))
@@ -4434,69 +4573,6 @@ class MusicPlayerApp(Gtk.Window):
             {"title": t.get("title", ""), "artist": artist_name, "duration_fmt": dur, "verified": True})
         return row
 
-    def _discover_for(self, name):
-        name = (name or "").strip()
-        self._loaded_key["discover"] = self._norm_key(name)
-        self.discover_token += 1
-        threading.Thread(target=self._discover_thread, args=(name, self.discover_token), daemon=True).start()
-
-    def _discover_thread(self, name, token):
-        artist = None
-        if name:
-            try:
-                artist = self._deezer_search_artist(name)
-            except Exception:
-                artist = None
-        if token != self.discover_token:
-            return
-        if not artist:
-            # sem artista de referência: mostra as músicas em alta
-            try:
-                tracks = self._http_json(f"{DEEZER_API}/chart/0/tracks?limit=15").get("data", []) or []
-            except Exception:
-                tracks = []
-            if token == self.discover_token:
-                GLib.idle_add(self._populate_discover, None, [], tracks, token)
-            return
-
-        aid = artist["id"]
-        related_r, top_r = self._http_json_many(
-            [f"{DEEZER_API}/artist/{aid}/related?limit=12", f"{DEEZER_API}/artist/{aid}/top?limit=15"])
-        related = (related_r or {}).get("data", []) or []
-        top_tracks = (top_r or {}).get("data", []) or []
-        if not top_tracks:
-            try:
-                q = urllib.parse.quote(f'artist:"{artist.get("name", "")}"')
-                data = self._http_json(f"{DEEZER_API}/search?q={q}&limit=15").get("data", []) or []
-                top_tracks = [t for t in data if (t.get("artist") or {}).get("id") == aid] or data
-            except Exception:
-                pass
-        if token == self.discover_token:
-            GLib.idle_add(self._populate_discover, artist, related, top_tracks, token)
-
-    def _populate_discover(self, artist, related, top_tracks, token=None):
-        if token is not None and token != self.discover_token:
-            return False
-        self.discover_current_artist = artist
-        if artist:
-            nm = artist.get("name", "")
-            self._loaded_key["discover"] = self._norm_key(nm)
-            self._set_h2(self.discover_title_lbl, f"Porque você ouviu {nm}")
-            self._set_h2(self.discover_related_lbl, f"Artistas parecidos com {nm}")
-        else:
-            self._set_h2(self.discover_title_lbl, "Músicas em alta")
-        self._fill_flow(self.discover_related_flow, [self._artist_card(a) for a in related[:8]])
-        self._set_shown(self.discover_related_box, bool(related))
-
-        for child in list(self.discover_tracks_list.get_children()):
-            self.discover_tracks_list.remove(child)
-        if not top_tracks:
-            self.discover_tracks_list.set_placeholder(self._placeholder("Não foi possível carregar recomendações (sem internet?)."))
-        for i, t in enumerate(top_tracks, start=1):
-            self.discover_tracks_list.add(self._dtrack_row(t, i))
-        self.discover_tracks_list.show_all()
-        return False
-
     def _open_artist_in_wiki(self, name, artist=None):
         name = (name or "").strip()
         if not name:
@@ -4511,7 +4587,7 @@ class MusicPlayerApp(Gtk.Window):
         self.discover_tracks_list.select_all()
         items = self._get_discover_selected_tracks()
         if not items:
-            self.mostrar_mensagem("Não há faixas recomendadas para adicionar.")
+            self.mostrar_mensagem("Não há faixas para adicionar.")
             return
         self._add_dtracks_to_playlist(items)
 
@@ -5354,14 +5430,12 @@ class MusicPlayerApp(Gtk.Window):
             ))
         return items
 
-    # ---------- Artista tocando -> vitrine "Descobrir" ----------
+    # ---------- Artista tocando ----------
     def _sync_artist_tabs(self, name):
         name = (name or "").strip()
         if not name:
             return
         self.now_artist = name
-        if self._norm_key(name) != self._loaded_key["discover"]:
-            self._discover_for(name)
 
     # ---------- Controle de Reprodução ----------
     def _mpris_notify(self, *props):
@@ -6774,7 +6848,7 @@ class MusicPlayerApp(Gtk.Window):
         page.pack_start(self._about_heading("Abas do aplicativo"), False, False, 0)
         for name, desc in (
             ("Barra lateral", "Início, Favoritas, Recentes e Sobre, além das suas playlists sempre à mão (botão direito: tocar, renomear, excluir)."),
-            ("Início", "Vitrines: atalho para suas curtidas, o que tocou recentemente, artistas em alta e recomendações baseadas no que você ouve."),
+            ("Início", "Vitrines: atalho para suas curtidas, o que tocou recentemente e o \"Em alta\" por país (padrão: Brasil) com os artistas e as músicas mais ouvidas do ranking."),
             ("Busca", "Uma busca só para músicas (YouTube), artistas e álbuns (Deezer), com filtros Tudo / Músicas / Artistas / Álbuns."),
             ("Artista e álbuns", "Biografia, faixas populares, discografia em capas e artistas parecidos. Abra um álbum para ver e tocar as faixas."),
             ("Rádio", "Botão Rádio no player (ou botão direito > Iniciar Rádio da Faixa): a fila se abastece sozinha com músicas parecidas, sem fim. Usa o mix automático do YouTube e, se ele falhar, a rádio do artista no Deezer."),
@@ -6801,7 +6875,7 @@ class MusicPlayerApp(Gtk.Window):
         page.pack_start(self._about_heading("APIs e serviços online"), False, False, 0)
         page.pack_start(self._about_text("Nenhuma exige chave de API ou login.", dim=True), False, False, 0)
         for name, desc, tag in (
-            ("Deezer API", "Refino de metadados na busca, álbum/ano/capa da aba Letra, busca de artistas, artistas relacionados, faixas mais populares, discografia e faixas de cada álbum. Uso não comercial.", "api.deezer.com"),
+            ("Deezer API", "Refino de metadados na busca, álbum/ano/capa da aba Letra, busca de artistas, artistas relacionados, faixas mais populares, discografia, faixas de cada álbum e os rankings por país (playlists oficiais \"Top <país>\" do Deezer Charts). Uso não comercial.", "api.deezer.com"),
             ("LRCLIB", "Fonte das letras. Usa a letra simples ou, se não houver, a sincronizada sem os marcadores de tempo.", "lrclib.net"),
             ("Wikipédia (pt/en)", "Biografia do artista (texto sob licença CC BY-SA 4.0). Tenta primeiro a versão em português; se não achar, usa a inglesa. Só aceita páginas de músicos e bandas.", "wikipedia.org"),
             ("YouTube (via yt-dlp)", "Busca de vídeos e stream de áudio. As miniaturas da faixa atual vêm do servidor de imagens do YouTube.", "youtube.com · i.ytimg.com"),
