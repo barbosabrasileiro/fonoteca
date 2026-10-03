@@ -50,7 +50,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Gio
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.1.3"
+APP_VERSION = "2.2.0"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -790,7 +790,7 @@ class MprisService:
         a = self.app
         if not a.queue:
             return False
-        return (a.is_shuffle and len(a.queue) > 1) or a.current_index + 1 < len(a.queue)
+        return (a.is_shuffle and len(a.queue) > 1) or a.current_index + 1 < len(a.queue) or a._radio is not None
 
     def _can_prev(self):
         return self.app.current_index > 0
@@ -1043,6 +1043,13 @@ class MusicPlayerApp(Gtk.Window):
         self.current_index = -1
         self.is_repeat = False
         self.is_shuffle = False
+        # Rádio (fila infinita com músicas parecidas); None = desligada
+        self._radio = None
+        self._radio_busy = False
+        self._radio_token = 0
+        self._radio_pending_next = False
+        self._radio_ended = False
+        self._radio_ui_lock = False
         self.track_duration = 0
         self.user_is_seeking = False
         # Estado do play/pause: ao abrir não há nada tocando (mpv ocioso)
@@ -1207,18 +1214,23 @@ class MusicPlayerApp(Gtk.Window):
         self.btn_repeat.set_tooltip_text("Repetir Fila")
         self.btn_repeat.connect("toggled", self.on_toggle_repeat)
 
+        self.btn_radio = Gtk.ToggleButton(label="Rádio")
+        self.btn_radio.set_tooltip_text("Rádio: continua tocando músicas parecidas com a faixa atual")
+        self.btn_radio.connect("toggled", self.on_toggle_radio)
+
         btn_download_ctrl = Gtk.Button.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON)
         btn_download_ctrl.set_tooltip_text("Baixar seleção em MP3")
         btn_download_ctrl.connect("clicked", self.on_download)
 
         self.btn_like = self._make_heart(None)
+        self.btn_like.set_relief(Gtk.ReliefStyle.NORMAL)   # moldura como os demais botões do player (nas listas segue sem moldura)
         self.btn_queue_toggle = Gtk.ToggleButton(label="Fila")
         self.btn_queue_toggle.set_tooltip_text("Fila de reprodução")
         self.btn_queue_toggle.connect("toggled", self._on_panel_toggle, "queue")
         self.btn_lyrics_toggle = Gtk.ToggleButton(label="Letra")
         self.btn_lyrics_toggle.set_tooltip_text("Letra da música")
         self.btn_lyrics_toggle.connect("toggled", self._on_panel_toggle, "lyrics")
-        for w in (self.btn_like, btn_paste, self.btn_shuffle, btn_prev, self.btn_playpause, btn_next, self.btn_repeat, btn_download_ctrl, self.btn_queue_toggle, self.btn_lyrics_toggle):
+        for w in (self.btn_like, btn_paste, self.btn_shuffle, btn_prev, self.btn_playpause, btn_next, self.btn_repeat, self.btn_radio, btn_download_ctrl, self.btn_queue_toggle, self.btn_lyrics_toggle):
             controls_box.pack_start(w, False, False, 0)
 
         now_playing_box.pack_start(controls_box, False, False, 0)
@@ -3120,6 +3132,7 @@ class MusicPlayerApp(Gtk.Window):
             return
         if shuffle:
             random.shuffle(tracks)
+        self.stop_radio(notify=False)
         self.queue = tracks
         self._save_queue()
         self.render_queue()
@@ -3173,7 +3186,7 @@ class MusicPlayerApp(Gtk.Window):
         item_dl.connect("activate", lambda w: self.on_download(None))
         item_rm = Gtk.MenuItem(label="Remover das Favoritas")
         item_rm.connect("activate", lambda w: self.set_favorites(sel, False))
-        for it in (item_play, item_q, item_pl, item_dl, Gtk.SeparatorMenuItem(), item_rm):
+        for it in (item_play, item_q, self._radio_menu_item(row.item), item_pl, item_dl, Gtk.SeparatorMenuItem(), item_rm):
             menu.append(it)
         menu.show_all()
         menu.popup_at_pointer(event)
@@ -3528,6 +3541,7 @@ class MusicPlayerApp(Gtk.Window):
         if not tracks:
             self.mostrar_mensagem("A playlist selecionada está vazia.")
             return
+        self.stop_radio(notify=False)
         self.queue = list(tracks)
         self._save_queue()
         self.render_queue()
@@ -3657,7 +3671,7 @@ class MusicPlayerApp(Gtk.Window):
             item_dl = Gtk.MenuItem(label="Baixar")
             item_dl.connect("activate", lambda w: self.on_download(None))
             item_like = self._like_menu_item([r.item for r in widget.get_selected_rows() if hasattr(r, "item")])
-            for it in (item_play, item_add_q, item_like, item_dl):
+            for it in (item_play, item_add_q, self._radio_menu_item(row.item), item_like, item_dl):
                 menu.append(it)
             menu.show_all()
             menu.popup_at_pointer(event)
@@ -3850,7 +3864,7 @@ class MusicPlayerApp(Gtk.Window):
             item_dl = Gtk.MenuItem(label="Baixar")
             item_dl.connect("activate", lambda w: self.on_download(None))
             item_like = self._like_menu_item([r.item for r in widget.get_selected_rows()])
-            for it in (item_add, item_play, item_pl, item_like, item_dl):
+            for it in (item_add, item_play, self._radio_menu_item(row.item), item_pl, item_like, item_dl):
                 menu.append(it)
             menu.show_all()
             menu.popup_at_pointer(event)
@@ -4064,6 +4078,7 @@ class MusicPlayerApp(Gtk.Window):
         if not self._confirm_action("Limpar toda a fila de reprodução?"):
             return
         self.queue.clear()
+        self.stop_radio(notify=False)
         self._save_queue()
         self.current_index = -1
         self.mpv.stop()
@@ -4090,7 +4105,7 @@ class MusicPlayerApp(Gtk.Window):
             item_dl = Gtk.MenuItem(label="Baixar Selecionadas")
             item_dl.connect("activate", lambda w: self.on_download(None))
             item_like = self._like_menu_item([r.item for r in widget.get_selected_rows()])
-            for it in (item_play, item_pl, item_like, item_del, item_dl):
+            for it in (item_play, self._radio_menu_item(row.item), item_pl, item_like, item_del, item_dl):
                 menu.append(it)
             menu.show_all()
             menu.popup_at_pointer(event)
@@ -4146,7 +4161,7 @@ class MusicPlayerApp(Gtk.Window):
             item_pl = Gtk.MenuItem(label="Adicionar à Playlist")
             item_pl.connect("activate", lambda w: self.on_add_selection_to_playlist(items_to_add=[r.item for r in widget.get_selected_rows()]))
             item_like = self._like_menu_item([r.item for r in widget.get_selected_rows()])
-            for it in (item_play, item_add_q, item_pl, item_like):
+            for it in (item_play, item_add_q, self._radio_menu_item(row.item), item_pl, item_like):
                 menu.append(it)
             menu.show_all()
             menu.popup_at_pointer(event)
@@ -4528,7 +4543,7 @@ class MusicPlayerApp(Gtk.Window):
         item_dl = Gtk.MenuItem(label="Baixar")
         item_dl.connect("activate", lambda w: self._download_dtracks(sel))
         item_like = self._like_menu_item(sel, resolver=lambda items, cb: self._discover_resolve_and(items, cb, "Curtindo faixas"))
-        for it in (item_play, item_add, item_pl, item_like, item_dl):
+        for it in (item_play, item_add, self._radio_menu_item_dtrack(row.item), item_pl, item_like, item_dl):
             menu.append(it)
         menu.show_all()
         menu.popup_at_pointer(event)
@@ -5388,6 +5403,7 @@ class MusicPlayerApp(Gtk.Window):
                 GLib.idle_add(self._skip_missing_file)
             return
         self._missing_skips = 0
+        self._radio_pending_next = False
 
         self._play_token += 1
         self._track_started = False
@@ -5413,6 +5429,7 @@ class MusicPlayerApp(Gtk.Window):
             threading.Thread(target=self._fetch_thumbnail, args=(item["id"], item["title"]), daemon=True).start()
         self.search_current_lyrics()
         self._sync_artist_tabs(self._guess_artist(item))
+        self._radio_refill()
 
     def _skip_missing_file(self):
         if self.current_index + 1 < len(self.queue):
@@ -5665,9 +5682,251 @@ class MusicPlayerApp(Gtk.Window):
             self.play_current()
             return False
         has_next = (self.is_shuffle and len(self.queue) > 1) or self.current_index + 1 < len(self.queue)
-        if not has_next:
+        if not has_next and self._radio is None:
             self._set_mpv_idle(True)  # fila acabou: o botão volta a ser "play"
+        self._radio_ended = (not has_next and self._radio is not None)   # com rádio, on_next busca mais faixas
         self.on_next(None)
+        return False
+
+    # ---------- Rádio (fila infinita com músicas parecidas) ----------
+    RADIO_REFILL_AT = 2      # reabastece quando restam até N faixas à frente
+    RADIO_BATCH = 8          # faixas adicionadas por vez
+    RADIO_POOL = 40          # tamanho do mix baixado por chamada (sobra fica em reserva, sem rede)
+    RADIO_MIN_SEC = 45
+    RADIO_MAX_SEC = 720
+    _RADIO_JUNK = re.compile(r"(?i)full\s+album|[aá]lbum\s+completo|\b\d+\s*(?:hours?|horas?)\b|non-?stop|compilation")
+    _YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+    def _radio_key(self, t):
+        return self._norm_key(t.get("title", "")) + "|" + self._norm_key(t.get("artist") or t.get("uploader") or "")
+
+    def _radio_menu_item(self, item):
+        mi = Gtk.MenuItem(label="Iniciar Rádio da Faixa")
+        mi.connect("activate", lambda w: self.start_radio(item))
+        return mi
+
+    def _radio_menu_item_dtrack(self, dtrack):
+        """Faixa do Deezer (Descobrir/Wiki): localiza no YouTube e inicia a rádio a partir dela."""
+        def go(w):
+            self.show_toast("Buscando faixa no YouTube...")
+            self._resolve_deezer_track(dtrack, lambda item: self.start_radio(item))
+        mi = Gtk.MenuItem(label="Iniciar Rádio da Faixa")
+        mi.connect("activate", go)
+        return mi
+
+    def _radio_set_button(self, active):
+        self._radio_ui_lock = True
+        try:
+            self.btn_radio.set_active(bool(active))
+        finally:
+            self._radio_ui_lock = False
+
+    def on_toggle_radio(self, button):
+        if self._radio_ui_lock:
+            return
+        if button.get_active():
+            item = self._current_item()
+            if item is None:
+                self._radio_set_button(False)
+                self.mostrar_mensagem("Toque uma música primeiro, ou use o botão direito > Iniciar Rádio da Faixa.")
+                return
+            self.start_radio(item, play_now=False)
+        else:
+            self.stop_radio()
+
+    def start_radio(self, item, play_now=True):
+        """Liga a rádio a partir de uma faixa. play_now=True toca a faixa já; False só continua depois da fila."""
+        item = self._normalize_track(item)
+        self._radio_token += 1
+        self._radio_busy = False
+        self._radio_pending_next = False
+        self._radio_ended = False
+        sid = item.get("id", "")
+        sid = sid if self._YT_ID_RE.match(sid or "") else ""
+        self._radio = {"seed": item, "seed_id": sid, "last_seed_id": sid, "pool": [], "fails": 0}
+        self._radio_set_button(True)
+        if self.is_shuffle:
+            self.btn_shuffle.set_active(False)   # rádio segue a ordem da fila
+        if play_now:
+            self.show_toast("Rádio: buscando músicas parecidas...")
+            self.play_item(item)                 # play_current já dispara o reabastecimento
+        else:
+            ahead = len(self.queue) - self.current_index - 1
+            self.show_toast("Rádio ligada." if ahead <= self.RADIO_REFILL_AT
+                            else "Rádio ligada: entra depois do que já está na fila.")
+        self._radio_refill()
+
+    def stop_radio(self, notify=True):
+        if self._radio is None:
+            return
+        self._radio = None
+        self._radio_token += 1
+        self._radio_busy = False
+        self._radio_pending_next = False
+        if self._radio_ended:
+            self._radio_ended = False
+            self._set_mpv_idle(True)
+        self._radio_set_button(False)
+        if notify:
+            self.show_toast("Rádio desligada.")
+
+    def _radio_refill(self, force=False):
+        """Pede mais faixas em segundo plano quando a fila está acabando (não bloqueia a interface)."""
+        rd = self._radio
+        if rd is None or self._radio_busy:
+            return
+        ahead = len(self.queue) - self.current_index - 1
+        if not force and ahead > self.RADIO_REFILL_AT:
+            return
+        self._radio_busy = True
+        ex_ids = {t.get("id") for t in self.queue if t.get("id")} | {t.get("id") for t in self.history[:60] if t.get("id")}
+        ex_keys = {self._radio_key(t) for t in self.queue[-150:]}
+        tail = [self._norm_key(t.get("artist") or t.get("uploader") or "") for t in self.queue[-2:]]
+        threading.Thread(target=self._radio_fill_thread,
+                         args=(rd, self._radio_token, ex_ids, ex_keys, tail), daemon=True).start()
+
+    def _radio_take(self, pool, want, ex_ids, ex_keys, tail):
+        """Tira até `want` faixas do pool: sem repetir faixa/título e sem o mesmo artista 3x seguidas."""
+        out, keep = [], []
+        for t in pool:
+            if len(out) >= want:
+                keep.append(t)
+                continue
+            k = self._radio_key(t)
+            if t["id"] in ex_ids or k in ex_keys:
+                continue
+            ak = self._norm_key(t.get("artist") or "")
+            if ak and len(tail) >= 2 and tail[-1] == ak and tail[-2] == ak:
+                keep.append(t)          # adia: fica para o próximo lote
+                continue
+            out.append(t)
+            ex_ids.add(t["id"])
+            ex_keys.add(k)
+            tail.append(ak)
+        pool[:] = keep
+        return out
+
+    def _radio_fetch_mix(self, seed_id):
+        """Mix automático do YouTube para um vídeo (a mesma 'rádio' do site), via yt-dlp. Lista normalizada."""
+        urls = (f"https://www.youtube.com/watch?v={seed_id}&list=RD{seed_id}",
+                f"https://music.youtube.com/watch?v={seed_id}&list=RDAMVM{seed_id}")
+        for url in urls:
+            try:
+                out = subprocess.check_output(
+                    ["yt-dlp", url, "--yes-playlist", "--flat-playlist", "-j", "--no-warnings",
+                     "--playlist-end", str(self.RADIO_POOL)],
+                    stderr=subprocess.DEVNULL, text=True, timeout=40)
+            except Exception:
+                continue
+            items = []
+            for line in out.splitlines():
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                vid = d.get("id") or self._extract_id(d.get("url", "") or "")
+                if not vid or not self._YT_ID_RE.match(vid):
+                    continue
+                dur = d.get("duration")
+                if dur and not (self.RADIO_MIN_SEC <= dur <= self.RADIO_MAX_SEC):
+                    continue
+                if d.get("live_status") in ("is_live", "is_upcoming"):
+                    continue
+                raw_title = d.get("title") or ""
+                if self._RADIO_JUNK.search(raw_title):
+                    continue
+                title, artist = self._tidy_yt_metadata(raw_title, d.get("uploader") or d.get("channel") or "")
+                items.append(self._normalize_track({
+                    "id": vid, "title": title, "uploader": artist,
+                    "duration": self._fmt_duration(dur), "verified": False}))
+            if items:
+                return items
+        return []
+
+    def _radio_deezer_fallback(self, rd, token, ex_ids, ex_keys, limit=5):
+        """Reserva sem o mix do YouTube: rádio do artista no Deezer, cada faixa localizada no YouTube."""
+        name = self._clean_artist_name(self._guess_artist(rd["seed"]))
+        if not name:
+            return []
+        artist = self._deezer_search_artist(name)
+        if not artist:
+            return []
+        data = self._http_json(f"{DEEZER_API}/artist/{artist['id']}/radio?limit=40", timeout=12).get("data", []) or []
+        out = []
+        for t in data:
+            if token != self._radio_token or len(out) >= limit:
+                break
+            title = t.get("title_short") or t.get("title") or ""
+            art = (t.get("artist") or {}).get("name", "")
+            k = self._norm_key(title) + "|" + self._norm_key(art)
+            if not title or k in ex_keys:
+                continue
+            res = self._resolve_one_dtrack({"artist": art, "title": title,
+                                            "duration": self._fmt_duration(t.get("duration"))})
+            if res and res["id"] not in ex_ids:
+                out.append(res)
+                ex_ids.add(res["id"])
+                ex_keys.add(k)
+        return out
+
+    def _radio_fill_thread(self, rd, token, ex_ids, ex_keys, tail):
+        picked = []
+        try:
+            if not rd.get("seed_id"):
+                # faixa local/sem ID do YouTube: acha o vídeo por "artista - título"
+                seed = rd["seed"]
+                res = self._resolve_one_dtrack({"artist": seed.get("artist") or seed.get("uploader") or "",
+                                                "title": seed.get("title", "")})
+                if res:
+                    rd["seed_id"] = rd["last_seed_id"] = res["id"]
+            picked = self._radio_take(rd["pool"], self.RADIO_BATCH, ex_ids, ex_keys, tail)
+            if not picked:
+                tried = set()
+                for sid in (rd.get("last_seed_id"), rd.get("seed_id")):
+                    if not sid or sid in tried or token != self._radio_token:
+                        continue
+                    tried.add(sid)
+                    mix = self._radio_fetch_mix(sid)
+                    print(f"[rádio] mix de {sid}: {len(mix)} faixa(s)", file=sys.stderr)
+                    rd["pool"].extend(mix)
+                    picked = self._radio_take(rd["pool"], self.RADIO_BATCH, ex_ids, ex_keys, tail)
+                    if picked:
+                        break
+            if not picked and token == self._radio_token:
+                picked = self._radio_deezer_fallback(rd, token, ex_ids, ex_keys)
+                print(f"[rádio] reserva Deezer: {len(picked)} faixa(s)", file=sys.stderr)
+        except Exception as e:
+            print(f"[rádio] erro: {e}", file=sys.stderr)
+        GLib.idle_add(self._radio_append, picked, token)
+
+    def _radio_append(self, items, token):
+        if token != self._radio_token or self._radio is None:
+            return False                # rádio desligada/reiniciada durante a busca: descarta
+        self._radio_busy = False
+        rd = self._radio
+        if items:
+            rd["fails"] = 0
+            rd["last_seed_id"] = items[-1]["id"]      # a rádio "anda": o próximo mix parte da última faixa
+            first_new = len(self.queue)
+            self.add_items_bulk(items, notify=False)
+            if self._radio_pending_next:
+                self._radio_pending_next = False
+                self._radio_ended = False
+                self.current_index = first_new
+                self.play_current()
+            return False
+        rd["fails"] += 1
+        if self._radio_pending_next:
+            self._radio_pending_next = False
+            if self._radio_ended:
+                self._radio_ended = False
+                self._set_mpv_idle(True)
+                self.now_playing_label.set_text("Fila finalizada")
+        if rd["fails"] >= 3:
+            self.stop_radio(notify=False)
+            self.show_toast("Rádio desligada: não encontrei mais músicas parecidas.")
+        else:
+            self.show_toast("Rádio: não encontrei músicas parecidas agora.")
         return False
 
     def on_load_error(self, error_msg):
@@ -5700,6 +5959,10 @@ class MusicPlayerApp(Gtk.Window):
         elif self.current_index + 1 < len(self.queue):
             self.current_index += 1
             self.play_current()
+        elif self._radio is not None:
+            self._radio_pending_next = True      # toca a primeira faixa nova assim que chegar
+            self.show_toast("Rádio: buscando mais músicas...")
+            self._radio_refill(force=True)
         else:
             self.now_playing_label.set_text("Fila finalizada")
 
@@ -6514,6 +6777,7 @@ class MusicPlayerApp(Gtk.Window):
             ("Início", "Vitrines: atalho para suas curtidas, o que tocou recentemente, artistas em alta e recomendações baseadas no que você ouve."),
             ("Busca", "Uma busca só para músicas (YouTube), artistas e álbuns (Deezer), com filtros Tudo / Músicas / Artistas / Álbuns."),
             ("Artista e álbuns", "Biografia, faixas populares, discografia em capas e artistas parecidos. Abra um álbum para ver e tocar as faixas."),
+            ("Rádio", "Botão Rádio no player (ou botão direito > Iniciar Rádio da Faixa): a fila se abastece sozinha com músicas parecidas, sem fim. Usa o mix automático do YouTube e, se ele falhar, a rádio do artista no Deezer."),
             ("Fila e Letra", "Painel que desliza à direita, aberto pelos botões do player: fila reordenável e letra da música atual."),
             ("Favoritas", "Curta músicas com o ♡ (ou tecla L): tocar tudo, aleatório, adicionar à fila ou salvar como playlist."),
             ("Recentes", f"Histórico das últimas {HISTORY_LIMIT} faixas tocadas."),
