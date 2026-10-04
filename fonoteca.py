@@ -25,6 +25,7 @@ import sys
 import json
 import socket
 import time
+import math
 import tempfile
 import random
 import urllib.request
@@ -52,7 +53,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Gio
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -1137,8 +1138,8 @@ class MusicPlayerApp(Gtk.Window):
         self._mpv_paused = False
         
         # Gerenciamento de timeouts e cancelamento de buscas
-        self._toast_timeout_id = None
         self._msg_timeout_id = None
+        self._msg_fade_id = None
         self.search_token = 0
         self.wiki_token = 0
         self._chart_token = 0           # descarta respostas antigas do "Em alta" ao trocar de país
@@ -1173,22 +1174,6 @@ class MusicPlayerApp(Gtk.Window):
         # Container Principal
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(vbox)
-
-        # Toast de notificação
-        self.notify_revealer = Gtk.Revealer()
-        self.notify_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
-        self.notify_label = Gtk.Label()
-        self.notify_label.set_margin_start(12)
-        self.notify_label.set_margin_end(12)
-        self.notify_label.set_margin_top(6)
-        self.notify_label.set_margin_bottom(6)
-        self.notify_label.get_style_context().add_class("app-notification")
-        self.notify_revealer.add(self.notify_label)
-
-        toast_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        toast_box.set_halign(Gtk.Align.CENTER)
-        toast_box.pack_start(self.notify_revealer, False, False, 6)
-        vbox.pack_start(toast_box, False, False, 0)
 
         # Corpo: barra lateral | conteúdo navegável | painel direito (Fila/Letra)
         overlay = Gtk.Overlay()
@@ -1325,8 +1310,16 @@ class MusicPlayerApp(Gtk.Window):
         self.progress_download.set_no_show_all(True)
         player_panel.pack_start(self.progress_download, False, False, 0)
 
+        # Linha de status discreta (substitui a antiga gaveta de notificações):
+        # altura fixa, sem moldura, nada se move quando a mensagem aparece.
         self.infobar_label = Gtk.Label()
-        self.infobar_label.get_style_context().add_class("dim-label")
+        self.infobar_label.set_halign(Gtk.Align.FILL)     # ocupa toda a largura: só corta no limite da janela
+        self.infobar_label.set_hexpand(True)
+        self.infobar_label.set_xalign(0.0)                # texto alinhado à esquerda
+        self.infobar_label.set_valign(Gtk.Align.CENTER)
+        self.infobar_label.set_size_request(-1, 22)       # altura fixa folgada (acentos, ♥, ⬇ e fontes de fallback)
+        self.infobar_label.set_ellipsize(3)
+        self.infobar_label.set_markup(self._STATUS_FMT.format(" "))
         player_panel.pack_start(self.infobar_label, False, False, 0)
 
         vbox.pack_start(player_panel, False, False, 0)
@@ -1434,9 +1427,13 @@ class MusicPlayerApp(Gtk.Window):
 
     def _card(self, title, subtitle="", size=(120, 120), icon="avatar-default-symbolic", url=None, on_click=None,
               local_item=None):
-        """Cartão de capa (artista, álbum, faixa) para as vitrines."""
-        btn = Gtk.Button()
+        """Cartão de capa (artista, álbum, faixa) para as vitrines.
+
+        Sem on_click: um clique só SELECIONA o cartão (destaque, só um por vez); as ações vêm do
+        duplo clique / botão direito, tratados por quem cria o cartão."""
+        btn = Gtk.ToggleButton()          # 'ativo' = cartão selecionado
         btn.set_relief(Gtk.ReliefStyle.NONE)
+        btn.set_focus_on_click(False)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         box.set_border_width(4)
         img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.DIALOG)
@@ -1460,11 +1457,35 @@ class MusicPlayerApp(Gtk.Window):
         btn.set_tooltip_text(title)
         if on_click:
             btn.connect("clicked", lambda b: on_click())
+        else:
+            btn.connect("button-press-event", self._on_card_select_press)   # 1º handler: roda antes dos do chamador
+            btn.connect("destroy", self._on_card_destroy)
         if local_item:
             self._submit_art(self._load_local_artwork_into, local_item, img, size[0], size[1])
         elif url:
             self._submit_art(self._load_artwork_into, url, img, size[0], size[1])
         return btn
+
+    def _on_card_select_press(self, card, event):
+        if event.type != Gdk.EventType.BUTTON_PRESS or event.button not in (1, 3):
+            return False                  # duplo clique segue adiante para quem abre/toca
+        self._select_card(card)
+        return event.button == 1          # consome o clique esquerdo (não alterna sozinho); o direito segue p/ o menu
+
+    def _select_card(self, card):
+        prev = getattr(self, "_sel_card", None)
+        if prev is not None and prev is not card:
+            try:
+                prev.set_active(False)
+            except Exception:
+                pass
+        self._sel_card = card
+        if not card.get_active():
+            card.set_active(True)
+
+    def _on_card_destroy(self, card):
+        if getattr(self, "_sel_card", None) is card:
+            self._sel_card = None
 
     def _submit_art(self, fn, *args):
         try:
@@ -1475,22 +1496,28 @@ class MusicPlayerApp(Gtk.Window):
     def _artist_card(self, a):
         fans = a.get("nb_fan") or 0
         sub = f"{fans:,} fãs".replace(",", ".") if fans else "Artista"
-        return self._card(a.get("name", ""), sub, (120, 120),
-                          url=a.get("picture_medium") or a.get("picture"),
-                          on_click=lambda a=a: self._open_artist_in_wiki(a.get("name", ""), a))
+        card = self._card(a.get("name", ""), sub, (120, 120),
+                          url=a.get("picture_medium") or a.get("picture"))
+        card.set_tooltip_text(f"{a.get('name', '')}\nDuplo clique para abrir · botão direito para opções")
+        card.connect("button-press-event", self._on_artist_card_press, a)
+        return card
 
     def _album_card(self, alb, artist_name=None):
         year = (alb.get("release_date") or "")[:4]
         art = artist_name or (alb.get("artist") or {}).get("name") or ""
         sub = " · ".join(x for x in (art, year) if x)
         card = self._card(alb.get("title", ""), sub, (120, 120), icon="media-optical",
-                          url=alb.get("cover_medium") or alb.get("cover_small"),
-                          on_click=lambda: self._open_album(alb, art))
+                          url=alb.get("cover_medium") or alb.get("cover_small"))
+        card.set_tooltip_text(f"{alb.get('title', '')}\nDuplo clique para abrir · botão direito para opções")
         card.connect("button-press-event", self._on_album_card_press, alb, art)
         return card
 
     def _on_album_card_press(self, btn, event, alb, art):
-        if event.button != 3:
+        # clique simples não faz nada; duplo clique abre o álbum; botão direito abre o menu
+        if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
+            GLib.idle_add(self._open_album_card, alb, art)   # adiado: navegar mexe nos cartões
+            return True
+        if event.button != 3 or event.type != Gdk.EventType.BUTTON_PRESS:
             return False
         menu = Gtk.Menu()
         it_open = Gtk.MenuItem(label="Ver faixas")
@@ -1506,6 +1533,10 @@ class MusicPlayerApp(Gtk.Window):
         menu.show_all()
         menu.popup_at_pointer(event)
         return True
+
+    def _open_album_card(self, alb, art):
+        self._open_album(alb, art)
+        return False
 
     def _fill_flow(self, flow, widgets):
         self._clear(flow)
@@ -1680,6 +1711,11 @@ class MusicPlayerApp(Gtk.Window):
         self.queue_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
         self.queue_list.connect("row-activated", self.on_queue_activated)
         self.queue_list.connect("button-press-event", self.on_queue_button_press)
+        self.queue_list.add_events(Gdk.EventMask.BUTTON1_MOTION_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
+        self.queue_list.connect("motion-notify-event", self._on_queue_motion)
+        self.queue_list.connect("button-release-event", self._on_queue_release)
+        self.queue_list.connect_after("draw", self._on_queue_draw)
+        self._qdrag = None
         self.queue_list.set_placeholder(self._placeholder("A fila está vazia.\nBusque algo para começar."))
         scroll.add(self.queue_list)
         page.pack_start(scroll, True, True, 0)
@@ -1783,6 +1819,7 @@ class MusicPlayerApp(Gtk.Window):
         self.chart_combo.set_active_id(saved if any(c[0] == saved for c in self.CHART_COUNTRIES) else "BR")
         self.chart_combo.set_tooltip_text("Escolher o país do ranking")
         self.chart_combo.connect("changed", self.on_chart_country_changed)
+        self.chart_combo.connect("scroll-event", self._on_combo_scroll_passthrough)
         chart_head.pack_end(self.chart_combo, False, False, 0)
         lbl_pais = Gtk.Label(label="País:")
         lbl_pais.get_style_context().add_class("dim-label")
@@ -1878,13 +1915,89 @@ class MusicPlayerApp(Gtk.Window):
             return
         cards = []
         for item in self.history[:8]:
-            cards.append(self._card(
+            # sem on_click: um clique simples não toca; só duplo clique (ou menu do botão direito)
+            card = self._card(
                 item.get("title", ""), item.get("uploader", ""), (160, 90), icon="audio-x-generic",
                 url=f"https://i.ytimg.com/vi/{item['id']}/mqdefault.jpg" if item.get("id") else None,
-                local_item=item if item.get("path") else None,
-                on_click=lambda it=item: self.play_item(it)))
+                local_item=item if item.get("path") else None)
+            card.set_tooltip_text(f"{item.get('title', '')}\nDuplo clique para tocar · botão direito para opções")
+            card.connect("button-press-event", self._on_recent_card_press, item)
+            cards.append(card)
         self._fill_flow(self.home_recent_flow, cards)
         self._set_shown(self.home_recent_box, bool(cards))
+
+    def _on_recent_card_press(self, btn, event, item):
+        if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
+            GLib.idle_add(self._play_recent_item, item)   # adiado: tocar reconstrói os cartões
+            return True
+        if event.button == 3 and event.type == Gdk.EventType.BUTTON_PRESS:
+            self._recent_card_menu(item, event)
+            return True
+        return False
+
+    def _play_recent_item(self, item):
+        self.play_item(item)
+        return False
+
+    def _recent_card_menu(self, item, event):
+        menu = Gtk.Menu()
+        it_play = Gtk.MenuItem(label="Reproduzir")
+        it_play.connect("activate", lambda w: self.play_item(item))
+        it_album = Gtk.MenuItem(label="Ver álbum")
+        it_album.connect("activate", lambda w: self._open_album_of_item(item))
+        it_artist = Gtk.MenuItem(label="Ver artista")
+        it_artist.connect("activate", lambda w: self._open_artist_of_item(item))
+        it_like = self._like_menu_item([item])
+        it_dl = Gtk.MenuItem(label="Baixar")
+        it_dl.connect("activate", lambda w: self._download_recent_item(item))
+        for it in (it_play, it_album, it_artist, it_like, it_dl, self._radio_menu_item(item)):
+            menu.append(it)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def _open_artist_of_item(self, item):
+        name = self._guess_artist(item)
+        if not name:
+            self.mostrar_mensagem("Não consegui identificar o artista desta faixa.")
+            return
+        self._open_artist_in_wiki(name)
+
+    def _download_recent_item(self, item):
+        if item.get("path"):
+            self.mostrar_mensagem("Esta faixa já está offline no seu computador.")
+            return
+        self._download_single_dialog(item)
+
+    def _open_album_of_item(self, item):
+        """Acha o álbum da faixa no Deezer e abre a página do álbum."""
+        artist = self._guess_artist(item)
+        title = self._clean_title(item.get("title", ""))
+        self.show_toast("Buscando álbum...")
+
+        def work():
+            alb, art_name = None, artist
+            try:
+                q = urllib.parse.quote(f"{artist} {title}".strip())
+                for r in self._http_json(f"{DEEZER_API}/search?q={q}&limit=5").get("data", []) or []:
+                    a = r.get("album") or {}
+                    if a.get("id"):
+                        alb = a
+                        art_name = (r.get("artist") or {}).get("name") or artist
+                        break
+            except Exception:
+                alb = None
+            GLib.idle_add(self._after_album_lookup, alb, art_name)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_album_lookup(self, alb, artist):
+        if self._closing:
+            return False
+        if alb:
+            self._open_album(alb, artist)
+        else:
+            self.mostrar_mensagem("Não encontrei o álbum desta faixa.")
+        return False
 
     # ---------- Em alta (por país) ----------
     # (código, nome, títulos "Top <nome>" usados pelo Deezer Charts, frase do título)
@@ -1912,6 +2025,14 @@ class MusicPlayerApp(Gtk.Window):
             if c[0] == code:
                 return c
         return self.CHART_COUNTRIES[0]
+
+    def _on_combo_scroll_passthrough(self, combo, event):
+        """A roda do mouse sobre o combo NÃO troca o item: o scroll segue para a página.
+        (Só o clique ou o teclado mudam a seleção.)"""
+        sw = combo.get_ancestor(Gtk.ScrolledWindow)
+        if sw is not None:
+            sw.event(event)
+        return True      # impede o ComboBox de tratar o scroll e trocar de país
 
     def on_chart_country_changed(self, combo):
         code = combo.get_active_id()
@@ -2028,9 +2149,11 @@ class MusicPlayerApp(Gtk.Window):
         for i, a in enumerate(order[:12], start=1):
             n = counts[a["id"]]
             sub = f"#{i} · {n} no top" if n > 1 else f"#{i}"
-            cards.append(self._card(a.get("name", ""), sub, (120, 120),
-                                    url=a.get("picture_medium") or a.get("picture"),
-                                    on_click=lambda a=a: self._open_artist_in_wiki(a.get("name", ""), a)))
+            card = self._card(a.get("name", ""), sub, (120, 120),
+                              url=a.get("picture_medium") or a.get("picture"))
+            card.set_tooltip_text(f"{a.get('name', '')}\nDuplo clique para abrir · botão direito para opções")
+            card.connect("button-press-event", self._on_artist_card_press, a)
+            cards.append(card)
         self._fill_flow(self.chart_flow, cards)
         self._set_shown(self.chart_artists_box, bool(cards))
 
@@ -2038,6 +2161,86 @@ class MusicPlayerApp(Gtk.Window):
             self.discover_tracks_list.add(self._dtrack_row(t, i))
         self.discover_tracks_list.show_all()
         return False
+
+    # ---------- Cartões de artista (Em alta, Busca, Fãs também ouvem): duplo clique + botão direito ----------
+    def _on_artist_card_press(self, btn, event, artist):
+        if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
+            GLib.idle_add(self._open_artist_card, artist)   # adiado: navegar mexe nos cartões
+            return True
+        if event.button == 3 and event.type == Gdk.EventType.BUTTON_PRESS:
+            self._artist_card_menu(artist, event)
+            return True
+        return False
+
+    def _open_artist_card(self, artist):
+        self._open_artist_in_wiki(artist.get("name", ""), artist)
+        return False
+
+    def _artist_top_dtracks(self, artist, limit=10):
+        """Populares do artista como faixas do Deezer prontas para tocar/enfileirar (roda em thread)."""
+        tracks = self._deezer_top_tracks(artist, limit=limit)
+        return [self._normalize_track({
+                    "title": t.get("title", ""),
+                    "artist": (t.get("artist") or {}).get("name") or artist.get("name", ""),
+                    "duration_fmt": self._fmt_duration(t.get("duration")),
+                    "verified": True})
+                for t in tracks if t.get("title")]
+
+    def _artist_card_menu(self, artist, event):
+        menu = Gtk.Menu()
+        it_open = Gtk.MenuItem(label="Ver artista")
+        it_open.connect("activate", lambda w: self._open_artist_in_wiki(artist.get("name", ""), artist))
+        it_play = Gtk.MenuItem(label="Tocar músicas populares")
+        it_play.connect("activate", lambda w: self._artist_play_top(artist))
+        it_queue = Gtk.MenuItem(label="Adicionar à Fila")
+        it_queue.connect("activate", lambda w: self._artist_queue_top(artist))
+        it_pl = Gtk.MenuItem(label="Adicionar à Playlist")
+        it_pl.connect("activate", lambda w: self._playlist_add_job(lambda: self._artist_top_dtracks(artist)))
+        it_radio = Gtk.MenuItem(label="Iniciar Rádio do Artista")
+        it_radio.connect("activate", lambda w: self._artist_start_radio(artist))
+        for it in (it_open, it_play, it_queue, it_radio, it_pl):
+            menu.append(it)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def _artist_play_top(self, artist):
+        """Toca a 1ª popular assim que localizada; as demais entram na fila (mesmo fluxo de 'Reproduzir Agora')."""
+        if self._job_guard():
+            return
+        state = {"n": 0}
+
+        def on_item(track):
+            self.add_items_bulk([track], notify=False)
+            if state["n"] == 0:
+                self.current_index = len(self.queue) - 1
+                self.play_current()
+            state["n"] += 1
+
+        def finish(resolved, missed):
+            if len(resolved) > 1:
+                self.show_toast(f"{len(resolved)} faixas adicionadas à fila.")
+
+        self._start_job(f"Populares de {artist.get('name', '')}", lambda: self._artist_top_dtracks(artist),
+                        finish, on_item=on_item,
+                        cancel_msg="Cancelado. O que já foi localizado permanece na fila.")
+
+    def _artist_queue_top(self, artist):
+        self._discover_resolve_and_source(
+            lambda: self._artist_top_dtracks(artist), self._queue_resolved_tracks, "Adicionando à fila")
+
+    def _artist_start_radio(self, artist):
+        """Rádio do artista: localiza a faixa mais popular dele e inicia a rádio a partir dela."""
+        self.show_toast("Buscando faixa no YouTube...")
+        self._discover_resolve_and_source(
+            lambda: self._artist_top_dtracks(artist, limit=1),
+            lambda resolved: self.start_radio(resolved[0]) if resolved else None,
+            "Iniciando rádio")
+
+    def _discover_resolve_and_source(self, source, callback, title):
+        """Como _discover_resolve_and, mas a lista de faixas vem de uma função (buscada em thread)."""
+        if self._job_guard():
+            return
+        self._start_job(title, source, lambda resolved, missed: callback(resolved))
 
     def _startup_chart(self):
         self._chart_load()
@@ -3487,15 +3690,52 @@ class MusicPlayerApp(Gtk.Window):
         }
 
     # ---------- Mensagens e Utilitários ----------
+    # Estilo da linha de status: pequeno, fino e translúcido (segue o tema claro/escuro)
+    _STATUS_FMT = '<span size="small" weight="light" letter_spacing="400" alpha="75%">{}</span>'
+
     def mostrar_mensagem(self, texto):
-        self.infobar_label.set_text(texto)
-        if self._msg_timeout_id:
-            GLib.source_remove(self._msg_timeout_id)
-        self._msg_timeout_id = GLib.timeout_add_seconds(4, self._clear_mensagem)
+        self._flash_status(texto, 4.0)
+
+    def _flash_status(self, texto, base_secs):
+        """Mostra 'texto' na linha de status e some com um fade suave."""
+        for attr in ("_msg_timeout_id", "_msg_fade_id"):
+            sid = getattr(self, attr, None)
+            if sid:
+                try:
+                    GLib.source_remove(sid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        texto = (texto or "").strip()
+        if not texto:
+            self._clear_mensagem()
+            return
+        self.infobar_label.set_markup(self._STATUS_FMT.format(GLib.markup_escape_text(texto)))
+        self.infobar_label.set_tooltip_text(texto)
+        self.infobar_label.set_opacity(1.0)
+        hold = max(base_secs, min(8.0, len(texto) / 14.0))   # mensagens longas ficam um pouco mais
+        self._msg_timeout_id = GLib.timeout_add(int(hold * 1000), self._start_fade_mensagem)
+
+    def _start_fade_mensagem(self):
+        self._msg_timeout_id = None
+        self._msg_fade_id = GLib.timeout_add(30, self._fade_step_mensagem)
+        return False
+
+    def _fade_step_mensagem(self):
+        op = self.infobar_label.get_opacity() - 0.1
+        if op <= 0.0:
+            self._clear_mensagem()
+            return False
+        self.infobar_label.set_opacity(op)
+        return True
 
     def _clear_mensagem(self):
-        self.infobar_label.set_text("")
         self._msg_timeout_id = None
+        self._msg_fade_id = None
+        # texto em branco com o mesmo tamanho de fonte: a altura da linha nunca muda
+        self.infobar_label.set_markup(self._STATUS_FMT.format(" "))
+        self.infobar_label.set_tooltip_text(None)
+        self.infobar_label.set_opacity(1.0)
         return False
 
     def _confirm_action(self, message):
@@ -3511,16 +3751,7 @@ class MusicPlayerApp(Gtk.Window):
         return response == Gtk.ResponseType.YES
 
     def show_toast(self, texto):
-        self.notify_label.set_text(texto)
-        self.notify_revealer.set_reveal_child(True)
-        if self._toast_timeout_id:
-            GLib.source_remove(self._toast_timeout_id)
-        self._toast_timeout_id = GLib.timeout_add_seconds(3, self._hide_toast)
-
-    def _hide_toast(self):
-        self.notify_revealer.set_reveal_child(False)
-        self._toast_timeout_id = None
-        return False
+        self._flash_status(texto, 3.0)
 
     def _section_label(self, text):
         lbl = Gtk.Label(xalign=0)
@@ -4314,7 +4545,175 @@ class MusicPlayerApp(Gtk.Window):
         self.current_index = row.get_index()
         self.play_current()
 
+    # ---------- Fila: clique + segurar o botão esquerdo e arrastar reposiciona faixa(s) ----------
+    # Arrasta a linha clicada ou, se ela fizer parte de uma seleção múltipla, todas as selecionadas.
+    # Uma linha horizontal mostra o ponto de inserção ENTRE as faixas.
+    QDRAG_THRESHOLD = 8      # px de movimento antes de virar arrasto (clique normal continua selecionando)
+
+    def _qdrag_gap_at(self, y):
+        """Posição de inserção (0..n): 'antes da linha g'. n = depois da última."""
+        n = len(self.queue_list.get_children())
+        row = self.queue_list.get_row_at_y(int(y))
+        if row is None:
+            return 0 if y < 0 else n
+        a = row.get_allocation()
+        return row.get_index() + (1 if y > a.y + a.height / 2.0 else 0)
+
+    def _qdrag_gap_y(self, gap):
+        n = len(self.queue_list.get_children())
+        if n == 0:
+            return None
+        if gap >= n:
+            a = self.queue_list.get_row_at_index(n - 1).get_allocation()
+            return a.y + a.height
+        return self.queue_list.get_row_at_index(max(gap, 0)).get_allocation().y
+
+    def _on_queue_draw(self, widget, cr):
+        st = self._qdrag
+        if not st or not st.get("on") or st.get("gap") is None:
+            return False
+        y = self._qdrag_gap_y(st["gap"])
+        if y is None:
+            return False
+        ctx = widget.get_style_context()
+        ok, col = ctx.lookup_color("theme_selected_bg_color")
+        if not ok:
+            col = ctx.get_color(Gtk.StateFlags.NORMAL)
+        w, h = widget.get_allocated_width(), widget.get_allocated_height()
+        y = min(max(y, 2.0), max(h - 2.0, 2.0))
+        cr.set_source_rgba(col.red, col.green, col.blue, 1.0)
+        cr.set_line_width(2.0)
+        cr.move_to(8, y)
+        cr.line_to(max(w - 8, 9), y)
+        cr.stroke()
+        cr.arc(8, y, 3.5, 0, 2 * math.pi)     # bolinha na ponta, como nos indicadores de soltar
+        cr.fill()
+        return False
+
+    def _qdrag_cursor(self, grabbing):
+        win = self.queue_list.get_window()
+        if win is None:
+            return
+        try:
+            win.set_cursor(Gdk.Cursor.new_from_name(win.get_display(), "grabbing") if grabbing else None)
+        except Exception:
+            pass
+
+    def _qdrag_update(self):
+        st = self._qdrag
+        if not st or not st.get("on"):
+            return
+        gap = self._qdrag_gap_at(st["y"])
+        if gap != st.get("gap"):
+            st["gap"] = gap
+        self.queue_list.queue_draw()
+
+    def _on_queue_motion(self, widget, event):
+        st = self._qdrag
+        if not st or not (event.state & Gdk.ModifierType.BUTTON1_MASK):
+            return False
+        st["y"] = event.y
+        if not st["on"]:
+            if abs(event.y - st["y0"]) < self.QDRAG_THRESHOLD:
+                return False
+            if self._queue_building or self._queue_dirty:
+                return False                  # fila ainda montando: não reordena
+            st["on"] = True
+            self._qdrag_cursor(True)
+            st["tick"] = GLib.timeout_add(40, self._qdrag_tick)
+        self._qdrag_update()
+        return False
+
+    def _qdrag_tick(self):
+        """Rolagem automática quando o ponteiro encosta na borda de cima/baixo durante o arrasto."""
+        st = self._qdrag
+        if not st or not st.get("on"):
+            if st:
+                st["tick"] = 0
+            return False
+        sw = self.queue_list.get_ancestor(Gtk.ScrolledWindow)
+        if sw is not None:
+            adj = sw.get_vadjustment()
+            top, page = adj.get_value(), adj.get_page_size()
+            ry, edge, d = st["y"] - top, 28, 0
+            if ry < edge:
+                d = -max(2, int((edge - ry) / 2))
+            elif ry > page - edge:
+                d = max(2, int((ry - (page - edge)) / 2))
+            if d:
+                new = max(adj.get_lower(), min(top + d, adj.get_upper() - page))
+                if new != top:
+                    adj.set_value(new)
+                    st["y"] += new - top      # o conteúdo andou; o ponteiro continua no mesmo lugar da tela
+                    self._qdrag_update()
+        return True
+
+    def _on_queue_release(self, widget, event):
+        st = self._qdrag
+        if event.button != 1 or not st:
+            return False
+        self._qdrag = None
+        if st.get("tick"):
+            GLib.source_remove(st["tick"])
+        if st.get("on"):
+            self._qdrag_cursor(False)
+            widget.queue_draw()               # apaga a linha de inserção
+            GLib.idle_add(self._queue_move_rows, st["rows"], st.get("gap"))   # fora do handler de evento
+        elif st.get("multi"):
+            # clique simples (sem arrastar) numa linha de seleção múltipla: vira seleção única, como no padrão
+            self.queue_list.unselect_all()
+            self.queue_list.select_row(st["row"])
+        return False
+
+    def _queue_move_rows(self, rows, gap):
+        """Move as linhas `rows` (uma ou várias) para a posição de inserção `gap`, mantendo a ordem entre elas."""
+        n = len(self.queue)
+        children = self.queue_list.get_children()
+        if (gap is None or self._queue_building or self._queue_dirty or len(children) != n
+                or any(r.get_parent() is not self.queue_list for r in rows)):
+            return False
+        sel = sorted({r.get_index() for r in rows})
+        sel = [i for i in sel if 0 <= i < n]
+        if not sel:
+            return False
+        gap = max(0, min(int(gap), n))
+        ins = gap - sum(1 for i in sel if i < gap)          # posição entre as faixas que não se movem
+        selset = set(sel)
+        rest = [i for i in range(n) if i not in selset]
+        order = rest[:ins] + sel + rest[ins:]               # order[j] = índice antigo da nova posição j
+        if order == list(range(n)):
+            return False                                    # soltou onde já estava
+
+        moved_rows = [children[i] for i in sel]
+        self.queue[:] = [self.queue[i] for i in order]
+        if 0 <= self.current_index < n:
+            self.current_index = order.index(self.current_index)   # a faixa tocando continua a mesma
+        self._save_queue()
+
+        for r in reversed(moved_rows):
+            self.queue_list.remove(r)
+        for k, r in enumerate(moved_rows):
+            self.queue_list.insert(r, ins + k)
+        self.queue_list.unselect_all()
+        for r in moved_rows:
+            self.queue_list.select_row(r)
+        self._update_queue_indices()
+        return False
+
     def on_queue_button_press(self, widget, event):
+        if (event.button == 1 and event.type == Gdk.EventType.BUTTON_PRESS
+                and not (event.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK))):
+            row = widget.get_row_at_y(int(event.y))
+            if row is not None and hasattr(row, "item"):
+                sel = widget.get_selected_rows()
+                multi = len(sel) > 1 and row in sel
+                rows = sorted(sel, key=lambda r: r.get_index()) if multi else [row]
+                self._qdrag = {"row": row, "rows": rows, "multi": multi, "y0": event.y, "y": event.y,
+                               "on": False, "tick": 0, "gap": None}
+                if multi:
+                    return True      # segura a seleção múltipla enquanto decide entre clique e arrasto
+            else:
+                self._qdrag = None
         if event.button == 3:
             row = widget.get_row_at_y(int(event.y))
             if row is None:
@@ -6934,11 +7333,11 @@ class MusicPlayerApp(Gtk.Window):
         page.pack_start(self._about_heading("Abas do aplicativo"), False, False, 0)
         for name, desc in (
             ("Barra lateral", "Início, Favoritas, Recentes e Sobre, além das suas playlists sempre à mão (botão direito: tocar, renomear, excluir)."),
-            ("Início", "Vitrines: atalho para suas curtidas, o que tocou recentemente e o \"Em alta\" por país (padrão: Brasil) com os artistas e as músicas mais ouvidas do ranking."),
+            ("Início", "Vitrines: atalho para suas curtidas, o que tocou recentemente (duplo clique toca; botão direito abre o menu) e o \"Em alta\" por país (padrão: Brasil) com os artistas (duplo clique abre; botão direito: tocar populares, fila, rádio, playlist) e as músicas mais ouvidas do ranking. Os cartões de artista da Busca e de \"Fãs também ouvem\", e todos os cartões de álbum, funcionam do mesmo jeito (um clique seleciona o cartão; duplo clique abre)."),
             ("Busca", "Uma busca só para músicas (YouTube), artistas e álbuns (Deezer), com filtros Tudo / Músicas / Artistas / Álbuns."),
             ("Artista e álbuns", "Biografia, faixas populares, discografia em capas e artistas parecidos. Abra um álbum para ver e tocar as faixas."),
             ("Rádio", "Botão Rádio no player (ou botão direito > Iniciar Rádio da Faixa): a fila se abastece sozinha com músicas parecidas, sem fim. Usa o mix automático do YouTube e, se ele falhar, a rádio do artista no Deezer."),
-            ("Fila e Letra", "Painel que desliza à direita, aberto pelos botões do player: fila reordenável e letra da música atual."),
+            ("Fila e Letra", "Painel que desliza à direita, aberto pelos botões do player: fila reordenável (clique e segure para arrastar uma ou várias faixas selecionadas; uma linha mostra onde vão ficar; ou use as setas) e letra da música atual."),
             ("Favoritas", "Curta músicas com o ♡ (ou tecla L): tocar tudo, aleatório, adicionar à fila ou salvar como playlist."),
             ("Recentes", f"Histórico das últimas {HISTORY_LIMIT} faixas tocadas."),
         ):
@@ -7331,7 +7730,7 @@ class MusicPlayerApp(Gtk.Window):
         except Exception:
             pass
         self._cancel_stall_watchdog()
-        for pid_name in ("_queue_save_id", "_toast_timeout_id", "_msg_timeout_id", "_dl_pulse_id", "_busy_pulse_id"):
+        for pid_name in ("_queue_save_id", "_msg_timeout_id", "_msg_fade_id", "_dl_pulse_id", "_busy_pulse_id"):
             sid = getattr(self, pid_name, None)
             if sid:
                 try:
