@@ -67,7 +67,7 @@ except Exception:  # sem PyGObject/GTK: cai para o modo terminal
 # ----------------------------------------------------------------------
 # Constantes
 # ----------------------------------------------------------------------
-INSTALLER_VERSION = "2.3.0"
+INSTALLER_VERSION = "3.0.0"
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
@@ -110,6 +110,7 @@ NETWORK_HOSTS = (
     ("Deezer", "https://api.deezer.com/"),
     ("LRCLIB", "https://lrclib.net/"),
     ("Wikipédia", "https://pt.wikipedia.org/"),
+    ("Radio-Browser", "https://de1.api.radio-browser.info/json/stats"),
     ("GitHub (yt-dlp)", "https://github.com/yt-dlp/yt-dlp"),
 )
 
@@ -119,6 +120,7 @@ PKG_GROUPS = {
         "core": [["python3", "python3-gi", "gir1.2-gtk-3.0", "mpv"]],
         "ffmpeg": [["ffmpeg"]],
         "notify": [["libnotify-bin"]],
+        "cairo": [["python3-gi-cairo"]],
     },
     "dnf": {
         "core": [["python3", "python3-gobject", "gtk3", "mpv"]],
@@ -134,6 +136,7 @@ PKG_GROUPS = {
         "core": [["python3", "python3-gobject", "python3-gobject-Gdk", "typelib-1_0-Gtk-3_0", "mpv"]],
         "ffmpeg": [["ffmpeg"]],
         "notify": [["libnotify-tools"]],
+        "cairo": [["python3-gobject-cairo"]],
     },
     "xbps": {
         "core": [["python3", "python3-gobject", "gtk+3", "mpv"]],
@@ -151,6 +154,7 @@ GROUP_LABELS = {
     "core": "mpv, Python e GTK",
     "ffmpeg": "ffmpeg",
     "notify": "notify-send (opcional)",
+    "cairo": "integração PyGObject-cairo (arrastar músicas na fila)",
 }
 
 
@@ -488,10 +492,30 @@ class Engine:
                          "import gi;gi.require_version('Gtk','3.0');from gi.repository import Gtk,GdkPixbuf"])
         return rc == 0
 
+    @staticmethod
+    def cairo_available_for_python3():
+        """PyGObject com suporte a cairo (pacote separado em Debian/Ubuntu/openSUSE). Sem ele, o desenho
+        da linha de inserção ao arrastar músicas na fila gera erros no terminal."""
+        if not shutil.which("python3"):
+            return False
+        rc, _ = capture(["python3", "-c", "import gi;gi.require_foreign('cairo')"])
+        return rc == 0
+
+    @staticmethod
+    def sqlite_fts5_available():
+        """Busca instantânea da biblioteca (SQLite FTS5). Sem ela a Fonoteca usa uma busca simples."""
+        if not shutil.which("python3"):
+            return False
+        rc, _ = capture(["python3", "-c",
+                         "import sqlite3;sqlite3.connect(':memory:').execute('create virtual table t using fts5(a)')"])
+        return rc == 0
+
     def missing_groups(self):
         groups = []
         if not (shutil.which("python3") and shutil.which("mpv") and self.gtk_available_for_python3()):
             groups.append("core")
+        elif "cairo" in PKG_GROUPS.get(detect_pkg_manager() or "", {}) and not self.cairo_available_for_python3():
+            groups.append("cairo")
         if not shutil.which("ffmpeg"):
             groups.append("ffmpeg")
         if not shutil.which("notify-send"):
@@ -580,6 +604,9 @@ class Engine:
                 tip = " No Arch, rode 'sudo pacman -Syu' e tente de novo." if mgr == "pacman" else ""
                 self.add("fail", f"Falha ao instalar: {GROUP_LABELS[g]}",
                          "Veja o registro detalhado." + tip, fix="deps")
+            elif g == "cairo":
+                self.add("warn", "Integração PyGObject-cairo não foi instalada",
+                         "A Fonoteca funciona, mas arrastar músicas na fila pode mostrar erros no terminal.", fix="deps")
             elif g == "ffmpeg":
                 self.add("warn", "ffmpeg não foi instalado",
                          "A Fonoteca toca normalmente, mas não converte downloads para MP3. "
@@ -1229,8 +1256,18 @@ class Engine:
             self.add("fail", "Python 3 não encontrado", "", fix="deps")
         if self.gtk_available_for_python3():
             self.add("ok", "GTK 3 e PyGObject", "disponíveis para o python3")
+            if "cairo" in PKG_GROUPS.get(detect_pkg_manager() or "", {}) and not self.cairo_available_for_python3():
+                self.add("warn", "PyGObject sem suporte a cairo",
+                         "arrastar músicas na fila gera erros. Instale python3-gi-cairo (Debian/Ubuntu) ou "
+                         "python3-gobject-cairo (openSUSE); o conserto automático faz isso.", fix="deps")
         else:
             self.add("fail", "GTK 3 / PyGObject ausentes no python3", "a janela da Fonoteca não abre", fix="deps")
+        if shutil.which("python3"):
+            if self.sqlite_fts5_available():
+                self.add("ok", "SQLite com busca FTS5", "a busca instantânea da biblioteca está disponível")
+            else:
+                self.add("info", "SQLite/FTS5 indisponível no python3",
+                         "a Fonoteca continua funcionando: busca simples da biblioteca e, sem SQLite, dados em arquivos JSON")
 
         self.step("Programas")
         mpv = shutil.which("mpv")
@@ -1360,6 +1397,27 @@ class Engine:
                         json.load(f)
                 except Exception:
                     bad.append(name)
+        db_path = os.path.join(CONFIG_DIR, "library.db")
+        if os.path.exists(db_path):
+            try:
+                import sqlite3
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+                try:
+                    verdict = con.execute("PRAGMA quick_check").fetchone()[0]
+                    n_tracks = con.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+                finally:
+                    con.close()
+            except Exception as e:
+                verdict, n_tracks = str(e)[:80], 0
+            if verdict == "ok":
+                found += 1
+                self.add("ok", "Banco de dados (library.db)",
+                         f"íntegro · {n_tracks} faixas indexadas (playlists, favoritas e histórico)")
+            else:
+                self.add("warn", "Banco de dados (library.db) com problema", f"{verdict}\n"
+                         f"Em {CONFIG_DIR}. Restaure um backup (Perfil › Importar). Dica: se existirem arquivos "
+                         "playlists.json.bak, favorites.json.bak e history.json.bak, tire o '.bak' do nome e apague "
+                         "o library.db: a Fonoteca recria o banco e reimporta esses dados na próxima abertura.")
         if bad:
             self.add("warn", "Arquivos de dados corrompidos", ", ".join(bad) +
                      f"\nEm {CONFIG_DIR}. Restaure um backup (Perfil › Importar) ou renomeie o arquivo para a Fonoteca recriá-lo.")
@@ -1928,9 +1986,9 @@ if HAVE_GTK:
                 self.title_done = "Diagnóstico"
                 self.lbl_confirm_title.set_markup("<b>Pronto para diagnosticar</b>")
                 lines += [
-                    "• Python, GTK, mpv, yt-dlp e ffmpeg",
-                    "• Instalação, atalho e seus dados",
-                    "• Conexão com YouTube, Deezer, LRCLIB e Wikipédia",
+                    "• Python, GTK, mpv, yt-dlp, ffmpeg e SQLite",
+                    "• Instalação, atalho e seus dados (inclui o banco library.db)",
+                    "• Conexão com YouTube, Deezer, LRCLIB, Wikipédia e Radio-Browser",
                     "• Um teste real de busca com o yt-dlp",
                     "",
                     "Nada será alterado agora. Se algo for encontrado, você poderá corrigir no fim.",

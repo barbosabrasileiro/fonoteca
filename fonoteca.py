@@ -7,8 +7,10 @@ Fonoteca (GTK3 + mpv IPC)
 Uma biblioteca musical para descobrir, organizar e ouvir música.
 
 Player leve para Linux, usando os widgets e o tema nativo do GTK do sistema
-(sem CSS customizado), com playlists, downloads, letras, descoberta de
-artistas e navegação rica.
+(sem CSS customizado), com playlists,
+downloads, letras, equalizador de 10 bandas, reprodução sem pausa (gapless),
+biblioteca em SQLite com busca FTS5, rádios web, descoberta de artistas e
+navegação rica.
 
 Este programa é software livre: você pode redistribuí-lo e/ou modificá-lo
 sob os termos da GNU General Public License, versão 3 ou (a seu critério)
@@ -35,9 +37,15 @@ import unicodedata
 import difflib
 import datetime
 import weakref
+import contextlib
 import signal
 import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:  # Python sem o módulo sqlite3: a Fonoteca segue funcionando com os arquivos JSON
+    import sqlite3
+except ImportError:  # pragma: no cover
+    sqlite3 = None
 
 try:  # opcional: leitura de tags (ID3, Vorbis, MP4...). Sem ele, usa ffprobe e o nome do arquivo.
     import mutagen
@@ -53,7 +61,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Gio
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.4.0"
+APP_VERSION = "3.0.0"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -126,6 +134,7 @@ PLAYLISTS_FILE = os.path.join(CONFIG_DIR, "playlists.json")
 PROFILE_FILE = os.path.join(CONFIG_DIR, "profile.json")
 FAVORITES_FILE = os.path.join(CONFIG_DIR, "favorites.json")
 LIBRARY_FILE = os.path.join(CONFIG_DIR, "library.json")   # índice de tags da biblioteca local
+DB_FILE = os.path.join(CONFIG_DIR, "library.db")          # SQLite: faixas, playlists, favoritas, histórico (+FTS5)
 COVERS_DIR = os.path.join(CONFIG_DIR, "covers")           # capas extraídas dos arquivos
 AUDIO_EXTS = (".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".mp4", ".aac", ".wav", ".wma", ".webm", ".mka")
 
@@ -450,6 +459,570 @@ def _install_exit_handlers(app):
     atexit.register(app.mpv._cleanup)   # rede de segurança: saída normal do Python nunca deixa o mpv
 
 
+# ======================================================================
+# Normalização de faixas e chave de identidade (usadas pelo app e pelo banco)
+# ======================================================================
+def normalize_track(item):
+    """Esquema único de uma faixa. Mantém campos extras de faixas offline (path...) e de rádios web."""
+    if not isinstance(item, dict):
+        item = {}
+    uploader = str(item.get("uploader") or item.get("artist") or "")
+    duration = str(item.get("duration") or item.get("duration_fmt") or "0:00")
+    out = {
+        "id": str(item.get("id") or ""),
+        "title": str(item.get("title") or "Sem título"),
+        "uploader": uploader,
+        "artist": uploader,
+        "duration": duration,
+        "duration_fmt": duration,
+        "verified": bool(item.get("verified")),
+    }
+    if item.get("path"):
+        out.update({k: item[k] for k in ("path", "offline", "album", "year", "track_no", "cover_url") if item.get(k)})
+    if item.get("stream_url"):   # estação de rádio web (Radio-Browser)
+        out.update({k: item[k] for k in ("stream_url", "webradio", "favicon", "country", "tags") if item.get(k)})
+    return out
+
+
+def track_key(t):
+    """Chave estável de uma faixa: arquivo local, id (YouTube/rádio) ou título|artista."""
+    if t.get("path"):
+        return "file:" + t["path"]
+    tid = (t.get("id") or "").strip()
+    return tid or f"{(t.get('title') or '').lower()}|{(t.get('uploader') or '').lower()}"
+
+
+def _unaccent_text(text):
+    return "".join(c for c in unicodedata.normalize("NFKD", text or "") if not unicodedata.combining(c))
+
+
+# ======================================================================
+# Banco de dados SQLite (library.db) com busca de texto completo FTS5
+# ======================================================================
+class LibraryDB:
+    """Persistência relacional de faixas, playlists, favoritas e histórico.
+
+    - Tabelas: tracks, playlists, playlist_tracks, favorites, history (+ meta e tracks_fts).
+    - FTS5 (índice externo + gatilhos) para buscar por título/artista/álbum em milissegundos.
+      Se o SQLite do sistema não tiver FTS5, a busca cai automaticamente para LIKE.
+    - Escritas rodam numa única thread em segundo plano (a interface nunca espera o disco) e só
+      regravam o que mudou (diff por playlist). A leitura inicial é feita uma vez na abertura.
+    - Na primeira abertura importa os .json legados (playlists/favorites/history) de forma
+      transparente e os renomeia para *.json.bak (nada é apagado).
+    """
+
+    def __init__(self, path, legacy_files=None):
+        self.path = path
+        self.fts = False
+        self._closed = False
+        self._lock = threading.RLock()
+        self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
+        self._pl_snap = {}      # nome -> tupla de chaves (último estado gravado)
+        self._fav_snap = None
+        self._hist_snap = None
+        # isolation_level=None: autocommit; as transações são controladas explicitamente em _tx().
+        self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=15)
+        try:
+            self.conn.create_function("unaccent", 1, lambda s: _unaccent_text(str(s or "")).lower())
+            self._init_schema()
+            self._migrate_legacy(legacy_files or {})
+            with self._tx() as c:
+                self._prune(c)
+        except Exception:
+            self._writer.shutdown(wait=False)
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            raise
+
+    # ---------- infraestrutura ----------
+    @contextlib.contextmanager
+    def _tx(self):
+        with self._lock:
+            c = self.conn
+            c.execute("BEGIN")
+            try:
+                yield c
+                c.execute("COMMIT")
+            except BaseException:
+                try:
+                    c.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def _submit(self, fn, *args):
+        if self._closed:
+            return
+        try:
+            self._writer.submit(self._guard, fn, *args)
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def _guard(fn, *args):
+        try:
+            fn(*args)
+        except Exception as exc:   # falha de gravação nunca derruba a interface
+            print(f"[{APP_NAME}] erro ao gravar no banco: {exc}", file=sys.stderr)
+
+    def _init_schema(self):
+        with self._lock:
+            c = self.conn
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
+            c.execute("PRAGMA foreign_keys=ON")
+            c.execute("PRAGMA cache_size=-1024")      # ~1 MB de cache de páginas (padrão 2 MB): app leve
+            c.executescript("""
+                CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS tracks(
+                    id     INTEGER PRIMARY KEY,
+                    key    TEXT NOT NULL UNIQUE,
+                    title  TEXT NOT NULL DEFAULT '',
+                    artist TEXT NOT NULL DEFAULT '',
+                    album  TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'online',   -- 'local' (arquivo) | 'online'
+                    data   TEXT NOT NULL                     -- faixa completa em JSON
+                );
+                CREATE TABLE IF NOT EXISTS playlists(
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, position INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS playlist_tracks(
+                    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+                    position    INTEGER NOT NULL,
+                    track_id    INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+                    PRIMARY KEY(playlist_id, position));
+                CREATE TABLE IF NOT EXISTS favorites(
+                    track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS history(
+                    position INTEGER PRIMARY KEY,
+                    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE);
+                CREATE INDEX IF NOT EXISTS idx_pt_track ON playlist_tracks(track_id);
+                CREATE INDEX IF NOT EXISTS idx_hist_track ON history(track_id);
+                CREATE INDEX IF NOT EXISTS idx_tracks_source ON tracks(source);
+            """)
+            try:
+                self._create_fts()
+                self.fts = True
+            except sqlite3.Error:
+                self.fts = False
+
+    def _create_fts(self):
+        c = self.conn
+        last = None
+        for tok in ("unicode61 remove_diacritics 2", "unicode61"):   # 'remove_diacritics 2' exige SQLite >= 3.27
+            try:
+                c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5("
+                          "title, artist, album, content='tracks', content_rowid='id', "
+                          f"tokenize='{tok}')")
+                last = None
+                break
+            except sqlite3.OperationalError as exc:
+                last = exc
+        if last is not None:
+            raise last
+        c.executescript("""
+            CREATE TRIGGER IF NOT EXISTS tracks_ai AFTER INSERT ON tracks BEGIN
+                INSERT INTO tracks_fts(rowid, title, artist, album) VALUES (new.id, new.title, new.artist, new.album);
+            END;
+            CREATE TRIGGER IF NOT EXISTS tracks_ad AFTER DELETE ON tracks BEGIN
+                INSERT INTO tracks_fts(tracks_fts, rowid, title, artist, album)
+                VALUES ('delete', old.id, old.title, old.artist, old.album);
+            END;
+            CREATE TRIGGER IF NOT EXISTS tracks_au AFTER UPDATE ON tracks BEGIN
+                INSERT INTO tracks_fts(tracks_fts, rowid, title, artist, album)
+                VALUES ('delete', old.id, old.title, old.artist, old.album);
+                INSERT INTO tracks_fts(rowid, title, artist, album) VALUES (new.id, new.title, new.artist, new.album);
+            END;
+        """)
+        if self._meta("fts_built") != "1":      # banco criado por versão sem FTS: indexa o que já existe
+            c.execute("INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild')")
+            self._set_meta("fts_built", "1")
+
+    def _meta(self, key):
+        with self._lock:
+            row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def _set_meta(self, key, value):
+        with self._lock:
+            self.conn.execute("INSERT INTO meta(key, value) VALUES(?, ?) "
+                              "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    # ---------- escrita de baixo nível (sempre dentro de _tx) ----------
+    @staticmethod
+    def _upsert_track(c, t):
+        """Insere/atualiza a faixa (pela chave) e devolve o id. Só toca no índice FTS se algo mudou."""
+        t = normalize_track(t)
+        key = track_key(t)
+        data = json.dumps(t, ensure_ascii=False, separators=(",", ":"))
+        c.execute(
+            "INSERT INTO tracks(key, title, artist, album, source, data) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET title=excluded.title, artist=excluded.artist, "
+            "album=excluded.album, data=excluded.data WHERE tracks.data != excluded.data",
+            (key, t["title"], t["uploader"], str(t.get("album") or ""),
+             "local" if t.get("path") else "online", data))
+        return c.execute("SELECT id FROM tracks WHERE key=?", (key,)).fetchone()[0]
+
+    @staticmethod
+    def _prune(c):
+        """Remove faixas online que nenhuma playlist/favorita/histórico referencia mais."""
+        c.execute("DELETE FROM tracks WHERE source != 'local' AND id NOT IN ("
+                  "SELECT track_id FROM playlist_tracks UNION SELECT track_id FROM favorites "
+                  "UNION SELECT track_id FROM history)")
+
+    def _w_playlists(self, order, changed):
+        with self._tx() as c:
+            existing = {n: i for i, n in c.execute("SELECT id, name FROM playlists")}
+            for name, pid in existing.items():
+                if name not in order:
+                    c.execute("DELETE FROM playlists WHERE id=?", (pid,))
+            for pos, name in enumerate(order):
+                pid = existing.get(name)
+                if pid is None:
+                    pid = c.execute("INSERT INTO playlists(name, position) VALUES(?,?)", (name, pos)).lastrowid
+                else:
+                    c.execute("UPDATE playlists SET position=? WHERE id=?", (pos, pid))
+                if name in changed:
+                    c.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (pid,))
+                    rows = [(pid, i, self._upsert_track(c, t)) for i, t in enumerate(changed[name])]
+                    c.executemany("INSERT INTO playlist_tracks(playlist_id, position, track_id) VALUES(?,?,?)", rows)
+            self._prune(c)
+
+    def _w_favorites(self, tracks):
+        with self._tx() as c:
+            c.execute("DELETE FROM favorites")
+            c.executemany("INSERT OR IGNORE INTO favorites(track_id, position) VALUES(?,?)",
+                          [(self._upsert_track(c, t), i) for i, t in enumerate(tracks)])
+            self._prune(c)
+
+    def _w_history(self, tracks):
+        with self._tx() as c:
+            c.execute("DELETE FROM history")
+            c.executemany("INSERT INTO history(position, track_id) VALUES(?,?)",
+                          [(i, self._upsert_track(c, t)) for i, t in enumerate(tracks)])
+            self._prune(c)
+
+    def _w_sync_local(self, tracks, sig=""):
+        """Delta-sync do espelho da biblioteca local. Três níveis de economia:
+        1) `sig` (mtime+tamanho do library.json, que o app só regrava quando algo muda) igual ao da última
+           sincronização => não faz NADA (zero CPU, zero leitura, zero escrita) - o caso normal a cada abertura;
+        2) senão compara com o banco e só grava faixas novas/alteradas e remove as sumidas;
+        3) trabalha em lotes cedendo a GIL, para não competir com a interface."""
+        if sig and self._meta("local_sig") == sig:
+            return
+        fresh = {}
+        for n, t in enumerate(tracks, 1):
+            t = normalize_track(dict(t))
+            fresh[track_key(t)] = (t, json.dumps(t, ensure_ascii=False, separators=(",", ":")))
+            if n % 400 == 0:
+                time.sleep(0.002)
+        with self._lock:
+            known = dict(self.conn.execute("SELECT key, data FROM tracks WHERE source='local'").fetchall())
+        changed = [t for k, (t, blob) in fresh.items() if known.get(k) != blob]
+        stale = [k for k in known if k not in fresh]
+        if not changed and not stale:
+            if sig:
+                self._set_meta("local_sig", sig)
+            return
+        with self._tx() as c:
+            for t in changed:
+                self._upsert_track(c, t)
+            for n in range(0, len(stale), 500):
+                chunk = stale[n:n + 500]
+                marks = ",".join("?" * len(chunk))
+                c.execute(f"DELETE FROM tracks WHERE key IN ({marks}) AND source='local' AND id NOT IN ("
+                          "SELECT track_id FROM playlist_tracks UNION SELECT track_id FROM favorites "
+                          "UNION SELECT track_id FROM history)", chunk)
+            if sig:
+                c.execute("INSERT INTO meta(key, value) VALUES('local_sig', ?) "
+                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (sig,))
+
+    # ---------- API de escrita (chamada pela interface; devolve na hora) ----------
+    def save_playlists(self, playlists):
+        keys = {str(n): tuple(track_key(t) for t in v) for n, v in playlists.items()}
+        if keys == self._pl_snap:
+            return
+        changed = {n: [dict(t) for t in playlists[n]] for n in keys if self._pl_snap.get(n) != keys[n]}
+        self._pl_snap = keys
+        self._submit(self._w_playlists, list(keys), changed)
+
+    def save_favorites(self, tracks):
+        keys = tuple(track_key(t) for t in tracks)
+        if keys == self._fav_snap:
+            return
+        self._fav_snap = keys
+        self._submit(self._w_favorites, [dict(t) for t in tracks])
+
+    def save_history(self, tracks):
+        keys = tuple(track_key(t) for t in tracks)
+        if keys == self._hist_snap:
+            return
+        self._hist_snap = keys
+        self._submit(self._w_history, [dict(t) for t in tracks])
+
+    def sync_local(self, tracks, sig=""):
+        """Espelha o índice da biblioteca local na tabela tracks (para a busca FTS), em segundo plano.
+        Recebe só a lista de referências (barato); as cópias e a comparação são feitas na thread do banco."""
+        self._submit(self._w_sync_local, list(tracks), sig)
+
+    # ---------- leitura ----------
+    @staticmethod
+    def _loads(blob):
+        try:
+            d = json.loads(blob)
+            return d if isinstance(d, dict) else None
+        except (TypeError, ValueError):
+            return None
+
+    def load_playlists(self):
+        out = {}
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT p.name, t.data FROM playlists p "
+                "LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id "
+                "LEFT JOIN tracks t ON t.id = pt.track_id ORDER BY p.position, p.id, pt.position").fetchall()
+        for name, blob in rows:
+            lst = out.setdefault(name, [])
+            d = self._loads(blob) if blob else None
+            if d:
+                lst.append(d)
+        self._pl_snap = {n: tuple(track_key(t) for t in v) for n, v in out.items()}
+        return out
+
+    def _load_ordered(self, sql):
+        with self._lock:
+            rows = self.conn.execute(sql).fetchall()
+        return [d for d in (self._loads(r[0]) for r in rows) if d]
+
+    def load_favorites(self):
+        out = self._load_ordered("SELECT t.data FROM favorites f JOIN tracks t ON t.id=f.track_id ORDER BY f.position")
+        self._fav_snap = tuple(track_key(t) for t in out)
+        return out
+
+    def load_history(self):
+        out = self._load_ordered("SELECT t.data FROM history h JOIN tracks t ON t.id=h.track_id ORDER BY h.position")
+        self._hist_snap = tuple(track_key(t) for t in out)
+        return out
+
+    def search(self, text, limit=200):
+        """Busca instantânea por qualquer termo de título, artista ou álbum (prefixo, sem acentos)."""
+        toks = re.findall(r"[^\W_]+", text or "")
+        if not toks:
+            return []
+        with self._lock:
+            try:
+                if self.fts:
+                    q = " ".join('"%s"*' % t.replace('"', "") for t in toks)
+                    rows = self.conn.execute(
+                        "SELECT t.data FROM tracks_fts JOIN tracks t ON t.id = tracks_fts.rowid "
+                        "WHERE tracks_fts MATCH ? ORDER BY bm25(tracks_fts, 4.0, 2.0, 1.0) LIMIT ?",
+                        (q, limit)).fetchall()
+                else:
+                    where = " AND ".join(["unaccent(title || ' ' || artist || ' ' || album) LIKE ?"] * len(toks))
+                    rows = self.conn.execute(
+                        f"SELECT data FROM tracks WHERE {where} LIMIT ?",
+                        [f"%{_unaccent_text(t).lower()}%" for t in toks] + [limit]).fetchall()
+            except sqlite3.Error:
+                return []
+        return [d for d in (self._loads(r[0]) for r in rows) if d]
+
+    def count_tracks(self):
+        with self._lock:
+            return self.conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+
+    # ---------- migração dos .json legados ----------
+    @staticmethod
+    def _read_json(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _migrate_legacy(self, files):
+        if self._meta("legacy_migrated") == "1":
+            return
+        pls_raw = self._read_json(files["playlists"]) if files.get("playlists") else None
+        fav_raw = self._read_json(files["favorites"]) if files.get("favorites") else None
+        his_raw = self._read_json(files["history"]) if files.get("history") else None
+
+        def clean(lst):
+            return [normalize_track(t) for t in lst if isinstance(t, dict)] if isinstance(lst, list) else []
+
+        playlists = ({str(k): clean(v) for k, v in pls_raw.items()} if isinstance(pls_raw, dict) else {})
+        favorites, history = clean(fav_raw), clean(his_raw)
+        if playlists:
+            self._w_playlists(list(playlists), playlists)
+        if favorites:
+            self._w_favorites(favorites)
+        if history:
+            self._w_history(history)
+        self._set_meta("legacy_migrated", "1")
+        for path in files.values():          # só depois do commit: o legado vira .bak (reversível)
+            if path and os.path.isfile(path):
+                try:
+                    os.replace(path, path + ".bak")
+                except OSError:
+                    pass
+
+    # ---------- encerramento ----------
+    def close(self):
+        """Espera as gravações pendentes terminarem e fecha o banco."""
+        if self._closed:
+            return
+        self._closed = True
+        self._writer.shutdown(wait=True)
+        with self._lock:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self.conn.execute("PRAGMA optimize")
+            except sqlite3.Error:
+                pass
+            try:
+                self.conn.close()
+            except sqlite3.Error:
+                pass
+
+
+# ======================================================================
+# Equalizador de 10 bandas (filtro de áudio do mpv)
+# ======================================================================
+EQ_BANDS = (31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000)   # Hz
+EQ_RANGE_DB = 12.0
+EQ_PRESETS = {
+    "Flat":       (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    "Rock":       (5, 4, 3, 1, -1, -1, 1, 3, 4, 5),
+    "Pop":        (-1, 1, 3, 4, 3, 0, -1, -1, 1, 2),
+    "Bass Boost": (8, 7, 5, 3, 1, 0, 0, 0, 0, 0),
+    "Vocal":      (-3, -2, -1, 1, 3, 4, 4, 2, 0, -1),
+    "Jazz":       (3, 2, 1, 2, -2, -2, 0, 1, 2, 3),
+}
+
+
+def clamp_eq(gains):
+    """Lista de 10 ganhos em dB, limitada a ±12 (aceita lixo vindo do config.json)."""
+    out = []
+    for i in range(len(EQ_BANDS)):
+        try:
+            g = float(gains[i])
+        except (TypeError, ValueError, IndexError):
+            g = 0.0
+        out.append(max(-EQ_RANGE_DB, min(EQ_RANGE_DB, g)))
+    return out
+
+
+def build_eq_filter(gains):
+    """Valor da propriedade `af` do mpv. Vazio = sem filtro (zero custo de CPU).
+
+    Nota: o mpv não tem um filtro 'equalizer=g1:...:g10'; o 'equalizer' do libavfilter é de UMA banda
+    (f=freq:t=o:w=largura:g=ganho). Por isso a cadeia é montada com um filtro por banda dentro de
+    `lavfi=[...]`. Há ainda um pré-ganho negativo igual ao maior reforço, para evitar clipping."""
+    gains = clamp_eq(gains)
+    parts = [f"equalizer=f={f}:t=o:w=1:g={g:.1f}" for f, g in zip(EQ_BANDS, gains) if abs(g) >= 0.05]
+    if not parts:
+        return ""
+    peak = max(0.0, max(gains))
+    if peak >= 0.05:
+        parts.append(f"volume=volume=-{peak:.1f}dB")
+    return "lavfi=[" + ",".join(parts) + "]"
+
+
+# ======================================================================
+# Radio-Browser (rádios web gratuitas)
+# ======================================================================
+WEBRADIO_SERVERS = (
+    "https://de1.api.radio-browser.info",
+    "https://de2.api.radio-browser.info",
+    "https://fi1.api.radio-browser.info",
+    "https://at1.api.radio-browser.info",
+)
+WEBRADIO_COUNTRIES = (   # (rótulo, código ISO-3166; "" = mundo todo)
+    ("Brasil", "BR"), ("Portugal", "PT"), ("Estados Unidos", "US"), ("Reino Unido", "GB"),
+    ("Argentina", "AR"), ("México", "MX"), ("Espanha", "ES"), ("França", "FR"),
+    ("Alemanha", "DE"), ("Itália", "IT"), ("Japão", "JP"), ("Mundo todo", ""),
+)
+WEBRADIO_TAGS = ("", "rock", "mpb", "notícias", "eletrônica", "pop", "jazz", "clássica",
+              "sertanejo", "samba", "forró", "gospel", "hip hop", "reggae", "lofi")
+
+
+def webradio_search(name="", country_code="", tag="", limit=80, timeout=8):
+    """Consulta a API do Radio-Browser (com revezamento entre servidores espelho). Bloqueante: use em thread."""
+    params = {"limit": str(limit), "hidebroken": "true", "order": "votes", "reverse": "true"}
+    if name.strip():
+        params["name"] = name.strip()
+    if country_code:
+        params["countrycode"] = country_code
+    if tag.strip():
+        params["tag"] = tag.strip()
+    qs = urllib.parse.urlencode(params)
+    last_err = None
+    for base in WEBRADIO_SERVERS:
+        try:
+            req = urllib.request.Request(f"{base}/json/stations/search?{qs}", headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, list):
+                return [s for s in data if isinstance(s, dict)]
+        except Exception as exc:
+            last_err = exc
+    raise RuntimeError(f"Radio-Browser indisponível ({last_err})")
+
+
+def webradio_to_track(st):
+    """Estação do Radio-Browser -> faixa do app (toca como qualquer outra, via fila)."""
+    url = (st.get("url_resolved") or st.get("url") or "").strip()
+    uuid = (st.get("stationuuid") or "").strip()
+    if not url or not uuid:
+        return None
+    tags = ", ".join([t for t in (st.get("tags") or "").split(",") if t][:4])
+    country = st.get("country") or st.get("countrycode") or ""
+    return normalize_track({
+        "id": f"webradio:{uuid}", "title": (st.get("name") or "Rádio").strip() or "Rádio",
+        "uploader": " · ".join(x for x in ("Rádio", country) if x),
+        "duration": "AO VIVO", "stream_url": url, "webradio": True,
+        "favicon": (st.get("favicon") or "").strip(), "country": country, "tags": tags,
+    })
+
+
+def webradio_register_click(uuid):
+    """Boa prática da API: avisa que a estação foi ouvida (ajuda o ranking). Falha em silêncio."""
+    for base in WEBRADIO_SERVERS[:2]:
+        try:
+            req = urllib.request.Request(f"{base}/json/url/{urllib.parse.quote(uuid)}", headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=6):
+                return
+        except Exception:
+            continue
+
+
+# ======================================================================
+# Pré-carregamento (gapless): resolve a URL direta da próxima faixa com o yt-dlp
+# ======================================================================
+PRELOAD_MAX_S = 15      # começa a resolver quando faltam <= 15 s ...
+PRELOAD_MIN_S = 10      # ... (janela ideal 10-15 s); se o usuário pular para o fim, ainda tenta até 4 s
+PRELOAD_LATE_S = 4
+
+
+def resolve_stream_url(video_url, timeout=30):
+    """URL direta do áudio (yt-dlp -g). Bloqueante: use em thread. Devolve None se falhar."""
+    try:
+        out = subprocess.run(
+            ["yt-dlp", "-g", "-f", "bestaudio/best", "--no-playlist", "--no-warnings",
+             "--socket-timeout", "10", video_url],
+            capture_output=True, text=True, timeout=timeout)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("http"):
+            return line
+    return None
+
+
 class MPVController:
     """Controla o processo mpv em modo daemon através de Unix Socket IPC."""
 
@@ -463,6 +1036,7 @@ class MPVController:
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._last_volume = 100
+        self._af = ""            # filtro de áudio atual (equalizador); reaplicado se o mpv reiniciar
 
     def _cleanup(self):
         """Encerra socket e processo (usado ao reiniciar e ao sair)."""
@@ -517,7 +1091,9 @@ class MPVController:
                     "--no-terminal",
                     "--ytdl=yes",
                     "--ytdl-format=bestaudio/best",
-                    "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
+                    # googlevideo: URLs diretas já resolvidas no pré-carregamento (gapless) não passam de novo pelo yt-dlp.
+                    # Padrão Lua sem '%' (no mpv, '%' em --script-opts é prefixo de comprimento e quebraria a opção).
+                    "--script-opts=ytdl_hook-ytdl_path=yt-dlp,ytdl_hook-exclude=googlevideo[.]com",
                     "--network-timeout=20",      # rede travada vira erro (o watchdog tenta de novo) em vez de pendurar
                     "--audio-display=no",
                     f"--input-ipc-server={MPV_SOCKET}",
@@ -558,6 +1134,12 @@ class MPVController:
         self._send(["observe_property", 2, "duration"])
         self._send(["observe_property", 3, "pause"])
         self._send(["observe_property", 4, "idle-active"])
+        self._send(["observe_property", 6, "metadata"])         # rádios web: título da música (ICY)
+        # Encadeamento sem pausa entre as entradas da playlist interna do mpv (ignorado por mpv antigo).
+        self._send(["set_property", "gapless-audio", "yes"])
+        self._send(["set_property", "prefetch-playlist", "yes"])
+        if self._af:
+            self._send(["set_property", "af", self._af])
         return True
 
     def _listen(self):
@@ -614,6 +1196,8 @@ class MPVController:
                         GLib.idle_add(self.callbacks["on_pause_change"], val)
                     elif name == "idle-active" and "on_idle_change" in self.callbacks:
                         GLib.idle_add(self.callbacks["on_idle_change"], bool(val))
+                    elif name == "metadata" and "on_metadata" in self.callbacks and isinstance(val, dict):
+                        GLib.idle_add(self.callbacks["on_metadata"], val)
 
                 if "request_id" in msg and "error" in msg:
                     if msg["error"] != "success" and "on_load_error" in self.callbacks:
@@ -642,6 +1226,19 @@ class MPVController:
             rid = self._request_id
         self._send(["set_property", "pause", False])  # escolher uma faixa sempre toca (mesmo se estava pausado)
         self._send(["loadfile", url, "replace"], request_id=rid)
+
+    def append(self, url):
+        """Gapless: enfileira a próxima faixa na playlist interna do mpv (toca assim que a atual acabar)."""
+        self._send(["loadfile", url, "append"])
+
+    def playlist_clear(self):
+        """Remove as entradas pendentes (pré-carregadas), mantendo a faixa que está tocando."""
+        self._send(["playlist-clear"])
+
+    def set_af(self, af):
+        """Aplica (ou, com string vazia, remove) o filtro de áudio via IPC: set_property af."""
+        self._af = af or ""
+        self._send(["set_property", "af", self._af])
 
     def pause_toggle(self):
         self._send(["cycle", "pause"])
@@ -1044,6 +1641,158 @@ class MprisService:
         self.notify("Metadata")
 
 
+# ======================================================================
+# Diálogo "Equalizador e Áudio": 10 bandas (Gtk.Scale vertical) + presets + gapless
+# ======================================================================
+class AudioDialog(Gtk.Window):
+    """Janela não modal. Fechar apenas a esconde (o estado fica no app e em config.json)."""
+
+    def __init__(self, app):
+        super().__init__(title="Equalizador e Áudio")
+        self.app = app
+        self.set_transient_for(app)
+        self.set_destroy_with_parent(True)
+        self.set_default_size(680, 430)
+        self.set_border_width(14)
+        self._updating = False
+        self._apply_id = None
+        self.scales, self.val_labels = [], []
+        self.connect("delete-event", lambda w, e: (w.hide(), True)[1])
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.add(root)
+
+        # Linha superior: liga/desliga + nome do preset atual
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.sw = Gtk.Switch()
+        self.sw.set_valign(Gtk.Align.CENTER)
+        self.sw.set_active(app.eq_enabled)
+        self.sw.connect("notify::active", self._on_switch)
+        top.pack_start(self.sw, False, False, 0)
+        title = Gtk.Label(xalign=0)
+        title.set_markup('<span size="large" weight="bold">Equalizador de 10 bandas</span>')
+        top.pack_start(title, False, False, 0)
+        self.preset_lbl = Gtk.Label(xalign=1)
+        self.preset_lbl.get_style_context().add_class("dim-label")
+        top.pack_end(self.preset_lbl, False, False, 0)
+        root.pack_start(top, False, False, 0)
+
+        # Presets
+        presets = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        presets.get_style_context().add_class("linked")
+        presets.set_halign(Gtk.Align.START)
+        for name in EQ_PRESETS:
+            b = Gtk.Button(label=name)
+            b.connect("clicked", self._on_preset, name)
+            presets.pack_start(b, False, False, 0)
+        root.pack_start(presets, False, False, 0)
+
+        # Bandas
+        bands = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        bands.set_homogeneous(True)
+        for i, (freq, gain) in enumerate(zip(EQ_BANDS, app.eq_gains)):
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            val = Gtk.Label(label=self._fmt_db(gain))
+            val.set_width_chars(6)
+            val.get_style_context().add_class("dim-label")
+            sc = Gtk.Scale.new_with_range(Gtk.Orientation.VERTICAL, -EQ_RANGE_DB, EQ_RANGE_DB, 0.5)
+            sc.set_inverted(True)                 # +12 dB em cima, -12 dB embaixo
+            sc.set_draw_value(False)
+            sc.set_has_origin(False)              # sem preenchimento 'a partir do fundo': o EQ é centrado em 0 dB
+            sc.set_size_request(-1, 190)
+            sc.set_vexpand(True)
+            sc.add_mark(0.0, Gtk.PositionType.RIGHT, None)
+            sc.set_value(gain)
+            sc.connect("value-changed", self._on_band, i)
+            sc.connect("button-press-event", self._on_band_press, i)
+            sc.set_tooltip_text(f"{self._fmt_freq(freq)} - duplo clique zera esta banda")
+            lbl = Gtk.Label(label=self._fmt_freq(freq))
+            col.pack_start(val, False, False, 0)
+            col.pack_start(sc, True, True, 0)
+            col.pack_start(lbl, False, False, 0)
+            bands.pack_start(col, True, True, 0)
+            self.scales.append(sc)
+            self.val_labels.append(val)
+        root.pack_start(bands, True, True, 0)
+
+        root.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
+        self.chk_gapless = Gtk.CheckButton(label="Reprodução sem pausa (gapless): pré-carrega a próxima faixa nos últimos segundos")
+        self.chk_gapless.set_active(app.gapless_enabled)
+        self.chk_gapless.connect("toggled", lambda b: app.set_gapless(b.get_active()))
+        root.pack_start(self.chk_gapless, False, False, 0)
+        hint = Gtk.Label(xalign=0)
+        hint.set_line_wrap(True)
+        hint.set_text("Faixa de ±12 dB por banda. Com todas as bandas em 0 dB o filtro é removido (zero custo de CPU). "
+                      "Ao reforçar bandas, um pré-ganho automático evita distorção por clipping.")
+        hint.get_style_context().add_class("dim-label")
+        root.pack_start(hint, False, False, 0)
+        self._refresh_preset_label()
+
+    @staticmethod
+    def _fmt_db(g):
+        return f"{g:+.1f} dB" if abs(g) >= 0.05 else "0 dB"
+
+    @staticmethod
+    def _fmt_freq(f):
+        return f"{f / 1000:g} kHz" if f >= 1000 else f"{f} Hz"
+
+    def _refresh_preset_label(self):
+        name = "Personalizado"
+        for n, g in EQ_PRESETS.items():
+            if all(abs(a - b) < 0.01 for a, b in zip(self.app.eq_gains, g)):
+                name = n
+                break
+        self.app.eq_preset = name
+        self.preset_lbl.set_text(f"Preset: {name}")
+
+    def _set_switch(self, on):
+        self._updating = True
+        self.sw.set_active(on)
+        self._updating = False
+        self.app.eq_enabled = on
+
+    def _on_switch(self, sw, _pspec):
+        if self._updating:
+            return
+        self.app.eq_enabled = sw.get_active()
+        self.app.apply_eq()
+
+    def _on_band(self, scale, i):
+        if self._updating:
+            return
+        g = scale.get_value()
+        self.val_labels[i].set_text(self._fmt_db(g))
+        self.app.eq_gains[i] = g
+        if not self.sw.get_active():
+            self._set_switch(True)
+        self._refresh_preset_label()
+        if self._apply_id is None:                         # debounce: arrastar o slider não inunda o IPC
+            self._apply_id = GLib.timeout_add(60, self._do_apply)
+
+    def _on_band_press(self, scale, event, i):
+        if event.type == Gdk.EventType.DOUBLE_BUTTON_PRESS:
+            scale.set_value(0.0)
+            return True
+        return False
+
+    def _do_apply(self):
+        self._apply_id = None
+        self.app.apply_eq()
+        return False
+
+    def _on_preset(self, btn, name):
+        gains = clamp_eq(EQ_PRESETS[name])
+        self._updating = True
+        for i, g in enumerate(gains):
+            self.scales[i].set_value(g)
+            self.val_labels[i].set_text(self._fmt_db(g))
+        self._updating = False
+        self.app.eq_gains = gains
+        self._set_switch(name != "Flat" or self.sw.get_active())
+        self._refresh_preset_label()
+        self.app.apply_eq()
+
+
 class MusicPlayerApp(Gtk.Window):
     # Estado da renderização em lotes (listas grandes são montadas aos poucos, só quando visíveis)
     _queue_gen = 0
@@ -1053,6 +1802,7 @@ class MusicPlayerApp(Gtk.Window):
     _fav_gen = 0
     _fav_dirty = False
     _lib_gen = 0
+    db = None            # LibraryDB (SQLite); None = modo de contingência com arquivos JSON
     CHUNK_FIRST = 40     # linhas criadas de imediato (a lista aparece na hora)
     CHUNK_STEP = 30      # linhas por passada ociosa (mantém a interface fluida)
 
@@ -1090,11 +1840,12 @@ class MusicPlayerApp(Gtk.Window):
         # Estado da aplicação
         self._queue_save_id = None
         self.queue = self._clean_track_list(self._load_json(QUEUE_FILE, []))
-        self.history = self._clean_track_list(self._load_json(HISTORY_FILE, []))[:HISTORY_LIMIT]
-        _pls = self._load_json(PLAYLISTS_FILE, {})
+        self._open_database()   # abre library.db (migra os .json legados na 1ª vez); None => contingência em JSON
+        self.history = self._clean_track_list(self._db_load("history"))[:HISTORY_LIMIT]
+        _pls = self._db_load("playlists")
         self.playlists = ({str(k): self._clean_track_list(v) for k, v in _pls.items()}
                           if isinstance(_pls, dict) else {})
-        self.favorites = [self._normalize_track(t) for t in self._load_json(FAVORITES_FILE, []) if isinstance(t, dict)]
+        self.favorites = [self._normalize_track(t) for t in self._db_load("favorites") if isinstance(t, dict)]
         self._hearts = weakref.WeakSet()
         # Biblioteca local (Músicas Offline)
         _lib = self._load_json(LIBRARY_FILE, {})
@@ -1170,6 +1921,28 @@ class MusicPlayerApp(Gtk.Window):
         self._track_started = False
         self._stall_retry_count = 0
         self._stall_check_id = None
+
+        # Gapless / pré-carregamento da próxima faixa
+        self.gapless_enabled = bool(self.config.get("gapless", True))
+        self._preload = None             # {"token","idx","key"}: próxima faixa já enfileirada no mpv
+        self._preload_fired = None       # token da faixa para a qual o pré-carregamento já foi disparado
+        self._preload_gen = 0
+        self._gapless_guard = None
+        self._preload_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="preload")
+
+        # Equalizador
+        _eq = self.config.get("eq") if isinstance(self.config.get("eq"), dict) else {}
+        self.eq_enabled = bool(_eq.get("enabled", False))
+        self.eq_gains = clamp_eq(_eq.get("gains") or [])
+        self.eq_preset = str(_eq.get("preset") or "Flat")
+        self._audio_dialog = None
+
+        # Rádios e busca na biblioteca (rede/banco sempre em threads)
+        self._net_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="net")
+        self.webradio_token = 0
+        self._webradio_loaded = False
+        self.mylib_token = 0
+        self._mylib_timer = None
 
         # Container Principal
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -1283,8 +2056,8 @@ class MusicPlayerApp(Gtk.Window):
         self.btn_repeat.set_tooltip_text("Repetir Fila")
         self.btn_repeat.connect("toggled", self.on_toggle_repeat)
 
-        self.btn_radio = Gtk.ToggleButton(label="Rádio")
-        self.btn_radio.set_tooltip_text("Rádio: continua tocando músicas parecidas com a faixa atual")
+        self.btn_radio = Gtk.ToggleButton(label="Mix")
+        self.btn_radio.set_tooltip_text("Mix: continua tocando músicas parecidas com a faixa atual")
         self.btn_radio.connect("toggled", self.on_toggle_radio)
 
         btn_download_ctrl = Gtk.Button.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON)
@@ -1293,13 +2066,15 @@ class MusicPlayerApp(Gtk.Window):
 
         self.btn_like = self._make_heart(None)
         self.btn_like.set_relief(Gtk.ReliefStyle.NORMAL)   # moldura como os demais botões do player (nas listas segue sem moldura)
+        self.btn_eq = Gtk.Button(label="EQ")
+        self.btn_eq.connect("clicked", self.on_open_audio)
         self.btn_queue_toggle = Gtk.ToggleButton(label="Fila")
         self.btn_queue_toggle.set_tooltip_text("Fila de reprodução")
         self.btn_queue_toggle.connect("toggled", self._on_panel_toggle, "queue")
         self.btn_lyrics_toggle = Gtk.ToggleButton(label="Letra")
         self.btn_lyrics_toggle.set_tooltip_text("Letra da música")
         self.btn_lyrics_toggle.connect("toggled", self._on_panel_toggle, "lyrics")
-        for w in (self.btn_like, btn_paste, self.btn_shuffle, btn_prev, self.btn_playpause, btn_next, self.btn_repeat, self.btn_radio, btn_download_ctrl, self.btn_queue_toggle, self.btn_lyrics_toggle):
+        for w in (self.btn_like, btn_paste, self.btn_shuffle, btn_prev, self.btn_playpause, btn_next, self.btn_repeat, self.btn_radio, btn_download_ctrl, self.btn_eq, self.btn_queue_toggle, self.btn_lyrics_toggle):
             controls_box.pack_start(w, False, False, 0)
 
         now_playing_box.pack_start(controls_box, False, False, 0)
@@ -1334,12 +2109,15 @@ class MusicPlayerApp(Gtk.Window):
                 "on_pause_change": self.on_mpv_pause_change,
                 "on_idle_change": self.on_mpv_idle_change,
                 "on_died": self.on_mpv_died,
+                "on_metadata": self.on_mpv_metadata,
             }
         )
+        self.mpv._af = build_eq_filter(self.eq_gains) if self.eq_enabled else ""   # aplicado já no start()
         if not self.mpv.start(initial_volume=self.config.get("volume", 100)):
             self.mostrar_mensagem("Erro ao iniciar o MPV. Verifique se está instalado.")
 
         self._apply_volume_ui()
+        self._refresh_eq_button()
 
         self._mpris_pos = 0
         self.mpris = MprisService(self)   # controles de mídia do sistema (MPRIS2)
@@ -1567,6 +2345,8 @@ class MusicPlayerApp(Gtk.Window):
         self._build_tab_favorites()
         self._build_tab_offline()
         self._build_tab_history()
+        self.main_stack.add_named(self._build_page_webradio(), "webradio")
+        self.main_stack.add_named(self._build_page_mylib(), "mylib")
         self._build_tab_about()
         # Abre sempre no Início: a aba Offline chama show_all() ao ser criada e, por ser a primeira página
         # visível do Stack, virava a página inicial. O filho precisa estar visível para ser selecionado.
@@ -1604,6 +2384,8 @@ class MusicPlayerApp(Gtk.Window):
             ("home", "⌂", "Início"),
             ("favorites", '<span foreground="#e0245e">♥</span>', "Favoritas"),
             ("offline", '<span foreground="#2e9e5b">⬇</span>', "Músicas Offline"),
+            ("webradio", "📻", "Rádios Web"),
+            ("mylib", "⌕", "Buscar na Biblioteca"),
             ("history", "◷", "Recentes"),
             ("about", "ⓘ", "Sobre"),
         ):
@@ -2196,7 +2978,7 @@ class MusicPlayerApp(Gtk.Window):
         it_queue.connect("activate", lambda w: self._artist_queue_top(artist))
         it_pl = Gtk.MenuItem(label="Adicionar à Playlist")
         it_pl.connect("activate", lambda w: self._playlist_add_job(lambda: self._artist_top_dtracks(artist)))
-        it_radio = Gtk.MenuItem(label="Iniciar Rádio do Artista")
+        it_radio = Gtk.MenuItem(label="Iniciar Mix do Artista")
         it_radio.connect("activate", lambda w: self._artist_start_radio(artist))
         for it in (it_open, it_play, it_queue, it_radio, it_pl):
             menu.append(it)
@@ -2234,7 +3016,7 @@ class MusicPlayerApp(Gtk.Window):
         self._discover_resolve_and_source(
             lambda: self._artist_top_dtracks(artist, limit=1),
             lambda resolved: self.start_radio(resolved[0]) if resolved else None,
-            "Iniciando rádio")
+            "Iniciando mix")
 
     def _discover_resolve_and_source(self, source, callback, title):
         """Como _discover_resolve_and, mas a lista de faixas vem de uma função (buscada em thread)."""
@@ -2977,6 +3759,8 @@ class MusicPlayerApp(Gtk.Window):
             return False
         self.lib_index = index
         self._lib_scanning = False
+        if self.db is not None:
+            self.db.sync_local(index.values(), self._lib_file_sig())   # busca FTS5: só trabalha se algo mudou
         self._lib_render()
         self._render_home_tiles()
         self.show_toast(f"Biblioteca atualizada: {len(index)} música(s).")
@@ -3053,6 +3837,8 @@ class MusicPlayerApp(Gtk.Window):
         return False
 
     def _lib_enrich_done(self, found, checked):
+        if self.db is not None and found:
+            self.db.sync_local(self.lib_index.values(), self._lib_file_sig())
         self.show_toast(f"Dados online: {found} de {checked} música(s) completadas.")
         if self.main_stack.get_visible_child_name() == "offline":
             self._lib_render()
@@ -3251,6 +4037,12 @@ class MusicPlayerApp(Gtk.Window):
             self._refresh_home_greeting()
         elif name == "offline":
             self._lib_render()
+        elif name == "webradio":
+            if not self._webradio_loaded:
+                self.on_webradio_search()          # 1ª visita: top rádios do Brasil
+        elif name == "mylib":
+            self.mylib_entry.grab_focus()
+            self._mylib_run()
 
     def navigate(self, name):
         cur = self.main_stack.get_visible_child_name()
@@ -3632,6 +4424,8 @@ class MusicPlayerApp(Gtk.Window):
 
     def _save_queue(self):
         """Grava a fila com atraso (debounce): adicionar muitas faixas seguidas não regrava o arquivo a cada uma."""
+        if self._preload is not None:     # a fila mudou: confere (após a mutação terminar) se o plano ainda vale
+            GLib.idle_add(self._check_preload_still_valid)
         if self._queue_save_id:
             GLib.source_remove(self._queue_save_id)
         self._queue_save_id = GLib.timeout_add(400, self._flush_queue_save)
@@ -3641,9 +4435,44 @@ class MusicPlayerApp(Gtk.Window):
         self._save_json(QUEUE_FILE, self.queue, compact=True)
         return False
 
+    def _open_database(self):
+        self.db = None
+        try:
+            self.db = LibraryDB(DB_FILE, {"playlists": PLAYLISTS_FILE, "favorites": FAVORITES_FILE,
+                                          "history": HISTORY_FILE})
+        except Exception as exc:
+            print(f"[{APP_NAME}] banco SQLite indisponível, usando JSON: {exc}", file=sys.stderr)
+            self.db = None
+
+    def _db_load(self, what):
+        """Playlists/favoritas/histórico: do SQLite; sem banco, dos .json (ou do .bak deixado pela migração)."""
+        if self.db is not None:
+            try:
+                return {"playlists": self.db.load_playlists, "favorites": self.db.load_favorites,
+                        "history": self.db.load_history}[what]()
+            except Exception as exc:
+                print(f"[{APP_NAME}] falha ao ler o banco ({what}): {exc}", file=sys.stderr)
+                self.db = None
+        path, default = {"playlists": (PLAYLISTS_FILE, {}), "favorites": (FAVORITES_FILE, []),
+                         "history": (HISTORY_FILE, [])}[what]
+        data = self._load_json(path, None)
+        return data if data is not None else self._load_json(path + ".bak", default)
+
     def _save_json(self, path, data, compact=False):
-        """Salva arquivo JSON de forma atômica para evitar corrupção de dados.
-        compact=True (fila, histórico, biblioteca): sem indentação — arquivo menor e gravação mais rápida."""
+        """Playlists/favoritas/histórico vão para o SQLite (gravação incremental em segundo plano).
+        Os demais arquivos: JSON atômico (arquivo temporário + os.replace) para evitar corrupção.
+        compact=True (fila, biblioteca): sem indentação — arquivo menor e gravação mais rápida."""
+        if self.db is not None and path in (PLAYLISTS_FILE, FAVORITES_FILE, HISTORY_FILE):
+            try:
+                if path == PLAYLISTS_FILE:
+                    self.db.save_playlists(data)
+                elif path == FAVORITES_FILE:
+                    self.db.save_favorites(data)
+                else:
+                    self.db.save_history(data)
+                return
+            except Exception as exc:
+                print(f"[{APP_NAME}] falha ao gravar no banco, usando JSON: {exc}", file=sys.stderr)
         tmp_path = path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -3673,21 +4502,7 @@ class MusicPlayerApp(Gtk.Window):
         return out
 
     def _normalize_track(self, item):
-        if not isinstance(item, dict):
-            item = {}
-        uploader = str(item.get("uploader") or item.get("artist") or "")
-        duration = str(item.get("duration") or item.get("duration_fmt") or "0:00")
-        return {
-            "id": str(item.get("id") or ""),
-            "title": str(item.get("title") or "Sem título"),
-            "uploader": uploader,
-            "artist": uploader,
-            "duration": duration,
-            "duration_fmt": duration,
-            "verified": bool(item.get("verified")),
-            **({k: item[k] for k in ("path", "offline", "album", "year", "track_no", "cover_url") if item.get(k)}
-               if item.get("path") else {}),
-        }
+        return normalize_track(item)
 
     # ---------- Mensagens e Utilitários ----------
     # Estilo da linha de status: pequeno, fino e translúcido (segue o tema claro/escuro)
@@ -4816,6 +5631,9 @@ class MusicPlayerApp(Gtk.Window):
     def search_current_lyrics(self):
         if 0 <= self.current_index < len(self.queue):
             item = self.queue[self.current_index]
+            if item.get("webradio"):
+                self._show_webradio_lyrics_panel(item)
+                return
             self._update_lyrics_ui("Buscando letra...")
             self.lyrics_title_label.set_markup("<b>Carregando...</b>")
             self.lyrics_artist_label.set_text("")
@@ -5944,11 +6762,15 @@ class MusicPlayerApp(Gtk.Window):
 
     def _media_source(self, item):
         """Caminho do arquivo (faixa offline) ou URL do YouTube. None se o arquivo sumiu."""
+        if item.get("stream_url"):          # rádio web: a URL do stream vai direto ao mpv
+            return item["stream_url"]
         if item.get("path"):
             return item["path"] if os.path.isfile(item["path"]) else None
         return f"https://www.youtube.com/watch?v={item['id']}"
 
-    def play_current(self):
+    def play_current(self, gapless=False):
+        """Toca queue[current_index]. gapless=True: o mpv já está tocando esta faixa (pré-carregada);
+        só a interface é sincronizada, sem novo loadfile (é o que elimina a pausa)."""
         if not (0 <= self.current_index < len(self.queue)):
             return
         item = self.queue[self.current_index]
@@ -5968,11 +6790,16 @@ class MusicPlayerApp(Gtk.Window):
         self._track_started = False
         self._stall_retry_count = 0
         self._cancel_stall_watchdog()
+        self._preload = None             # `loadfile replace` (ou a troca gapless) já descartou o plano anterior
+        self._preload_fired = None
+        self._preload_gen += 1
+        self._gapless_guard = self._play_token if gapless else None
 
         self._mpv_paused = False
         self._mpv_idle = False
         self._update_playpause_icon()
-        self.mpv.load(url)
+        if not gapless:
+            self.mpv.load(url)
         self.now_playing_label.set_text(f"{item['title']}")
         self._highlight_track_change()
         self.add_to_history(item)
@@ -5982,6 +6809,12 @@ class MusicPlayerApp(Gtk.Window):
 
         self._schedule_stall_watchdog(self._play_token)
 
+        if item.get("webradio"):
+            self.stop_radio(notify=False)      # a "Rádio" de músicas parecidas não se aplica a uma transmissão ao vivo
+            threading.Thread(target=self._load_webradio_thumbnail, args=(item, self._play_token), daemon=True).start()
+            self._show_webradio_lyrics_panel(item)
+            threading.Thread(target=webradio_register_click, args=(item["id"].split(":", 1)[-1],), daemon=True).start()
+            return
         if item.get("path"):
             threading.Thread(target=self._load_local_thumbnail, args=(item, self._play_token), daemon=True).start()
         else:
@@ -6163,6 +6996,8 @@ class MusicPlayerApp(Gtk.Window):
 
     def on_mpv_time_change(self, pos):
         self._mpris_pos = pos or 0
+        if pos and self.track_duration and self.track_duration - pos <= PRELOAD_MAX_S:
+            self.on_mpv_time_remaining(self.track_duration - pos)     # pré-carregamento da próxima faixa (gapless)
         if pos and pos > 0.5 and not self._track_started:
             self._track_started = True
             self._cancel_stall_watchdog()
@@ -6207,6 +7042,11 @@ class MusicPlayerApp(Gtk.Window):
     def on_mpv_idle_change(self, is_idle):
         self._mpv_idle = bool(is_idle)
         self._update_playpause_icon()
+        # A faixa pré-carregada falhou ao abrir (mpv ficou ocioso): recupera já pelo caminho normal.
+        if is_idle and self._gapless_guard == self._play_token and not self._track_started and not self._closing:
+            self._gapless_guard = None
+            self._cancel_stall_watchdog()
+            self._check_playback_stall(self._play_token)
         return False
 
     def _set_mpv_idle(self, idle):
@@ -6240,6 +7080,12 @@ class MusicPlayerApp(Gtk.Window):
         if self.is_repeat:
             self.play_current()
             return False
+        # Gapless: o mpv já passou sozinho para a faixa pré-carregada; só sincroniza a interface.
+        pre, self._preload = self._preload, None
+        if pre and self.gapless_enabled and self._gapless_accept(pre):
+            self.current_index = pre["idx"]
+            self.play_current(gapless=True)
+            return False
         has_next = (self.is_shuffle and len(self.queue) > 1) or self.current_index + 1 < len(self.queue)
         if not has_next and self._radio is None:
             self._set_mpv_idle(True)  # fila acabou: o botão volta a ser "play"
@@ -6260,7 +7106,7 @@ class MusicPlayerApp(Gtk.Window):
         return self._norm_key(t.get("title", "")) + "|" + self._norm_key(t.get("artist") or t.get("uploader") or "")
 
     def _radio_menu_item(self, item):
-        mi = Gtk.MenuItem(label="Iniciar Rádio da Faixa")
+        mi = Gtk.MenuItem(label="Iniciar Mix da Faixa")
         mi.connect("activate", lambda w: self.start_radio(item))
         return mi
 
@@ -6269,7 +7115,7 @@ class MusicPlayerApp(Gtk.Window):
         def go(w):
             self.show_toast("Buscando faixa no YouTube...")
             self._resolve_deezer_track(dtrack, lambda item: self.start_radio(item))
-        mi = Gtk.MenuItem(label="Iniciar Rádio da Faixa")
+        mi = Gtk.MenuItem(label="Iniciar Mix da Faixa")
         mi.connect("activate", go)
         return mi
 
@@ -6287,7 +7133,7 @@ class MusicPlayerApp(Gtk.Window):
             item = self._current_item()
             if item is None:
                 self._radio_set_button(False)
-                self.mostrar_mensagem("Toque uma música primeiro, ou use o botão direito > Iniciar Rádio da Faixa.")
+                self.mostrar_mensagem("Toque uma música primeiro, ou use o botão direito > Iniciar Mix da Faixa.")
                 return
             self.start_radio(item, play_now=False)
         else:
@@ -6296,6 +7142,10 @@ class MusicPlayerApp(Gtk.Window):
     def start_radio(self, item, play_now=True):
         """Liga a rádio a partir de uma faixa. play_now=True toca a faixa já; False só continua depois da fila."""
         item = self._normalize_track(item)
+        if item.get("stream_url"):          # rádio web ao vivo: não existem "músicas parecidas" de uma transmissão
+            self._radio_set_button(self._radio is not None)   # reflete o estado real (pode já haver uma Mix ligado)
+            self.show_toast("O Mix automático não funciona com rádios ao vivo.")
+            return
         self._radio_token += 1
         self._radio_busy = False
         self._radio_pending_next = False
@@ -6307,12 +7157,12 @@ class MusicPlayerApp(Gtk.Window):
         if self.is_shuffle:
             self.btn_shuffle.set_active(False)   # rádio segue a ordem da fila
         if play_now:
-            self.show_toast("Rádio: buscando músicas parecidas...")
+            self.show_toast("Mix: buscando músicas parecidas...")
             self.play_item(item)                 # play_current já dispara o reabastecimento
         else:
             ahead = len(self.queue) - self.current_index - 1
-            self.show_toast("Rádio ligada." if ahead <= self.RADIO_REFILL_AT
-                            else "Rádio ligada: entra depois do que já está na fila.")
+            self.show_toast("Mix ligado." if ahead <= self.RADIO_REFILL_AT
+                            else "Mix ligado: entra depois do que já está na fila.")
         self._radio_refill()
 
     def stop_radio(self, notify=True):
@@ -6327,7 +7177,7 @@ class MusicPlayerApp(Gtk.Window):
             self._set_mpv_idle(True)
         self._radio_set_button(False)
         if notify:
-            self.show_toast("Rádio desligada.")
+            self.show_toast("Mix desligado.")
 
     def _radio_refill(self, force=False):
         """Pede mais faixas em segundo plano quando a fila está acabando (não bloqueia a interface)."""
@@ -6483,9 +7333,9 @@ class MusicPlayerApp(Gtk.Window):
                 self.now_playing_label.set_text("Fila finalizada")
         if rd["fails"] >= 3:
             self.stop_radio(notify=False)
-            self.show_toast("Rádio desligada: não encontrei mais músicas parecidas.")
+            self.show_toast("Mix desligado: não encontrei mais músicas parecidas.")
         else:
-            self.show_toast("Rádio: não encontrei músicas parecidas agora.")
+            self.show_toast("Mix: não encontrei músicas parecidas agora.")
         return False
 
     def on_load_error(self, error_msg):
@@ -6520,17 +7370,19 @@ class MusicPlayerApp(Gtk.Window):
             self.play_current()
         elif self._radio is not None:
             self._radio_pending_next = True      # toca a primeira faixa nova assim que chegar
-            self.show_toast("Rádio: buscando mais músicas...")
+            self.show_toast("Mix: buscando mais músicas...")
             self._radio_refill(force=True)
         else:
             self.now_playing_label.set_text("Fila finalizada")
 
     def on_toggle_shuffle(self, button):
         self.is_shuffle = button.get_active()
+        self._invalidate_preload()
         self._mpris_notify("Shuffle", "CanGoNext")
 
     def on_toggle_repeat(self, button):
         self.is_repeat = button.get_active()
+        self._invalidate_preload()
         self._mpris_notify("LoopStatus")
 
     def on_volume_changed(self, scale):
@@ -6626,7 +7478,8 @@ class MusicPlayerApp(Gtk.Window):
     # ---------- Download MP3 (Com Progresso em Real-time) ----------
     def _selection_lists(self):
         return [self.results_list, self.queue_list, self.pl_tracks_list, self.history_list,
-                self.favorites_list, self.discover_tracks_list, self.offline_tracks_list]
+                self.favorites_list, self.discover_tracks_list, self.offline_tracks_list,
+                self.webradio_list, self.mylib_list]
 
     def _wire_selection_tracking(self):
         """Só UMA lista mantém seleção por vez; a última em que você clicou é a 'ativa'.
@@ -6665,9 +7518,9 @@ class MusicPlayerApp(Gtk.Window):
         if not items:
             self.mostrar_mensagem("Selecione uma ou mais faixas para baixar.")
             return
-        online = [i for i in items if not i.get("path")]
+        online = [i for i in items if not i.get("path") and not i.get("webradio")]
         if not online:
-            self.mostrar_mensagem("As faixas selecionadas já estão offline no seu computador.")
+            self.mostrar_mensagem("As faixas selecionadas já estão offline ou são rádios ao vivo (não baixáveis).")
             return
         if len(online) < len(items):
             self.show_toast(f"{len(items) - len(online)} faixa(s) offline ignorada(s).")
@@ -7103,6 +7956,11 @@ class MusicPlayerApp(Gtk.Window):
                 self.on_paste_link()
                 return True
 
+        # Ctrl + E: equalizador e opções de áudio
+        if state and event.keyval in (Gdk.KEY_e, Gdk.KEY_E) and not in_entry:
+            self.on_open_audio()
+            return True
+
         # Ctrl + F: foca a busca
         if state and event.keyval in (Gdk.KEY_f, Gdk.KEY_F):
             self.search_entry.grab_focus()
@@ -7333,11 +8191,14 @@ class MusicPlayerApp(Gtk.Window):
         page.pack_start(self._about_heading("Abas do aplicativo"), False, False, 0)
         for name, desc in (
             ("Barra lateral", "Início, Favoritas, Recentes e Sobre, além das suas playlists sempre à mão (botão direito: tocar, renomear, excluir)."),
-            ("Início", "Vitrines: atalho para suas curtidas, o que tocou recentemente (duplo clique toca; botão direito abre o menu) e o \"Em alta\" por país (padrão: Brasil) com os artistas (duplo clique abre; botão direito: tocar populares, fila, rádio, playlist) e as músicas mais ouvidas do ranking. Os cartões de artista da Busca e de \"Fãs também ouvem\", e todos os cartões de álbum, funcionam do mesmo jeito (um clique seleciona o cartão; duplo clique abre)."),
+            ("Início", "Vitrines: atalho para suas curtidas, o que tocou recentemente (duplo clique toca; botão direito abre o menu) e o \"Em alta\" por país (padrão: Brasil) com os artistas (duplo clique abre; botão direito: tocar populares, fila, mix, playlist) e as músicas mais ouvidas do ranking. Os cartões de artista da Busca e de \"Fãs também ouvem\", e todos os cartões de álbum, funcionam do mesmo jeito (um clique seleciona o cartão; duplo clique abre)."),
             ("Busca", "Uma busca só para músicas (YouTube), artistas e álbuns (Deezer), com filtros Tudo / Músicas / Artistas / Álbuns."),
             ("Artista e álbuns", "Biografia, faixas populares, discografia em capas e artistas parecidos. Abra um álbum para ver e tocar as faixas."),
-            ("Rádio", "Botão Rádio no player (ou botão direito > Iniciar Rádio da Faixa): a fila se abastece sozinha com músicas parecidas, sem fim. Usa o mix automático do YouTube e, se ele falhar, a rádio do artista no Deezer."),
+            ("Mix", "Botão Mix no player (ou botão direito > Iniciar Mix da Faixa): a fila se abastece sozinha com músicas parecidas, sem fim. Usa o mix automático do YouTube e, se ele falhar, as músicas do artista no Deezer."),
             ("Fila e Letra", "Painel que desliza à direita, aberto pelos botões do player: fila reordenável (clique e segure para arrastar uma ou várias faixas selecionadas; uma linha mostra onde vão ficar; ou use as setas) e letra da música atual."),
+            ("Rádios Web", "Estações de rádio online gratuitas (Radio-Browser): busque por país, gênero ou nome e ouça na hora."),
+            ("Buscar na Biblioteca", "Busca instantânea (SQLite FTS5) por título, artista ou álbum em tudo que é seu: playlists, favoritas, recentes e músicas offline."),
+            ("Equalizador (EQ)", "Botão EQ no player (ou Ctrl+E): 10 bandas de ±12 dB, presets Flat, Rock, Pop, Bass Boost, Vocal e Jazz, e a opção de reprodução sem pausa."),
             ("Favoritas", "Curta músicas com o ♡ (ou tecla L): tocar tudo, aleatório, adicionar à fila ou salvar como playlist."),
             ("Recentes", f"Histórico das últimas {HISTORY_LIMIT} faixas tocadas."),
         ):
@@ -7351,7 +8212,8 @@ class MusicPlayerApp(Gtk.Window):
             ("Resolução do áudio", "O mpv usa o yt-dlp como hook para transformar o ID do vídeo em um stream de áudio (bestaudio). Um watchdog detecta reproduções travadas e tenta novamente.", "yt-dlp"),
             ("Concorrência", "Buscas, letras, capas e downloads rodam em threads. Os resultados voltam à interface via GLib.idle_add; um token por busca descarta respostas obsoletas.", "threading"),
             ("Metadados limpos", "Cada resultado do YouTube é comparado com faixas do Deezer (palavras do título, artista e duração) para exibir título e artista corretos. Sem correspondência, o título é higienizado por expressões regulares.", "Deezer + regex"),
-            ("Persistência", "Dados em arquivos JSON, gravados de forma atômica (arquivo temporário + os.replace) para evitar corrupção. O volume usa debounce para não gravar a cada movimento do slider.", "JSON"),
+            ("Persistência", "Playlists, favoritas, histórico e o índice de faixas ficam num banco SQLite (library.db) com busca FTS5, gravado em segundo plano e só no que mudou. Fila e configurações seguem em JSON atômico (arquivo temporário + os.replace). Os .json antigos são importados sozinhos na 1ª abertura.", "SQLite + FTS5"),
+            ("Áudio sem pausa", "Faltando ~15 s para o fim da faixa, o yt-dlp resolve a próxima em segundo plano e o mpv a recebe com loadfile append, encadeando sem silêncio. O equalizador usa filtros lavfi enviados por IPC (set_property af).", "gapless + lavfi"),
             ("Downloads", "Áudio extraído e convertido para MP3 na melhor qualidade pelo yt-dlp, com progresso lido da saída do processo. Capa do álbum, artista, álbum, ano, nº da faixa e gênero (Deezer) são gravados como tags ID3 no arquivo.", "yt-dlp + ffmpeg"),
         ):
             page.pack_start(self._about_card(name, desc, tag), False, False, 0)
@@ -7363,6 +8225,7 @@ class MusicPlayerApp(Gtk.Window):
             ("Deezer API", "Refino de metadados na busca, álbum/ano/capa da aba Letra, busca de artistas, artistas relacionados, faixas mais populares, discografia, faixas de cada álbum e os rankings por país (playlists oficiais \"Top <país>\" do Deezer Charts). Uso não comercial.", "api.deezer.com"),
             ("LRCLIB", "Fonte das letras. Usa a letra simples ou, se não houver, a sincronizada sem os marcadores de tempo.", "lrclib.net"),
             ("Wikipédia (pt/en)", "Biografia do artista (texto sob licença CC BY-SA 4.0). Tenta primeiro a versão em português; se não achar, usa a inglesa. Só aceita páginas de músicos e bandas.", "wikipedia.org"),
+            ("Radio-Browser", "Diretório aberto de rádios web: busca por país, gênero e nome, e o endereço do stream. Uso gratuito, sem chave.", "api.radio-browser.info"),
             ("YouTube (via yt-dlp)", "Busca de vídeos e stream de áudio. As miniaturas da faixa atual vêm do servidor de imagens do YouTube.", "youtube.com · i.ytimg.com"),
         ) + TRANSLATE_CARDS:
             page.pack_start(self._about_card(name, desc, tag), False, False, 0)
@@ -7381,11 +8244,10 @@ class MusicPlayerApp(Gtk.Window):
         page.pack_start(self._about_heading("Onde ficam seus dados"), False, False, 0)
         page.pack_start(self._about_text(f"Pasta: <tt>{GLib.markup_escape_text(CONFIG_DIR)}</tt>"), False, False, 0)
         for name, desc in (
-            ("config.json", "Volume e tamanho da janela."),
+            ("library.db", "Banco SQLite: faixas, playlists, favoritas e histórico (com índice de busca FTS5)."),
+            ("config.json", "Volume, tamanho da janela, equalizador e opção gapless."),
             ("queue.json", "Fila de reprodução."),
-            ("playlists.json", "Suas playlists e faixas."),
-            ("favorites.json", "Suas músicas curtidas (Favoritas)."),
-            ("history.json", f"Últimas {HISTORY_LIMIT} faixas tocadas."),
+            ("*.json.bak", "Cópias dos antigos playlists/favorites/history.json, deixadas após a migração para o SQLite."),
             ("profile.json", "Nome de usuário."),
         ):
             page.pack_start(self._about_card(name, desc), False, False, 0)
@@ -7722,6 +8584,424 @@ class MusicPlayerApp(Gtk.Window):
         self.show_toast("Perfil importado com sucesso!")
         return True
 
+    # ======================================================================
+    # Equalizador + opções de áudio
+    # ======================================================================
+    def on_open_audio(self, button=None):
+        if getattr(self, "_audio_dialog", None) is None:
+            self._audio_dialog = AudioDialog(self)
+        self._audio_dialog.show_all()
+        self._audio_dialog.present()
+
+    def apply_eq(self):
+        """Envia o filtro ao mpv (set_property af ...) e grava o estado no config.json."""
+        af = build_eq_filter(self.eq_gains) if self.eq_enabled else ""
+        self.mpv.set_af(af)
+        self.config["eq"] = {"enabled": bool(self.eq_enabled), "gains": [round(g, 1) for g in self.eq_gains],
+                             "preset": self.eq_preset}
+        self._schedule_config_save()
+        self._refresh_eq_button()
+
+    def _refresh_eq_button(self):
+        ctx = self.btn_eq.get_style_context()
+        if self.eq_enabled and any(abs(g) >= 0.05 for g in self.eq_gains):
+            ctx.add_class("suggested-action")
+            self.btn_eq.set_tooltip_text(f"Equalizador ligado ({self.eq_preset}) - Ctrl+E")
+        else:
+            ctx.remove_class("suggested-action")
+            self.btn_eq.set_tooltip_text("Equalizador e opções de áudio (Ctrl+E)")
+
+    def set_gapless(self, on):
+        self.gapless_enabled = bool(on)
+        self.config["gapless"] = self.gapless_enabled
+        self._schedule_config_save()
+        if not on:
+            self._invalidate_preload()
+
+    @staticmethod
+    def _lib_file_sig():
+        """Assinatura barata do library.json (o app só o regrava quando o índice muda). '' = sem arquivo."""
+        try:
+            st = os.stat(LIBRARY_FILE)
+            return f"{st.st_mtime_ns}:{st.st_size}"
+        except OSError:
+            return ""
+
+    # ======================================================================
+    # Reprodução sem pausa (gapless) com pré-carregamento
+    # ======================================================================
+    def _plan_next_index(self):
+        """Próxima faixa que o on_next() escolheria (sem efeitos colaterais). None se a fila acaba."""
+        if not self.queue or self.current_index < 0:
+            return None
+        if self.is_shuffle and len(self.queue) > 1:
+            nxt = self.current_index
+            while nxt == self.current_index:
+                nxt = random.randint(0, len(self.queue) - 1)
+            return nxt
+        if self.current_index + 1 < len(self.queue):
+            return self.current_index + 1
+        return None
+
+    def on_mpv_time_remaining(self, rem):
+        """Chamado pelo on_mpv_time_change com duração - posição. Perto do fim, resolve a próxima em segundo plano."""
+        if (not (PRELOAD_LATE_S <= rem <= PRELOAD_MAX_S) or self._closing or not self.gapless_enabled
+                or self.is_repeat or self._preload is not None or self._preload_fired == self._play_token):
+            return False
+        cur = self._current_item()
+        if not cur or cur.get("webradio"):
+            return False
+        nxt = self._plan_next_index()
+        if nxt is None:
+            return False
+        item = self.queue[nxt]
+        src = self._media_source(item)
+        if src is None:        # arquivo local sumiu: o fluxo normal avisa o usuário e pula
+            return False
+        self._preload_fired = self._play_token
+        token, gen, key = self._play_token, self._preload_gen, track_key(item)
+        if item.get("path") or item.get("stream_url"):
+            self._preload_ready(token, gen, nxt, key, src)          # sem rede: enfileira direto
+        else:
+            try:
+                self._preload_pool.submit(self._preload_worker, token, gen, nxt, key, src)
+            except RuntimeError:
+                pass
+        return False
+
+    def _preload_worker(self, token, gen, idx, key, watch_url):
+        """Thread: resolve a URL direta com o yt-dlp. Se falhar, enfileira o link do vídeo (o mpv resolve)."""
+        url = resolve_stream_url(watch_url) or watch_url
+        GLib.idle_add(self._preload_ready, token, gen, idx, key, url)
+
+    def _preload_ready(self, token, gen, idx, key, url):
+        if (self._closing or token != self._play_token or gen != self._preload_gen or self._preload is not None
+                or not self.gapless_enabled or self.is_repeat):
+            return False
+        if not (0 <= idx < len(self.queue)) or track_key(self.queue[idx]) != key:
+            return False
+        self.mpv.append(url)                      # ["loadfile", url, "append"]
+        self._preload = {"token": token, "idx": idx, "key": key}
+        return False
+
+    def _invalidate_preload(self):
+        """Descarta a faixa pré-carregada (fila mudou, shuffle/repeat alterado...)."""
+        self._preload_gen += 1
+        self._preload_fired = None
+        if self._preload is not None:
+            self._preload = None
+            self.mpv.playlist_clear()             # remove só a entrada pendente; a atual continua tocando
+
+    def _check_preload_still_valid(self):
+        pre = self._preload
+        if pre is not None:
+            ok = (pre["token"] == self._play_token and not self.is_repeat
+                  and 0 <= pre["idx"] < len(self.queue) and track_key(self.queue[pre["idx"]]) == pre["key"]
+                  and (self.is_shuffle or pre["idx"] == self.current_index + 1))
+            if not ok:
+                self._invalidate_preload()
+        return False
+
+    def _gapless_accept(self, pre):
+        return (pre["token"] == self._play_token and not self.is_repeat
+                and 0 <= pre["idx"] < len(self.queue) and track_key(self.queue[pre["idx"]]) == pre["key"])
+
+    # ======================================================================
+    # Rádios web (Radio-Browser)
+    # ======================================================================
+    def _build_page_webradio(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(20)
+        title = Gtk.Label(xalign=0)
+        title.set_markup('<span size="xx-large" weight="bold">Rádios Web</span>')
+        page.pack_start(title, False, False, 0)
+        sub = Gtk.Label(label="Estações de rádio online gratuitas, do Radio-Browser. Dê dois cliques para ouvir.", xalign=0)
+        sub.get_style_context().add_class("dim-label")
+        page.pack_start(sub, False, False, 0)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.webradio_name = Gtk.SearchEntry()
+        self.webradio_name.set_placeholder_text("Nome da rádio...")
+        self.webradio_name.connect("activate", self.on_webradio_search)
+        row.pack_start(self.webradio_name, True, True, 0)
+
+        self.webradio_country = Gtk.ComboBoxText()
+        for label, _code in WEBRADIO_COUNTRIES:
+            self.webradio_country.append_text(label)
+        self.webradio_country.set_active(0)                       # Brasil
+        self.webradio_country.connect("changed", self.on_webradio_search)
+        row.pack_start(self.webradio_country, False, False, 0)
+
+        self.webradio_tag = Gtk.ComboBoxText.new_with_entry()
+        for t in WEBRADIO_TAGS:
+            self.webradio_tag.append_text(t.capitalize() if t else "")
+        self.webradio_tag.get_child().set_placeholder_text("Gênero (Rock, MPB, Notícias...)")
+        self.webradio_tag.get_child().connect("activate", self.on_webradio_search)
+        # "changed" também dispara ao digitar; só busca quando o item vem da lista (active >= 0)
+        self.webradio_tag.connect("changed", lambda c: self.on_webradio_search() if c.get_active() >= 0 else None)
+        row.pack_start(self.webradio_tag, False, False, 0)
+
+        self.webradio_spinner = Gtk.Spinner()
+        row.pack_start(self.webradio_spinner, False, False, 0)
+        btn = Gtk.Button(label="Buscar")
+        btn.get_style_context().add_class("suggested-action")
+        btn.connect("clicked", self.on_webradio_search)
+        row.pack_start(btn, False, False, 0)
+        page.pack_start(row, False, False, 0)
+
+        self.webradio_status = Gtk.Label(xalign=0)
+        self.webradio_status.get_style_context().add_class("dim-label")
+        page.pack_start(self.webradio_status, False, False, 0)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.webradio_list = Gtk.ListBox()
+        self.webradio_list.set_activate_on_single_click(False)
+        self.webradio_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        self.webradio_list.connect("row-activated", lambda lb, r: self.play_item(r.item))
+        self.webradio_list.connect("button-press-event", self.on_webradio_button_press)
+        self.webradio_list.set_placeholder(self._placeholder("Nenhuma rádio carregada."))
+        sw.add(self.webradio_list)
+        page.pack_start(sw, True, True, 0)
+        return page
+
+    def on_webradio_search(self, widget=None):
+        self._webradio_loaded = True
+        self.webradio_token += 1
+        token = self.webradio_token
+        name = self.webradio_name.get_text()
+        idx = max(self.webradio_country.get_active(), 0)
+        code = WEBRADIO_COUNTRIES[idx][1]
+        tag = (self.webradio_tag.get_child().get_text() or "").strip()
+        self.webradio_spinner.start()
+        self.webradio_status.set_text("Buscando rádios...")
+        try:
+            self._net_pool.submit(self._webradio_thread, name, code, tag, token)
+        except RuntimeError:
+            pass
+
+    def _webradio_thread(self, name, code, tag, token):
+        try:
+            stations = webradio_search(name, code, tag)
+            tracks = []
+            for st in stations:
+                t = webradio_to_track(st)
+                if t:
+                    codec, br = st.get("codec") or "", st.get("bitrate") or 0
+                    t["_info"] = " · ".join(x for x in (
+                        st.get("country") or "", ", ".join([g for g in (st.get("tags") or "").split(",") if g][:3]),
+                        f"{codec} {br} kbps" if codec and br else codec) if x)
+                    tracks.append(t)
+            GLib.idle_add(self._webradio_populate, tracks, token, None)
+        except Exception as exc:
+            GLib.idle_add(self._webradio_populate, [], token, str(exc))
+
+    def _webradio_populate(self, tracks, token, error):
+        if token != self.webradio_token:
+            return False
+        self.webradio_spinner.stop()
+        for child in list(self.webradio_list.get_children()):
+            self.webradio_list.remove(child)
+        if error:
+            self.webradio_status.set_text("Não foi possível carregar as rádios. Verifique a conexão.")
+            return False
+        for t in tracks:
+            info = t.pop("_info", "")
+            row = Gtk.ListBoxRow()
+            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            hb.set_border_width(4)
+            ic = Gtk.Label(label="📻")
+            hb.pack_start(ic, False, False, 4)
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            n = Gtk.Label(xalign=0)
+            n.set_ellipsize(3)
+            n.set_markup(f"<b>{GLib.markup_escape_text(t['title'])}</b>")
+            s = Gtk.Label(label=info or "Rádio web", xalign=0)
+            s.set_ellipsize(3)
+            s.get_style_context().add_class("dim-label")
+            vb.pack_start(n, False, False, 0)
+            vb.pack_start(s, False, False, 0)
+            hb.pack_start(vb, True, True, 0)
+            play = Gtk.Button.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON)
+            play.set_relief(Gtk.ReliefStyle.NONE)
+            play.set_tooltip_text("Ouvir agora")
+            play.connect("clicked", lambda b, it=t: self.play_item(it))
+            hb.pack_start(play, False, False, 0)
+            hb.pack_start(self._make_heart(t), False, False, 0)
+            row.add(hb)
+            row.item = t
+            self.webradio_list.add(row)
+        self.webradio_list.show_all()
+        self.webradio_status.set_text(f"{len(tracks)} estação(ões) encontrada(s)." if tracks else "Nenhuma estação encontrada.")
+        return False
+
+    def _simple_track_menu(self, widget, event, extra=None):
+        """Menu de contexto genérico (Tocar / Fila / Playlist / Curtir) para listas de faixas."""
+        if event.button != 3:
+            return False
+        row = widget.get_row_at_y(int(event.y))
+        if row is None or not hasattr(row, "item"):
+            return False
+        self._ensure_row_selected(widget, row)
+        sel = [r.item for r in widget.get_selected_rows()] or [row.item]
+        menu = Gtk.Menu()
+        mi = Gtk.MenuItem(label="Reproduzir")
+        mi.connect("activate", lambda w: self.play_item(row.item))
+        menu.append(mi)
+        if not row.item.get("webradio"):
+            menu.append(self._radio_menu_item(row.item))      # "Iniciar Mix da Faixa" (fila infinita)
+        mi = Gtk.MenuItem(label="Adicionar à Fila")
+        mi.connect("activate", lambda w: self.add_items_bulk(sel))
+        menu.append(mi)
+        mi = Gtk.MenuItem(label="Adicionar à Playlist")
+        mi.connect("activate", lambda w: self.on_add_selection_to_playlist(items_to_add=sel))
+        menu.append(mi)
+        menu.append(self._like_menu_item(sel))
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
+
+    def on_webradio_button_press(self, widget, event):
+        return self._simple_track_menu(widget, event)
+
+    def on_mpv_metadata(self, md):
+        """Rádios enviam o título da música (ICY). Mostra 'Estação — Música' no player."""
+        item = self._current_item()
+        if not item or not item.get("webradio") or not isinstance(md, dict):
+            return False
+        icy = next((str(v) for k, v in md.items() if str(k).lower() == "icy-title" and v), "")
+        if icy:
+            self.now_playing_label.set_text(f"{item['title']} — {icy}")
+            self.lyrics_album_label.set_text(f"Tocando agora: {icy}")
+        return False
+
+    def _show_webradio_lyrics_panel(self, item):
+        self._update_lyrics_ui("Rádio ao vivo.\n\nTransmissões ao vivo não têm letra.")
+        self.lyrics_title_label.set_markup(f"<b>{GLib.markup_escape_text(item['title'])}</b>")
+        self.lyrics_artist_label.set_text(item.get("uploader", ""))
+        self.lyrics_album_label.set_text(item.get("tags", ""))
+        self.lyrics_year_label.set_text("")
+        self.lyrics_art_img.set_from_icon_name("audio-x-generic", Gtk.IconSize.DIALOG)
+
+    def _load_webradio_thumbnail(self, item, token):
+        """Logotipo da estação (favicon) no player e na aba Letra."""
+        data = None
+        fav = item.get("favicon") or ""
+        if fav.startswith(("http://", "https://")):
+            try:
+                req = urllib.request.Request(fav, headers={"User-Agent": USER_AGENT})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = resp.read(2_000_000)
+            except Exception:
+                data = None
+        shown = False
+        if data and token == self._play_token:
+            try:
+                GLib.idle_add(self.thumbnail_img.set_from_pixbuf, self._decode_scaled(data, 48, 48))
+                GLib.idle_add(self._set_lyrics_cover, self._decode_scaled(data, 80, 80), token)
+                shown = True
+            except Exception:
+                pass
+        if token == self._play_token:
+            if not shown:
+                GLib.idle_add(self.thumbnail_img.set_from_icon_name, "audio-x-generic", Gtk.IconSize.DIALOG)
+        GLib.idle_add(self._notify, APP_NAME, f"Rádio: {item.get('title', '')}", "audio-x-generic")
+
+    # ======================================================================
+    # Buscar na Biblioteca (SQLite FTS5)
+    # ======================================================================
+    def _build_page_mylib(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(20)
+        title = Gtk.Label(xalign=0)
+        title.set_markup('<span size="xx-large" weight="bold">Buscar na Biblioteca</span>')
+        page.pack_start(title, False, False, 0)
+        self.mylib_entry = Gtk.SearchEntry()
+        self.mylib_entry.set_placeholder_text("Título, artista ou álbum de qualquer música sua (playlists, favoritas, recentes, offline)...")
+        self.mylib_entry.connect("search-changed", self._on_mylib_changed)
+        self.mylib_entry.connect("stop-search", lambda e: e.set_text(""))
+        page.pack_start(self.mylib_entry, False, False, 0)
+        self.mylib_status = Gtk.Label(xalign=0)
+        self.mylib_status.get_style_context().add_class("dim-label")
+        page.pack_start(self.mylib_status, False, False, 0)
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.mylib_list = Gtk.ListBox()
+        self.mylib_list.set_activate_on_single_click(False)
+        self.mylib_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        self.mylib_list.connect("row-activated", lambda lb, r: self.play_item(r.item))
+        self.mylib_list.connect("button-press-event", lambda w, e: self._simple_track_menu(w, e))
+        self.mylib_list.set_placeholder(self._placeholder("Digite para buscar."))
+        sw.add(self.mylib_list)
+        page.pack_start(sw, True, True, 0)
+        return page
+
+    def _on_mylib_changed(self, entry):
+        if self._mylib_timer:
+            GLib.source_remove(self._mylib_timer)
+        self._mylib_timer = GLib.timeout_add(120, self._mylib_run)      # debounce curto
+
+    def _mylib_run(self):
+        self._mylib_timer = None
+        self.mylib_token += 1
+        token = self.mylib_token
+        text = self.mylib_entry.get_text().strip()
+        if self.db is None:
+            self.mylib_status.set_text("Banco de dados indisponível nesta sessão.")
+            return False
+        try:
+            self._net_pool.submit(self._mylib_thread, text, token)
+        except RuntimeError:
+            pass
+        return False
+
+    def _mylib_thread(self, text, token):
+        t0 = time.perf_counter()
+        try:
+            items = self.db.search(text, 200) if text else []
+            total = self.db.count_tracks()
+        except Exception:
+            items, total = [], 0
+        GLib.idle_add(self._mylib_populate, items, total, text, (time.perf_counter() - t0) * 1000, token)
+
+    def _mylib_populate(self, items, total, text, ms, token):
+        if token != self.mylib_token:
+            return False
+        for child in list(self.mylib_list.get_children()):
+            self.mylib_list.remove(child)
+        for it in items:
+            it = self._normalize_track(it)
+            row = Gtk.ListBoxRow()
+            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            hb.set_border_width(4)
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            t = Gtk.Label(xalign=0)
+            t.set_ellipsize(3)
+            t.set_markup(f"<b>{GLib.markup_escape_text(it['title'])}</b>")
+            sub = "  ·  ".join(x for x in (it.get("uploader"), it.get("album"), it.get("year")) if x) or "Artista desconhecido"
+            s = Gtk.Label(label=sub, xalign=0)
+            s.set_ellipsize(3)
+            s.get_style_context().add_class("dim-label")
+            vb.pack_start(t, False, False, 0)
+            vb.pack_start(s, False, False, 0)
+            hb.pack_start(vb, True, True, 6)
+            d = Gtk.Label(label=it.get("duration", ""))
+            d.get_style_context().add_class("dim-label")
+            hb.pack_start(d, False, False, 4)
+            hb.pack_start(self._offline_badge(it), False, False, 0)
+            hb.pack_start(self._make_heart(it), False, False, 0)
+            row.add(hb)
+            row.item = it
+            self.mylib_list.add(row)
+        self.mylib_list.show_all()
+        engine = "FTS5" if self.db is not None and self.db.fts else "LIKE"
+        if text:
+            self.mylib_status.set_text(f"{len(items)} resultado(s) em {ms:.1f} ms · {total} faixas indexadas ({engine})")
+        else:
+            self.mylib_status.set_text(f"{total} faixas indexadas ({engine}).")
+        self.mylib_list.set_placeholder(self._placeholder("Nenhum resultado." if text else "Digite para buscar."))
+        return False
+
     # ---------- Encerramento ----------
     def on_destroy(self, widget):
         self._closing = True
@@ -7745,6 +9025,11 @@ class MusicPlayerApp(Gtk.Window):
             except Exception:
                 pass
         self._art_pool.shutdown(wait=False)
+        self._preload_pool.shutdown(wait=False)
+        self._net_pool.shutdown(wait=False)
+        if getattr(self, "_mylib_timer", None):
+            GLib.source_remove(self._mylib_timer)
+            self._mylib_timer = None
         if self._config_save_id:
             GLib.source_remove(self._config_save_id)
             self._config_save_id = None
@@ -7756,6 +9041,8 @@ class MusicPlayerApp(Gtk.Window):
         self._save_json(FAVORITES_FILE, self.favorites)
         self._save_json(PROFILE_FILE, self.profile)
         self._save_json(HISTORY_FILE, self.history, compact=True)
+        if self.db is not None:
+            self.db.close()          # espera as gravações pendentes e fecha o SQLite
         if getattr(self, "mpris", None) is not None:
             self.mpris.close()
         Gtk.main_quit()

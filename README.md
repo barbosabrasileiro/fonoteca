@@ -14,7 +14,7 @@
 
 ## O que é
 
-A **Fonoteca** é um player de música leve para o desktop Linux. Ela busca faixas, toca só o áudio, organiza sua fila, playlists e histórico, mostra letras, ajuda a descobrir artistas parecidos e exibe biografia e discografia, tudo usando os widgets e o tema nativos do GTK (sem CSS customizado) e pensada para rodar bem em PCs modestos.
+A **Fonoteca** é um player de música leve para o desktop Linux. Ela busca faixas, toca só o áudio, organiza sua fila, playlists e histórico, mostra letras, ajuda a descobrir artistas parecidos e exibe biografia e discografia. Tem ainda equalizador de 10 bandas, reprodução sem pausa entre as faixas, o **Mix** (uma fila que se abastece sozinha com músicas parecidas), **Rádios Web** gratuitas e busca instantânea na sua biblioteca, tudo usando os widgets e o tema nativos do GTK (sem CSS customizado) e pensada para rodar bem em PCs modestos.
 
 ## Instalação rápida (copiar e colar)
 
@@ -90,6 +90,32 @@ Pronto. Vá para [Como usar](#como-usar-em-1-minuto).
 
 ---
 
+## Como usar em 1 minuto
+
+- **Buscar e tocar:** digite na barra do topo (ou cole um link com `Ctrl+V`) e dê **duplo clique** numa faixa. Com o **botão direito** você adiciona à fila, a uma playlist, curte ou inicia um Mix.
+- **Fila:** botão **Fila**. Arraste as faixas para reordenar.
+- **Letra:** botão **Letra** mostra a letra da música que está tocando.
+- **Mix:** botão **Mix** (ou botão direito › *Iniciar Mix da Faixa*). A fila passa a se abastecer sozinha com músicas parecidas, sem fim. Desligue clicando de novo.
+- **Equalizador:** botão **EQ** (ou `Ctrl+E`). São 10 bandas de ±12 dB, com presets (Flat, Rock, Pop, Bass Boost, Vocal e Jazz). Duplo clique num controle zera a banda. No mesmo painel você liga ou desliga a **reprodução sem pausa**, que prepara a próxima faixa nos últimos segundos da atual.
+- **Rádios Web:** na barra lateral. Busque estações de rádio online por país (Brasil já vem selecionado), gênero ou nome e dê duplo clique para ouvir. Elas entram na fila e podem ser curtidas ou colocadas em playlists. Rádio ao vivo não tem letra nem pode ser baixada.
+- **Buscar na Biblioteca:** na barra lateral. Procura por título, artista ou álbum em tudo que é seu: playlists, favoritas, recentes e músicas offline.
+
+| Tecla | Ação |
+|---|---|
+| `Espaço` | tocar / pausar |
+| `←` / `→` | voltar / avançar 5 segundos |
+| `Ctrl+←` / `Ctrl+→` | faixa anterior / próxima |
+| `Alt+←` | voltar à tela anterior |
+| `M` | silenciar |
+| `L` | curtir a faixa atual |
+| `Ctrl+F` | ir para a busca |
+| `Ctrl+V` | colar um link |
+| `Ctrl+E` | equalizador |
+
+As teclas de uma letra só (`M`, `L`) e o `Espaço` não funcionam enquanto você digita num campo de texto.
+
+---
+
 ## Manutenção (atualizar, diagnosticar, desinstalar)
 
 Você pode fazer tudo isso **sem digitar nada**, por qualquer um destes caminhos:
@@ -124,7 +150,7 @@ Depois de atualizar, **feche e abra a Fonoteca de novo** para carregar a versão
 
 ### Diagnosticar problemas
 
-Verifica Python, GTK, mpv, yt-dlp, ffmpeg, atalhos, seus dados, a conexão com os serviços e faz uma busca de teste de verdade. Se achar algo errado, oferece corrigir na hora.
+Verifica Python, GTK, SQLite, mpv, yt-dlp, ffmpeg, atalhos, seus dados (inclusive a integridade do banco `library.db`), a conexão com os serviços e faz uma busca de teste de verdade. Se achar algo errado, oferece corrigir na hora.
 
 ```bash
 python3 ~/.local/share/fonoteca/fonoteca-installer.py --diagnose
@@ -164,6 +190,10 @@ python3 ~/.local/share/fonoteca/fonoteca-installer.py --uninstall --remove-data 
 | Sumiu o atalho do instalador | Rode o `--update` (ele recria os atalhos) |
 | "Não achei o código-fonte para atualizar" | A pasta clonada foi apagada ou movida. Clone de novo (`git clone ...`) e rode `python3 fonoteca-installer.py --update` dentro dela |
 | "Fonoteca parece estar aberta" mesmo fechada | O `--diagnose` remove o socket abandonado do mpv quando você aceita a correção |
+| Arrastar músicas na fila mostra erro com `cairo.Context` no terminal | Falta a integração cairo do PyGObject. Rode o `--diagnose` e aceite a correção, ou instale `python3-gi-cairo` (Debian/Ubuntu) / `python3-gobject-cairo` (openSUSE) |
+| A lista de Rádios Web não carrega | O Radio-Browser pode estar fora do ar ou você está sem internet. O app tenta vários servidores, então tente de novo em instantes. O `--diagnose` mostra se o serviço responde |
+| Apareceram arquivos `.json.bak` na pasta de dados | É normal: são cópias de segurança dos antigos `playlists.json`, `favorites.json` e `history.json`, deixadas depois que seus dados foram importados para o `library.db`. Pode apagá-los quando conferir que está tudo certo |
+| O diagnóstico avisa "Banco de dados (library.db) com problema" | Restaure um backup (**Perfil › Importar**). Se ainda tiver os `.json.bak`, tire o `.bak` do nome, apague o `library.db` e abra a Fonoteca: ela recria o banco e reimporta esses dados |
 | Sistema imutável (Silverblue, Kinoite etc.) | O instalador não mexe em pacotes do sistema. Instale `mpv` e `ffmpeg` numa caixa (toolbox/distrobox) ou com `rpm-ostree install` e rode o instalador de novo |
 
 Se nada resolver, rode o `--diagnose`, copie o relatório final e abra uma *issue* no GitHub.
@@ -181,7 +211,7 @@ Se nada resolver, rode o `--diagnose`, copie o relatório final e abra uma *issu
 
 ```bash
 # Debian / Ubuntu / Mint
-sudo apt install python3-gi gir1.2-gtk-3.0 mpv ffmpeg libnotify-bin
+sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 mpv ffmpeg libnotify-bin
 ```
 
 ```bash
@@ -226,6 +256,8 @@ sed "s|/CAMINHO/PARA/fonoteca.py|$PWD/fonoteca.py|" fonoteca.desktop > ~/.local/
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) (busca, streams e downloads)
 - `ffmpeg` (converter downloads para MP3)
 - `notify-send` / libnotify (notificações; opcional)
+- SQLite com FTS5 (já vem com o Python da maioria das distros; sem o FTS5 a busca da biblioteca fica no modo simples)
+- Suporte a cairo no PyGObject (`python3-gi-cairo` no Debian/Ubuntu; nas outras distros já vem junto)
 
 O instalador cuida de tudo isso para você.
 
@@ -251,9 +283,11 @@ Doações são opcionais e ajudam a manter o desenvolvimento: LINK-AQUI
 
 ## Seus dados
 
-Tudo fica em `~/.config/fonoteca/` (`config.json`, `queue.json`, `playlists.json`, `history.json`, `profile.json`). Nada é enviado para servidores da Fonoteca: **não há conta, login, telemetria nem anúncios**.
+Tudo fica em `~/.config/fonoteca/`: `library.db` (banco SQLite com playlists, favoritas, histórico e o índice da busca), `library.json` (índice da pasta de músicas offline), `config.json`, `queue.json` e `profile.json`. Nada é enviado para servidores da Fonoteca: **não há conta, login, telemetria nem anúncios**.
 
-O perfil de usuário pode ser salvo, exportado e importado (aba **Perfil**) para garantir portabilidade de seus dados. Para trocar de PC, exporte o perfil no antigo e importe no novo.
+Se você veio de uma versão antiga, na primeira abertura a Fonoteca importa sozinha os antigos `playlists.json`, `favorites.json` e `history.json` para o `library.db` e os renomeia para `.json.bak` (nada é apagado).
+
+O perfil de usuário pode ser salvo, exportado e importado (aba **Perfil**) para garantir portabilidade de seus dados. Para trocar de PC, exporte o perfil no antigo e importe no novo. Prefira isso a copiar o `library.db` com a Fonoteca aberta, porque o banco mantém arquivos auxiliares (`-wal` e `-shm`) enquanto o app roda.
 
 ## Serviços online usados
 
@@ -265,6 +299,9 @@ A Fonoteca não tem servidor próprio. Para funcionar, ela consulta serviços de
 | Deezer (API pública) | Nomes limpos, artistas similares, discografia, capas | Uso não comercial |
 | LRCLIB | Letras | Serviço comunitário e aberto |
 | Wikipédia | Biografias | Texto sob CC BY-SA 4.0 |
+| Radio-Browser | Rádios Web: busca de estações e endereço do stream | Diretório comunitário e aberto, sem chave |
+
+As rádios tocam direto dos servidores de cada emissora, que também veem o seu IP.
 
 Detalhes e avisos de licença em [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
@@ -286,4 +323,4 @@ O ícone (`fonoteca.svg` / `fonoteca.png`) é uma arte original do projeto, dist
 
 ## Marcas e afiliação
 
-Fonoteca é um projeto independente. **Não é afiliada, patrocinada nem endossada** por YouTube, Google, Deezer, Wikimedia Foundation, LRCLIB ou pelo projeto mpv. Todos os nomes e marcas citados pertencem aos seus respectivos donos e são usados apenas para identificar os serviços com os quais o programa se comunica.
+Fonoteca é um projeto independente. **Não é afiliada, patrocinada nem endossada** por YouTube, Google, Deezer, Wikimedia Foundation, LRCLIB, Radio-Browser ou pelo projeto mpv. Todos os nomes e marcas citados pertencem aos seus respectivos donos e são usados apenas para identificar os serviços com os quais o programa se comunica.
