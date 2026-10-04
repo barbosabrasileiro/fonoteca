@@ -34,6 +34,8 @@ import unicodedata
 import difflib
 import datetime
 import weakref
+import signal
+import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:  # opcional: leitura de tags (ID3, Vorbis, MP4...). Sem ele, usa ffprobe e o nome do arquivo.
@@ -50,7 +52,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Gio
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.2.3"
+APP_VERSION = "2.3.0"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -367,6 +369,84 @@ def local_cover_bytes(path):
 
 
 _TIMEPOS_RE = re.compile(rb'"data":\s*(-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)')
+
+
+def _proc_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        return []
+
+
+def _reap_orphan_mpv():
+    """Encerra mpv que sobrou de uma Fonoteca fechada à força (ex.: atualização/reinício,
+    queda de energia do app). Só mexe em mpv da Fonoteca cujo app dono não existe mais."""
+    uid, me = os.getuid(), os.getpid()
+    tmp = tempfile.gettempdir()
+    prefix = f"--input-ipc-server={os.path.join(tmp, APP_ID + '_mpv')}"
+    legacy = prefix + ".sock"                       # versões antigas: um socket só, sem PID
+    try:
+        names = [n for n in os.listdir("/proc") if n.isdigit()]
+    except OSError:
+        return
+
+    def app_alive(pid):
+        argv = _proc_cmdline(pid)
+        return any(os.path.basename(a) == f"{APP_ID}.py" for a in argv[1:3])
+
+    others_running = any(int(n) != me and app_alive(n) for n in names)
+    for n in names:
+        pid = int(n)
+        if pid == me:
+            continue
+        try:
+            if os.stat(f"/proc/{n}").st_uid != uid:
+                continue
+        except OSError:
+            continue
+        argv = _proc_cmdline(n)
+        if not argv or os.path.basename(argv[0]) != "mpv":
+            continue
+        sock_arg = next((a for a in argv if a.startswith(prefix) and a.endswith(".sock")), None)
+        if not sock_arg:
+            continue
+        mid = sock_arg[len(prefix):-len(".sock")]       # "" (antigo) ou "_<pid do app>"
+        if sock_arg == legacy:
+            orphan = not others_running
+        else:
+            orphan = mid.startswith("_") and mid[1:].isdigit() and not app_alive(mid[1:])
+        if not orphan:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        for path in (sock_arg[len("--input-ipc-server="):],
+                     os.path.join(tmp, f"{APP_ID}_mpv{mid}.log")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def _install_exit_handlers(app):
+    """Fechar o app por fora (instalador, kill, logout) tem que fechar de verdade: roda o
+    on_destroy (salva tudo e encerra o mpv). Sem isso o Python morre direto no SIGTERM e o
+    mpv continua tocando sozinho."""
+    def _quit():
+        if not getattr(app, "_closing", False):
+            app.destroy()
+        return False
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, _quit)
+        except Exception:
+            # PyGObject antigo: handler Python + "cutuca" o laço do GTK para ele rodar
+            signal.signal(sig, lambda *a: GLib.idle_add(_quit))
+            GLib.timeout_add(500, lambda: True)
+    atexit.register(app.mpv._cleanup)   # rede de segurança: saída normal do Python nunca deixa o mpv
 
 
 class MPVController:
@@ -7246,6 +7326,10 @@ class MusicPlayerApp(Gtk.Window):
     # ---------- Encerramento ----------
     def on_destroy(self, widget):
         self._closing = True
+        try:
+            self.mpv.quit()      # música para na hora, antes de qualquer outra coisa
+        except Exception:
+            pass
         self._cancel_stall_watchdog()
         for pid_name in ("_queue_save_id", "_toast_timeout_id", "_msg_timeout_id", "_dl_pulse_id", "_busy_pulse_id"):
             sid = getattr(self, pid_name, None)
@@ -7275,7 +7359,6 @@ class MusicPlayerApp(Gtk.Window):
         self._save_json(HISTORY_FILE, self.history, compact=True)
         if getattr(self, "mpris", None) is not None:
             self.mpris.close()
-        self.mpv.quit()
         Gtk.main_quit()
 
 
@@ -7283,6 +7366,8 @@ if __name__ == "__main__":
     GLib.set_prgname(APP_ID)
     GLib.set_application_name(APP_NAME)
     Gtk.Window.set_default_icon_name(APP_ID)
+    _reap_orphan_mpv()
     app = MusicPlayerApp()
+    _install_exit_handlers(app)
     app.show_all()
     Gtk.main()

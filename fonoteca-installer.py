@@ -34,6 +34,7 @@ Este programa é software livre (GPL-3.0-or-later), sem qualquer garantia.
 import argparse
 import ast
 import datetime
+import glob
 import hashlib
 import json
 import os
@@ -66,7 +67,7 @@ except Exception:  # sem PyGObject/GTK: cai para o modo terminal
 # ----------------------------------------------------------------------
 # Constantes
 # ----------------------------------------------------------------------
-INSTALLER_VERSION = "1.1.1"
+INSTALLER_VERSION = "2.3.0"
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
@@ -82,7 +83,10 @@ LEGACY_CONFIG_DIR = os.path.join(HOME, ".config", "yt_music_player")
 APPS_DIR = os.path.join(HOME, ".local", "share", "applications")
 ICON_PNG_DIR = os.path.join(HOME, ".local", "share", "icons", "hicolor", "256x256", "apps")
 ICON_SVG_DIR = os.path.join(HOME, ".local", "share", "icons", "hicolor", "scalable", "apps")
-MPV_SOCKET = os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpv.sock")
+# O app cria um socket do mpv por processo (fonoteca_mpv_<pid>.sock); versões antigas usavam
+# fonoteca_mpv.sock. O padrão cobre os dois, senão sobra mpv tocando depois de reiniciar o app.
+MPV_SOCKET_GLOB = os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpv*.sock")
+MPV_PROC_PATTERN = f"{APP_ID}_mpv"
 
 # Repositório usado só se a pasta original (clone) não existir mais na hora de atualizar.
 # Deve ser o mesmo repositório do APP_URL do fonoteca.py.
@@ -394,14 +398,15 @@ def restart_app(install_dir):
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
-    # mpv que possa ter sobrado usando o socket da Fonoteca
+    # mpv que possa ter sobrado (app morto à força não encerra o mpv): fecha os da Fonoteca
     if shutil.which("pkill"):
-        capture(["pkill", "-f", os.path.basename(MPV_SOCKET)], timeout=5)
+        capture(["pkill", "-f", MPV_PROC_PATTERN], timeout=5)
         time.sleep(0.3)
-    try:
-        os.remove(MPV_SOCKET)
-    except OSError:
-        pass
+    for sock_path in glob.glob(MPV_SOCKET_GLOB):
+        try:
+            os.remove(sock_path)
+        except OSError:
+            pass
     try:
         subprocess.Popen([launcher], start_new_session=True, stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1132,10 +1137,12 @@ class Engine:
         else:
             self.add("info", "Atalhos e ícones", "nenhum encontrado")
 
-        if os.path.exists(MPV_SOCKET):
-            rc, _ = capture(["pgrep", "-f", os.path.basename(MPV_SOCKET)], timeout=5)
+        socks = glob.glob(MPV_SOCKET_GLOB)
+        if socks:
+            rc, _ = capture(["pgrep", "-f", MPV_PROC_PATTERN], timeout=5)
             if rc != 0:
-                self._rm(MPV_SOCKET)
+                for sock_path in socks:
+                    self._rm(sock_path)
 
         # yt-dlp (opcional)
         if remove_ytdlp:
@@ -1359,12 +1366,17 @@ class Engine:
         else:
             self.add("ok", "Dados do usuário", f"{found} arquivo(s) íntegros em {CONFIG_DIR}")
 
-        if os.path.exists(MPV_SOCKET):
-            rc, _ = capture(["pgrep", "-f", os.path.basename(MPV_SOCKET)], timeout=5)
-            if rc == 0:
+        socks = glob.glob(MPV_SOCKET_GLOB)
+        if socks:
+            rc, _ = capture(["pgrep", "-f", MPV_PROC_PATTERN], timeout=5)
+            if rc == 0 and running_app_pids():
                 self.add("info", "Fonoteca parece estar aberta agora", "há um mpv em execução usando o socket dela")
+            elif rc == 0:
+                self.add("warn", "mpv da Fonoteca tocando sem o app aberto",
+                         "sobrou de um fechamento forçado; o conserto encerra esse mpv", fix="socket")
             else:
-                self.add("warn", "Socket do mpv abandonado", f"{MPV_SOCKET} sobrou de uma execução anterior", fix="socket")
+                self.add("warn", "Socket do mpv abandonado",
+                         f"{socks[0]} sobrou de uma execução anterior", fix="socket")
 
     def _diagnose_network(self):
         oks, fails = [], []
@@ -1406,15 +1418,19 @@ class Engine:
             self.install_ytdlp(update=bool(os.path.exists(os.path.join(LOCAL_BIN, "yt-dlp"))))
         if "socket" in fixes:
             self.step("Removendo socket abandonado")
-            rc, _ = capture(["pgrep", "-f", os.path.basename(MPV_SOCKET)], timeout=5)
-            if rc == 0:
+            rc, _ = capture(["pgrep", "-f", MPV_PROC_PATTERN], timeout=5)
+            if rc == 0 and running_app_pids():
                 self.log("    A Fonoteca está aberta; feche-a e tente de novo.")
             else:
-                try:
-                    os.remove(MPV_SOCKET)
-                    self.log("    Removido.")
-                except OSError as e:
-                    self.log(f"    {e}")
+                if rc == 0 and shutil.which("pkill"):
+                    capture(["pkill", "-f", MPV_PROC_PATTERN], timeout=5)   # mpv órfão: sem app dono
+                    time.sleep(0.3)
+                for sock_path in glob.glob(MPV_SOCKET_GLOB):
+                    try:
+                        os.remove(sock_path)
+                    except OSError as e:
+                        self.log(f"    {e}")
+                self.log("    Removido.")
         self.log("\n=== Reverificando ===")
         self.diagnose()
 
