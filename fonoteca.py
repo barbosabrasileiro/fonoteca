@@ -50,7 +50,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Gio
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "2.2.2"
+APP_VERSION = "2.2.3"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -1166,15 +1166,20 @@ class MusicPlayerApp(Gtk.Window):
         self.now_playing_label.set_ellipsize(3)
         self.time_label = Gtk.Label(label="0:00 / 0:00", xalign=0)
         self.time_label.get_style_context().add_class("dim-label")
+        # Botão do artista: com moldura e ícones (pessoa + seta) para deixar claro que é clicável
         self.now_artist_btn = Gtk.Button()
         self.now_artist_lbl = Gtk.Label(label="", xalign=0)
         self.now_artist_lbl.set_ellipsize(3)
-        self.now_artist_lbl.get_style_context().add_class("dim-label")
-        self.now_artist_btn.add(self.now_artist_lbl)
-        self.now_artist_btn.set_relief(Gtk.ReliefStyle.NONE)
+        artist_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        artist_box.pack_start(Gtk.Image.new_from_icon_name("avatar-default-symbolic", Gtk.IconSize.MENU), False, False, 0)
+        artist_box.pack_start(self.now_artist_lbl, True, True, 0)
+        artist_box.pack_start(Gtk.Image.new_from_icon_name("go-next-symbolic", Gtk.IconSize.MENU), False, False, 0)
+        self.now_artist_btn.add(artist_box)
+        self.now_artist_btn.set_relief(Gtk.ReliefStyle.NORMAL)
         self.now_artist_btn.set_halign(Gtk.Align.START)
         self.now_artist_btn.set_focus_on_click(False)
         self.now_artist_btn.set_sensitive(False)
+        self.now_artist_btn.set_opacity(0.0)   # invisível até haver artista (mantém a altura da barra)
         self.now_artist_btn.set_tooltip_text("Abrir a página do artista")
         self.now_artist_btn.connect("clicked", self.on_open_now_artist)
         info_box.pack_start(self.now_playing_label, True, True, 0)
@@ -3042,6 +3047,7 @@ class MusicPlayerApp(Gtk.Window):
         artist = self._guess_artist(item) or item.get("uploader", "")
         self.now_artist_lbl.set_text(artist)
         self.now_artist_btn.set_sensitive(bool(artist))
+        self.now_artist_btn.set_opacity(1.0 if artist else 0.0)
         self._refresh_hearts()
 
     def _current_item(self):
