@@ -61,7 +61,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Gio
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -132,6 +132,7 @@ QUEUE_FILE = os.path.join(CONFIG_DIR, "queue.json")
 HISTORY_FILE = os.path.join(CONFIG_DIR, "history.json")
 PLAYLISTS_FILE = os.path.join(CONFIG_DIR, "playlists.json")
 PROFILE_FILE = os.path.join(CONFIG_DIR, "profile.json")
+STATS_FILE = os.path.join(CONFIG_DIR, "stats.json")       # estatísticas de escuta do Perfil (só neste computador)
 FAVORITES_FILE = os.path.join(CONFIG_DIR, "favorites.json")
 LIBRARY_FILE = os.path.join(CONFIG_DIR, "library.json")   # índice de tags da biblioteca local
 DB_FILE = os.path.join(CONFIG_DIR, "library.db")          # SQLite: faixas, playlists, favoritas, histórico (+FTS5)
@@ -144,6 +145,9 @@ BACKUP_FORMAT = "fonoteca_backup"
 LEGACY_BACKUP_FORMATS = ("yt_music_player_backup",)
 BACKUP_VERSION = 1
 HISTORY_LIMIT = 50
+PLAYLIST_SORTS = (("Nome (A–Z)", "name"), ("Mais faixas", "count"),
+                  ("Maior duração", "dur"), ("Criadas por último", "new"))
+LIB_PREVIEW = 6            # resultados da biblioteca mostrados na busca em "Tudo" (o filtro Biblioteca mostra todos)
 
 # Socket por processo: duas instâncias do app não derrubam o mpv uma da outra.
 MPV_SOCKET = os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpv_{os.getpid()}.sock")
@@ -911,6 +915,15 @@ def clamp_eq(gains):
             g = 0.0
         out.append(max(-EQ_RANGE_DB, min(EQ_RANGE_DB, g)))
     return out
+
+
+def eq_preset_name(gains):
+    """Nome do preset que bate com os ganhos atuais, ou 'Personalizado'."""
+    g = clamp_eq(gains)
+    for name, preset in EQ_PRESETS.items():
+        if all(abs(a - b) < 0.01 for a, b in zip(g, preset)):
+            return name
+    return "Personalizado"
 
 
 def build_eq_filter(gains):
@@ -1832,10 +1845,7 @@ class MusicPlayerApp(Gtk.Window):
         self.set_position(Gtk.WindowPosition.CENTER)
         self.maximize()  # sempre abre maximizado (não é tela cheia); o tamanho acima vale ao restaurar
 
-        header = Gtk.HeaderBar()
-        header.set_show_close_button(True)
-        header.set_title(APP_NAME)
-        self.set_titlebar(header)
+        self._build_headerbar()
 
         # Estado da aplicação
         self._queue_save_id = None
@@ -1873,6 +1883,7 @@ class MusicPlayerApp(Gtk.Window):
         self.selected_playlist = None
         self.results = []
         self.current_index = -1
+        self._resume = None      # {"idx","key"} da faixa restaurada ao abrir (o play toca ela, não a 1ª da fila)
         self.is_repeat = False
         self.is_shuffle = False
         # Rádio (fila infinita com músicas parecidas); None = desligada
@@ -1935,20 +1946,32 @@ class MusicPlayerApp(Gtk.Window):
         self.eq_enabled = bool(_eq.get("enabled", False))
         self.eq_gains = clamp_eq(_eq.get("gains") or [])
         self.eq_preset = str(_eq.get("preset") or "Flat")
+        self._eq_ui_lock = False      # evita laço ao sincronizar o interruptor do EQ do player
         self._audio_dialog = None
 
         # Rádios e busca na biblioteca (rede/banco sempre em threads)
         self._net_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="net")
         self.webradio_token = 0
         self._webradio_loaded = False
-        self.mylib_token = 0
-        self._mylib_timer = None
+        # Estatísticas de escuta (Perfil)
+        self.stats = self._load_stats()
+        self._stat_last_t = 0.0          # relógio do último time-pos (só conta reprodução contínua)
+        self._stat_ctx = None            # (play_token, chave da faixa) da faixa que está sendo contada
+        self._stat_secs = 0.0
+        self._stat_counted = False
+        self._stat_artist = ""
+        self._stats_save_id = None
+        self._sysinfo = None
+        self._pl_sort = "name"
+        self._lib_hits = []              # resultados da biblioteca para a busca atual
+        self._pl_page_dirty = True       # página Minhas Playlists precisa ser remontada
+        self._pl_page_sel = None         # playlist selecionada (cartão) na página Minhas Playlists
 
         # Container Principal
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(vbox)
 
-        # Corpo: barra lateral | conteúdo navegável | painel direito (Fila/Letra)
+        # Corpo: barra lateral | conteúdo navegável | painel direito (Letra)
         overlay = Gtk.Overlay()
         self._body_widget = self._build_body()
         self._wire_selection_tracking()
@@ -1959,78 +1982,62 @@ class MusicPlayerApp(Gtk.Window):
 
         vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
 
-        # Painel Inferior de Reprodução
-        player_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        player_panel.set_border_width(10)
+        # Painel Inferior de Reprodução (grade 3 colunas x 2 linhas; cada linha alinha os sliders):
+        #   [capa · título · artista] [♥ Letra · controles · Mix ⬇]  [EQ ◯ preset]
+        #                             [0:00 ─── progresso ─── 3:20]  [🔊 ── volume ──]
+        player_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        player_panel.set_border_width(8)
+        player_bar = Gtk.Grid()
+        player_bar.set_column_spacing(14)
+        player_bar.set_row_spacing(4)
+        SIDE_W, INNER_W = 290, 190     # laterais iguais: os controles ficam no centro exato da janela
 
-        seek_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-
-        self.seek_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self.seek_scale.set_draw_value(False)
-        self.seek_scale.connect("button-press-event", self.on_seek_start)
-        self.seek_scale.connect("button-release-event", self.on_seek_finish)
-        seek_row.pack_start(self.seek_scale, True, True, 0)
-
-        # Volume: botão Mute (ícone muda conforme o nível) + slider compacto
-        vol_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
-        self.btn_mute = Gtk.Button()
-        self.btn_mute.set_relief(Gtk.ReliefStyle.NONE)
-        self.mute_img = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic", Gtk.IconSize.BUTTON)
-        self.btn_mute.set_image(self.mute_img)
-        self.btn_mute.add_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
-        self.btn_mute.connect("clicked", self.on_toggle_mute)
-        self.btn_mute.connect("scroll-event", self.on_volume_scroll)
-        vol_box.pack_start(self.btn_mute, False, False, 0)
-
-        self.vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self.vol_scale.set_draw_value(False)
-        self.vol_scale.set_increments(5, 10)
-        self.vol_scale.set_size_request(90, -1)
-        self.vol_scale.set_value(self.config.get("volume", 100))
-        self.vol_scale.connect("value-changed", self.on_volume_changed)
-        vol_box.pack_start(self.vol_scale, False, False, 0)
-
-        seek_row.pack_start(vol_box, False, False, 0)
-        player_panel.pack_start(seek_row, False, False, 0)
-
-        now_playing_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        # --- Esquerda: capa, título e artista ---
+        left_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        left_box.set_size_request(SIDE_W, -1)
+        left_box.set_valign(Gtk.Align.CENTER)
 
         self.thumbnail_img = Gtk.Image.new_from_icon_name("audio-x-generic", Gtk.IconSize.DIALOG)
         self.thumbnail_img.set_pixel_size(48)
-        now_playing_box.pack_start(self.thumbnail_img, False, False, 0)
+        left_box.pack_start(self.thumbnail_img, False, False, 0)
 
         info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        info_box.set_valign(Gtk.Align.CENTER)
         self.now_playing_label = Gtk.Label(label="Nenhuma música em execução", xalign=0)
         self.now_playing_label.set_ellipsize(3)
-        self.time_label = Gtk.Label(label="0:00 / 0:00", xalign=0)
-        self.time_label.get_style_context().add_class("dim-label")
-        # Botão do artista: com moldura e ícones (pessoa + seta) para deixar claro que é clicável
+        self.now_playing_label.set_max_width_chars(28)
+        # Botão do artista: plano, com ícone de pessoa (clicável: abre a Wiki do artista)
         self.now_artist_btn = Gtk.Button()
         self.now_artist_lbl = Gtk.Label(label="", xalign=0)
         self.now_artist_lbl.set_ellipsize(3)
+        self.now_artist_lbl.set_max_width_chars(24)
         artist_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         artist_box.pack_start(Gtk.Image.new_from_icon_name("avatar-default-symbolic", Gtk.IconSize.MENU), False, False, 0)
         artist_box.pack_start(self.now_artist_lbl, True, True, 0)
         artist_box.pack_start(Gtk.Image.new_from_icon_name("go-next-symbolic", Gtk.IconSize.MENU), False, False, 0)
         self.now_artist_btn.add(artist_box)
-        self.now_artist_btn.set_relief(Gtk.ReliefStyle.NORMAL)
+        self.now_artist_btn.set_relief(Gtk.ReliefStyle.NONE)
         self.now_artist_btn.set_halign(Gtk.Align.START)
         self.now_artist_btn.set_focus_on_click(False)
         self.now_artist_btn.set_sensitive(False)
         self.now_artist_btn.set_opacity(0.0)   # invisível até haver artista (mantém a altura da barra)
         self.now_artist_btn.set_tooltip_text("Abrir a página do artista")
         self.now_artist_btn.connect("clicked", self.on_open_now_artist)
-        info_box.pack_start(self.now_playing_label, True, True, 0)
+        info_box.pack_start(self.now_playing_label, False, False, 0)
         info_box.pack_start(self.now_artist_btn, False, False, 0)
-        info_box.pack_start(self.time_label, False, False, 0)
-        now_playing_box.pack_start(info_box, True, True, 0)
+        left_box.pack_start(info_box, True, True, 0)
 
-        controls_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        # --- Centro, linha 1: ♥ Letra | embaralhar anterior play próxima repetir | Mix ⬇ ---
+        controls_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        controls_box.set_halign(Gtk.Align.CENTER)
         controls_box.set_valign(Gtk.Align.CENTER)
 
-        btn_paste = Gtk.Button.new_from_icon_name("edit-paste-symbolic", Gtk.IconSize.BUTTON)
-        btn_paste.set_tooltip_text("Colar link e tocar (Ctrl+V)")
-        btn_paste.connect("clicked", self.on_paste_link)
+        self.btn_like = self._make_heart(None)
+        self.btn_like.set_valign(Gtk.Align.CENTER)
+
+        self.btn_lyrics_toggle = Gtk.ToggleButton(label="Letra")
+        self.btn_lyrics_toggle.set_tooltip_text("Letra da música")
+        self.btn_lyrics_toggle.connect("toggled", self._on_panel_toggle, "lyrics")
 
         self.btn_shuffle = Gtk.ToggleButton()
         self.btn_shuffle.set_image(Gtk.Image.new_from_icon_name("media-playlist-shuffle-symbolic", Gtk.IconSize.BUTTON))
@@ -2060,25 +2067,96 @@ class MusicPlayerApp(Gtk.Window):
         self.btn_radio.set_tooltip_text("Mix: continua tocando músicas parecidas com a faixa atual")
         self.btn_radio.connect("toggled", self.on_toggle_radio)
 
-        btn_download_ctrl = Gtk.Button.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON)
-        btn_download_ctrl.set_tooltip_text("Baixar seleção em MP3")
-        btn_download_ctrl.connect("clicked", self.on_download)
+        self.btn_download_ctrl = Gtk.Button.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON)
+        self.btn_download_ctrl.set_relief(Gtk.ReliefStyle.NONE)
+        self.btn_download_ctrl.set_valign(Gtk.Align.CENTER)
+        self.btn_download_ctrl.set_tooltip_text("Baixar a música que está tocando (MP3)")
+        self.btn_download_ctrl.connect("clicked", self.on_download_current)
 
-        self.btn_like = self._make_heart(None)
-        self.btn_like.set_relief(Gtk.ReliefStyle.NORMAL)   # moldura como os demais botões do player (nas listas segue sem moldura)
-        self.btn_eq = Gtk.Button(label="EQ")
-        self.btn_eq.connect("clicked", self.on_open_audio)
-        self.btn_queue_toggle = Gtk.ToggleButton(label="Fila")
-        self.btn_queue_toggle.set_tooltip_text("Fila de reprodução")
-        self.btn_queue_toggle.connect("toggled", self._on_panel_toggle, "queue")
-        self.btn_lyrics_toggle = Gtk.ToggleButton(label="Letra")
-        self.btn_lyrics_toggle.set_tooltip_text("Letra da música")
-        self.btn_lyrics_toggle.connect("toggled", self._on_panel_toggle, "lyrics")
-        for w in (self.btn_like, btn_paste, self.btn_shuffle, btn_prev, self.btn_playpause, btn_next, self.btn_repeat, self.btn_radio, btn_download_ctrl, self.btn_eq, self.btn_queue_toggle, self.btn_lyrics_toggle):
+        # Pares simétricos com a mesma largura: o botão de play fica exatamente no centro
+        pair_icons = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        pair_icons.add_widget(self.btn_like)
+        pair_icons.add_widget(self.btn_download_ctrl)
+        pair_text = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        pair_text.add_widget(self.btn_lyrics_toggle)
+        pair_text.add_widget(self.btn_radio)
+
+        for w in (self.btn_like, self.btn_lyrics_toggle, self.btn_shuffle, btn_prev, self.btn_playpause,
+                  btn_next, self.btn_repeat, self.btn_radio, self.btn_download_ctrl):
             controls_box.pack_start(w, False, False, 0)
 
-        now_playing_box.pack_start(controls_box, False, False, 0)
-        player_panel.pack_start(now_playing_box, False, False, 0)
+        # --- Centro, linha 2: tempo atual | progresso | duração ---
+        seek_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        seek_row.set_valign(Gtk.Align.CENTER)
+        self.time_cur_label = Gtk.Label(label="0:00", xalign=1)
+        self.time_cur_label.set_width_chars(5)
+        self.time_cur_label.get_style_context().add_class("dim-label")
+        self.seek_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self.seek_scale.set_draw_value(False)
+        self.seek_scale.connect("button-press-event", self.on_seek_start)
+        self.seek_scale.connect("button-release-event", self.on_seek_finish)
+        self.time_dur_label = Gtk.Label(label="0:00", xalign=0)
+        self.time_dur_label.set_width_chars(5)
+        self.time_dur_label.get_style_context().add_class("dim-label")
+        seek_row.pack_start(self.time_cur_label, False, False, 0)
+        seek_row.pack_start(self.seek_scale, True, True, 0)
+        seek_row.pack_start(self.time_dur_label, False, False, 0)
+
+        # --- Direita, linha 1: EQ (liga/desliga + preset atual que abre a janela do equalizador) ---
+        eq_cell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        eq_cell.set_size_request(SIDE_W, -1)
+        eq_cell.set_valign(Gtk.Align.CENTER)
+        eq_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        eq_box.set_size_request(INNER_W, -1)
+        eq_lbl = Gtk.Label(label="EQ")
+        eq_lbl.get_style_context().add_class("dim-label")
+        self.eq_switch = Gtk.Switch()
+        self.eq_switch.set_valign(Gtk.Align.CENTER)
+        self.eq_switch.set_active(self.eq_enabled)
+        self.eq_switch.set_tooltip_text("Liga/desliga o equalizador")
+        self.eq_switch.connect("notify::active", self.on_eq_switch)
+        self.btn_eq_preset = Gtk.Button()
+        self.eq_preset_lbl = Gtk.Label(label=eq_preset_name(self.eq_gains))
+        self.eq_preset_lbl.set_ellipsize(3)
+        self.btn_eq_preset.add(self.eq_preset_lbl)
+        self.btn_eq_preset.set_tooltip_text("Preset atual: abre o equalizador (Ctrl+E)")
+        self.btn_eq_preset.connect("clicked", self.on_open_audio)
+        eq_box.pack_start(eq_lbl, False, False, 0)
+        eq_box.pack_start(self.eq_switch, False, False, 0)
+        eq_box.pack_start(self.btn_eq_preset, True, True, 0)
+        eq_cell.pack_end(eq_box, False, False, 0)
+
+        # --- Direita, linha 2: Mute + volume (na mesma linha do slider de progresso) ---
+        vol_cell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        vol_cell.set_size_request(SIDE_W, -1)
+        vol_cell.set_valign(Gtk.Align.CENTER)
+        vol_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        vol_box.set_size_request(INNER_W, -1)
+        self.btn_mute = Gtk.Button()
+        self.btn_mute.set_relief(Gtk.ReliefStyle.NONE)
+        self.mute_img = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic", Gtk.IconSize.BUTTON)
+        self.btn_mute.set_image(self.mute_img)
+        self.btn_mute.add_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        self.btn_mute.connect("clicked", self.on_toggle_mute)
+        self.btn_mute.connect("scroll-event", self.on_volume_scroll)
+        vol_box.pack_start(self.btn_mute, False, False, 0)
+        self.vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self.vol_scale.set_draw_value(False)
+        self.vol_scale.set_increments(5, 10)
+        self.vol_scale.set_value(self.config.get("volume", 100))
+        self.vol_scale.connect("value-changed", self.on_volume_changed)
+        vol_box.pack_start(self.vol_scale, True, True, 0)
+        vol_cell.pack_end(vol_box, False, False, 0)
+
+        controls_box.set_hexpand(True)
+        seek_row.set_hexpand(True)
+        player_bar.attach(left_box, 0, 0, 1, 2)
+        player_bar.attach(controls_box, 1, 0, 1, 1)
+        player_bar.attach(seek_row, 1, 1, 1, 1)
+        player_bar.attach(eq_cell, 2, 0, 1, 1)
+        player_bar.attach(vol_cell, 2, 1, 1, 1)
+
+        player_panel.pack_start(player_bar, False, False, 0)
 
         self.progress_download = Gtk.ProgressBar()
         self.progress_download.set_show_text(True)
@@ -2126,6 +2204,7 @@ class MusicPlayerApp(Gtk.Window):
         self.connect("window-state-event", self._on_window_state)
         self.connect("key-press-event", self.on_key_press)
 
+        self._restore_last_played()   # mostra (parada) a faixa que tocava ao fechar; o play retoma ela
         self.render_queue()
         self.render_playlists()
         self.render_history()
@@ -2136,6 +2215,33 @@ class MusicPlayerApp(Gtk.Window):
         GLib.timeout_add(700, self._show_welcome)
         GLib.timeout_add(400, self._startup_chart)
         GLib.timeout_add(1500, self._lib_startup)
+
+    def _build_headerbar(self):
+        """Barra de título: Voltar | busca centralizada (aceita link colado, também com Ctrl+V)."""
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        header.set_title(APP_NAME)
+        self.set_titlebar(header)
+
+        self.btn_back = Gtk.Button.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.BUTTON)
+        self.btn_back.set_tooltip_text("Voltar (Alt+←)")
+        self.btn_back.set_sensitive(False)
+        self.btn_back.connect("clicked", self.go_back)
+        header.pack_start(self.btn_back)
+
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.search_entry = Gtk.Entry()
+        self.search_entry.set_width_chars(50)
+        self.search_entry.set_placeholder_text("Buscar na biblioteca, músicas, artistas, álbuns ou colar um link...")
+        self.search_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "edit-find-symbolic")
+        self.search_entry.set_icon_activatable(Gtk.EntryIconPosition.PRIMARY, True)
+        self.search_entry.set_icon_tooltip_text(Gtk.EntryIconPosition.PRIMARY, "Buscar (Enter)")
+        self.search_entry.connect("activate", self.on_search)
+        self.search_entry.connect("icon-press", lambda e, pos, ev: self.on_search(e))
+        search_box.pack_start(self.search_entry, True, True, 0)
+        self.search_spinner = Gtk.Spinner()
+        search_box.pack_start(self.search_spinner, False, False, 0)
+        header.set_custom_title(search_box)
 
     def _check_dependencies(self):
         missing = []
@@ -2159,7 +2265,7 @@ class MusicPlayerApp(Gtk.Window):
             dialog.destroy()
 
     # ======================================================================
-    # Interface: barra lateral | conteúdo navegável | painel direito (Fila/Letra)
+    # Interface: barra lateral | conteúdo navegável | painel direito (Letra)
     # ======================================================================
     def _clear(self, container):
         for child in list(container.get_children()):
@@ -2334,19 +2440,19 @@ class MusicPlayerApp(Gtk.Window):
         body.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0)
 
         center = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        center.pack_start(self._build_topbar(), False, False, 0)
-        center.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
 
         self.main_stack.add_named(self._build_page_home(), "home")
+        self.main_stack.add_named(self._build_page_queue(), "queue")
         self.main_stack.add_named(self._build_page_search(), "search")
         self.main_stack.add_named(self._build_page_artist(), "artist")
         self.main_stack.add_named(self._build_wiki_album_page(), "album")
+        self.main_stack.add_named(self._build_page_playlists(), "playlists")
         self.main_stack.add_named(self._build_page_playlist(), "playlist")
+        self.main_stack.add_named(self._build_page_profile(), "profile")
         self._build_tab_favorites()
         self._build_tab_offline()
         self._build_tab_history()
         self.main_stack.add_named(self._build_page_webradio(), "webradio")
-        self.main_stack.add_named(self._build_page_mylib(), "mylib")
         self._build_tab_about()
         # Abre sempre no Início: a aba Offline chama show_all() ao ser criada e, por ser a primeira página
         # visível do Stack, virava a página inicial. O filho precisa estar visível para ser selecionado.
@@ -2379,82 +2485,64 @@ class MusicPlayerApp(Gtk.Window):
 
         self.nav_list = Gtk.ListBox()
         self.nav_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.nav_list.connect("row-activated", lambda lb, row: self.navigate(row.nav_name))
-        for key, icon, label in (
-            ("home", "⌂", "Início"),
-            ("favorites", '<span foreground="#e0245e">♥</span>', "Favoritas"),
-            ("offline", '<span foreground="#2e9e5b">⬇</span>', "Músicas Offline"),
-            ("webradio", "📻", "Rádios Web"),
-            ("mylib", "⌕", "Buscar na Biblioteca"),
-            ("history", "◷", "Recentes"),
-            ("about", "ⓘ", "Sobre"),
+        self.nav_list.connect("row-activated", self._on_nav_activated)
+        self.nav_list.set_header_func(self._nav_header)
+        # (chave, ícone, rótulo, ação). Com ação, o item não abre página: executa e devolve o destaque.
+        for key, icon, label, action in (
+            ("home", "go-home-symbolic", "Início", None),
+            ("queue", "media-playlist-consecutive-symbolic", "Fila de Reprodução", None),
+            ("history", "document-open-recent-symbolic", "Recentes", None),
+            ("playlists", "view-list-symbolic", "Minhas Playlists", None),
+            ("favorites", "emblem-favorite-symbolic", "Favoritas", None),
+            ("offline", "folder-music-symbolic", "Músicas Offline", None),
+            ("webradio", "audio-input-microphone-symbolic", "Rádios Web", None),
+            ("profile", "avatar-default-symbolic", "Perfil", None),
+            ("update", "view-refresh-symbolic", "Corrigir e Atualizar a Fonoteca", self.on_open_installer),
+            ("about", "help-about-symbolic", "Sobre", None),
         ):
             row = Gtk.ListBoxRow()
             hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-            hb.set_border_width(6)
-            ic = Gtk.Label()
-            ic.set_markup(f'<span size="large">{icon}</span>')
-            ic.set_width_chars(2)
-            hb.pack_start(ic, False, False, 0)
-            hb.pack_start(Gtk.Label(label=label, xalign=0), True, True, 0)
+            hb.set_border_width(5)
+            hb.pack_start(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU), False, False, 0)
+            lbl = Gtk.Label(label=label, xalign=0)
+            lbl.set_line_wrap(True)
+            lbl.set_max_width_chars(22)
+            hb.pack_start(lbl, True, True, 0)
             row.add(hb)
             row.nav_name = key
+            row.nav_action = action
+            if action is not None:
+                row.set_tooltip_text("Abre o instalador: atualizar, corrigir problemas ou desinstalar")
             self.nav_list.add(row)
         side.pack_start(self.nav_list, False, False, 0)
-        side.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 4)
 
-        btn_new_pl = Gtk.Button.new_from_icon_name("list-add-symbolic", Gtk.IconSize.BUTTON)
-        btn_new_pl.set_relief(Gtk.ReliefStyle.NONE)
-        btn_new_pl.set_tooltip_text("Nova playlist")
-        btn_new_pl.connect("clicked", self.on_create_playlist_dialog)
-        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        head.pack_start(self._section_label("Suas playlists"), True, True, 0)
-        head.pack_end(btn_new_pl, False, False, 0)
-        side.pack_start(head, False, False, 0)
-
-        self.pl_search_entry = Gtk.SearchEntry()
-        self.pl_search_entry.set_placeholder_text("Buscar playlist...")
-        self.pl_search_entry.connect("search-changed", self.on_playlist_filter_changed)
-        self.pl_search_entry.connect("stop-search", lambda e: e.set_text(""))
-        side.pack_start(self.pl_search_entry, False, False, 0)
-
-        pl_scroll = Gtk.ScrolledWindow()
-        pl_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.playlists_list = Gtk.ListBox()
-        self.playlists_list.connect("row-activated", self.on_playlist_selected)
-        self.playlists_list.connect("button-press-event", self.on_playlists_button_press)
-        self.playlists_list.set_filter_func(self._playlist_filter_func)
-        self.playlists_list.set_placeholder(self._placeholder("Nenhuma playlist ainda.\nClique em + para criar."))
-        pl_scroll.add(self.playlists_list)
-        side.pack_start(pl_scroll, True, True, 0)
+        ver = Gtk.Label(label=f"{APP_NAME} {APP_VERSION}", xalign=0)
+        ver.get_style_context().add_class("dim-label")
+        ver.set_margin_start(6)
+        side.pack_end(ver, False, False, 0)
         return side
 
-    def _build_topbar(self):
-        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        top.set_border_width(10)
+    def _nav_header(self, row, before):
+        """Linha separando a biblioteca (acima) de perfil, manutenção e sobre (abaixo)."""
+        if getattr(row, "nav_name", "") == "profile":
+            if row.get_header() is None:
+                sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+                sep.set_margin_top(4)
+                sep.set_margin_bottom(4)
+                row.set_header(sep)
+        else:
+            row.set_header(None)
 
-        self.btn_back = Gtk.Button.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.BUTTON)
-        self.btn_back.set_tooltip_text("Voltar (Alt+←)")
-        self.btn_back.set_sensitive(False)
-        self.btn_back.connect("clicked", self.go_back)
-        top.pack_start(self.btn_back, False, False, 0)
-
-        self.search_entry = Gtk.Entry()
-        self.search_entry.set_placeholder_text("O que você quer ouvir? Músicas, artistas, álbuns ou link...")
-        self.search_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "edit-find-symbolic")
-        self.search_entry.connect("activate", self.on_search)
-        top.pack_start(self.search_entry, True, True, 0)
-
-        self.search_spinner = Gtk.Spinner()
-        top.pack_start(self.search_spinner, False, False, 0)
-        btn_search = Gtk.Button(label="Buscar")
-        btn_search.get_style_context().add_class("suggested-action")
-        btn_search.connect("clicked", self.on_search)
-        top.pack_start(btn_search, False, False, 0)
-        return top
+    def _on_nav_activated(self, lb, row):
+        action = getattr(row, "nav_action", None)
+        if action is not None:
+            self._select_nav(self._current_view())      # o destaque continua na página aberta
+            action()
+            return
+        self.navigate(row.nav_name)
 
     def _build_side_panel(self):
-        """Painel direito (Fila / Letra) que desliza e pode ser fechado."""
+        """Painel direito (Letra) que desliza e pode ser fechado."""
         self.side_revealer = Gtk.Revealer()
         self.side_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_LEFT)
         self.side_revealer.set_transition_duration(150)
@@ -2463,12 +2551,9 @@ class MusicPlayerApp(Gtk.Window):
         self.side_stack = Gtk.Stack()
         self.side_stack.set_transition_type(Gtk.StackTransitionType.NONE)
         self.side_stack.set_size_request(340, -1)
-        self.side_stack.add_named(self._build_panel_queue(), "queue")
         self.side_stack.add_named(self._build_panel_lyrics(), "lyrics")
         box.pack_start(self.side_stack, True, True, 0)
         self.side_revealer.add(box)
-        self.side_revealer.connect("notify::reveal-child", self._on_queue_visibility)
-        self.side_stack.connect("notify::visible-child-name", self._on_queue_visibility)
         return self.side_revealer
 
     def _panel_head(self, title):
@@ -2481,10 +2566,37 @@ class MusicPlayerApp(Gtk.Window):
         head.pack_end(btn, False, False, 0)
         return head
 
-    def _build_panel_queue(self):
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        page.set_border_width(12)
-        page.pack_start(self._panel_head("Fila"), False, False, 0)
+    def _build_page_queue(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(20)
+
+        title = Gtk.Label(xalign=0)
+        title.set_markup('<span size="xx-large" weight="bold">Fila de Reprodução</span>')
+        page.pack_start(title, False, False, 0)
+
+        # FlowBox: os botões quebram de linha em janelas estreitas (com a Letra aberta, por exemplo)
+        btns = Gtk.FlowBox()
+        btns.set_selection_mode(Gtk.SelectionMode.NONE)
+        btns.set_homogeneous(False)
+        btns.set_min_children_per_line(1)
+        btns.set_max_children_per_line(5)
+        btns.set_column_spacing(8)
+        btns.set_row_spacing(8)
+        btn_add_pl_queue = Gtk.Button(label="+ Playlist")
+        btn_add_pl_queue.set_tooltip_text("Adiciona as faixas selecionadas a uma playlist")
+        btn_add_pl_queue.connect("clicked", self.on_add_selection_to_playlist)
+        btn_save_as_pl = Gtk.Button(label="Salvar como Playlist")
+        btn_save_as_pl.connect("clicked", self.on_save_queue_as_playlist)
+        btn_dl_queue = Gtk.Button(label="Baixar Selecionadas")
+        btn_dl_queue.set_tooltip_text("Baixa em MP3 as faixas selecionadas da fila")
+        btn_dl_queue.connect("clicked", lambda b: self.on_download_list(b, self.queue_list))
+        btn_delete_sel = Gtk.Button(label="Excluir Selecionadas")
+        btn_delete_sel.connect("clicked", self.on_delete_selected_queue)
+        btn_clear = Gtk.Button(label="Limpar Fila")
+        btn_clear.connect("clicked", self.on_clear_queue)
+        for b in (btn_add_pl_queue, btn_save_as_pl, btn_dl_queue, btn_delete_sel, btn_clear):
+            btns.add(b)
+        page.pack_start(btns, False, False, 0)
 
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -2501,23 +2613,6 @@ class MusicPlayerApp(Gtk.Window):
         self.queue_list.set_placeholder(self._placeholder("A fila está vazia.\nBusque algo para começar."))
         scroll.add(self.queue_list)
         page.pack_start(scroll, True, True, 0)
-
-        r1 = Gtk.Box(spacing=6)
-        btn_add_pl_queue = Gtk.Button(label="+ Playlist")
-        btn_add_pl_queue.connect("clicked", self.on_add_selection_to_playlist)
-        btn_save_as_pl = Gtk.Button(label="Salvar como Playlist")
-        btn_save_as_pl.connect("clicked", self.on_save_queue_as_playlist)
-        r1.pack_start(btn_add_pl_queue, True, True, 0)
-        r1.pack_start(btn_save_as_pl, True, True, 0)
-        r2 = Gtk.Box(spacing=6)
-        btn_delete_sel = Gtk.Button(label="Excluir Selecionadas")
-        btn_delete_sel.connect("clicked", self.on_delete_selected_queue)
-        btn_clear = Gtk.Button(label="Limpar Fila")
-        btn_clear.connect("clicked", self.on_clear_queue)
-        r2.pack_start(btn_delete_sel, True, True, 0)
-        r2.pack_start(btn_clear, True, True, 0)
-        page.pack_start(r1, False, False, 0)
-        page.pack_start(r2, False, False, 0)
         return page
 
     def _build_panel_lyrics(self):
@@ -2562,9 +2657,9 @@ class MusicPlayerApp(Gtk.Window):
         lyrics_scroll.add(self.lyrics_text_view)
         page.pack_start(lyrics_scroll, True, True, 0)
 
-        btn_reload_lyrics = Gtk.Button(label="Buscar Novamente")
-        btn_reload_lyrics.connect("clicked", lambda w: self.search_current_lyrics())
-        page.pack_start(btn_reload_lyrics, False, False, 0)
+        self.btn_reload_lyrics = Gtk.Button(label="Buscar Novamente")
+        self.btn_reload_lyrics.connect("clicked", lambda w: self.search_current_lyrics())
+        page.pack_start(self.btn_reload_lyrics, False, False, 0)
         return page
 
     # ---------- Início (vitrines estilo Spotify) ----------
@@ -2684,6 +2779,10 @@ class MusicPlayerApp(Gtk.Window):
         n = len(self.favorites)
         tiles = [tile('<span foreground="#e0245e">♥</span>', "Músicas curtidas",
                       "1 música" if n == 1 else f"{n} músicas", lambda: self.navigate("favorites"))]
+        npl = len(self.playlists)
+        tiles.append(tile('<span foreground="#3584e4">♫</span>', "Minhas playlists",
+                          "1 playlist" if npl == 1 else f"{npl} playlists" if npl else "Crie a primeira",
+                          lambda: self.navigate("playlists")))
         nl = len(self.lib_index) if self.lib_root else 0
         tiles.append(tile('<span foreground="#2e9e5b">⬇</span>', "Músicas offline",
                           ("1 música" if nl == 1 else f"{nl} músicas") if nl
@@ -2725,19 +2824,26 @@ class MusicPlayerApp(Gtk.Window):
         menu = Gtk.Menu()
         it_play = Gtk.MenuItem(label="Reproduzir")
         it_play.connect("activate", lambda w: self.play_item(item))
-        it_album = Gtk.MenuItem(label="Ver álbum")
-        it_album.connect("activate", lambda w: self._open_album_of_item(item))
-        it_artist = Gtk.MenuItem(label="Ver artista")
-        it_artist.connect("activate", lambda w: self._open_artist_of_item(item))
         it_like = self._like_menu_item([item])
-        it_dl = Gtk.MenuItem(label="Baixar")
-        it_dl.connect("activate", lambda w: self._download_recent_item(item))
-        for it in (it_play, it_album, it_artist, it_like, it_dl, self._radio_menu_item(item)):
+        entries = [it_play]
+        if not self._is_live(item):          # rádio ao vivo: só reproduzir e curtir
+            it_album = Gtk.MenuItem(label="Ver álbum")
+            it_album.connect("activate", lambda w: self._open_album_of_item(item))
+            it_artist = Gtk.MenuItem(label="Ver artista")
+            it_artist.connect("activate", lambda w: self._open_artist_of_item(item))
+            it_dl = Gtk.MenuItem(label="Baixar")
+            it_dl.connect("activate", lambda w: self._download_recent_item(item))
+            entries += [it_album, it_artist, it_like, it_dl, self._radio_menu_item(item)]
+        else:
+            entries.append(it_like)
+        for it in entries:
             menu.append(it)
         menu.show_all()
         menu.popup_at_pointer(event)
 
     def _open_artist_of_item(self, item):
+        if self._is_live(item):
+            return
         name = self._guess_artist(item)
         if not name:
             self.mostrar_mensagem("Não consegui identificar o artista desta faixa.")
@@ -2745,6 +2851,9 @@ class MusicPlayerApp(Gtk.Window):
         self._open_artist_in_wiki(name)
 
     def _download_recent_item(self, item):
+        if self._is_live(item):
+            self.mostrar_mensagem("Rádios ao vivo não podem ser baixadas.")
+            return
         if item.get("path"):
             self.mostrar_mensagem("Esta faixa já está offline no seu computador.")
             return
@@ -2752,6 +2861,8 @@ class MusicPlayerApp(Gtk.Window):
 
     def _open_album_of_item(self, item):
         """Acha o álbum da faixa no Deezer e abre a página do álbum."""
+        if self._is_live(item):
+            return
         artist = self._guess_artist(item)
         title = self._clean_title(item.get("title", ""))
         self.show_toast("Buscando álbum...")
@@ -3039,9 +3150,12 @@ class MusicPlayerApp(Gtk.Window):
         chips.get_style_context().add_class("linked")
         chips.set_halign(Gtk.Align.START)
         first = None
-        for key, label in (("all", "Tudo"), ("tracks", "Músicas"), ("artists", "Artistas"), ("albums", "Álbuns")):
+        self._filter_btns = {}
+        for key, label in (("all", "Tudo"), ("library", "Biblioteca"), ("tracks", "Músicas"),
+                           ("artists", "Artistas"), ("albums", "Álbuns")):
             b = Gtk.RadioButton.new_with_label_from_widget(first, label)
             b.set_mode(False)
+            self._filter_btns[key] = b
             first = first or b
             b.connect("toggled", self._on_filter_toggled, key)
             chips.pack_start(b, False, False, 0)
@@ -3050,6 +3164,31 @@ class MusicPlayerApp(Gtk.Window):
         self.search_status = Gtk.Label(xalign=0)
         self.search_status.get_style_context().add_class("dim-label")
         page.pack_start(self.search_status, False, False, 0)
+
+        # Na sua biblioteca (playlists, favoritas, recentes e offline): sempre a primeira seção
+        self.sec_library = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        lib_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        lib_head.pack_start(self._h2("Na sua biblioteca"), False, False, 0)
+        self.lib_results_status = Gtk.Label(xalign=0)
+        self.lib_results_status.get_style_context().add_class("dim-label")
+        self.lib_results_status.set_valign(Gtk.Align.END)
+        lib_head.pack_start(self.lib_results_status, False, False, 0)
+        self.sec_library.pack_start(lib_head, False, False, 0)
+        self.lib_results_list = Gtk.ListBox()
+        self.lib_results_list.set_activate_on_single_click(False)
+        self.lib_results_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        self.lib_results_list.connect("row-activated", lambda lb, r: self.play_item(r.item))
+        self.lib_results_list.connect("button-press-event", lambda w, e: self._simple_track_menu(w, e))
+        self.lib_results_list.set_placeholder(self._placeholder("Nada na sua biblioteca para essa busca."))
+        lib_frame = Gtk.Frame()
+        lib_frame.add(self.lib_results_list)
+        self.sec_library.pack_start(lib_frame, False, False, 0)
+        self.lib_more_btn = Gtk.Button(label="Ver todos os resultados")
+        self.lib_more_btn.set_halign(Gtk.Align.START)
+        self.lib_more_btn.set_no_show_all(True)
+        self.lib_more_btn.connect("clicked", lambda b: self._filter_btns["library"].set_active(True))
+        self.sec_library.pack_start(self.lib_more_btn, False, False, 0)
+        page.pack_start(self.sec_library, False, False, 0)
 
         # Artistas
         self.sec_artists = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -3087,16 +3226,17 @@ class MusicPlayerApp(Gtk.Window):
         btn_add_pl = Gtk.Button(label="+ Playlist")
         btn_add_pl.connect("clicked", self.on_add_selection_to_playlist)
         btn_download_results = Gtk.Button(label="Baixar")
-        btn_download_results.connect("clicked", self.on_download)
+        btn_download_results.connect("clicked", lambda b: self.on_download_list(b, self.results_list))
         for b in (btn_play_now, btn_add_queue, btn_add_pl, btn_download_results):
             result_btns.pack_start(b, False, False, 0)
         self.sec_tracks.pack_start(result_btns, False, False, 0)
         page.pack_start(self.sec_tracks, False, False, 0)
 
         scroll.add(page)
-        for w in (self.sec_artists, self.sec_albums, self.sec_tracks):
+        for w in (self.sec_library, self.sec_artists, self.sec_albums, self.sec_tracks):
             w.show_all()
             w.set_no_show_all(True)
+        self.sec_library.hide()          # só aparece quando a busca acha algo na biblioteca
         self._search_filter = "all"
         return scroll
 
@@ -3107,9 +3247,75 @@ class MusicPlayerApp(Gtk.Window):
 
     def _apply_search_filter(self):
         f = self._search_filter
+        self.sec_library.set_visible(f == "library" or (f == "all" and bool(self._lib_hits)))
         self.sec_artists.set_visible(f in ("all", "artists"))
         self.sec_albums.set_visible(f in ("all", "albums"))
         self.sec_tracks.set_visible(f in ("all", "tracks"))
+        self._render_lib_hits()
+
+    def _lib_result_row(self, it):
+        row = Gtk.ListBoxRow()
+        hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        hb.set_border_width(4)
+        vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        t = Gtk.Label(xalign=0)
+        t.set_ellipsize(3)
+        t.set_markup(f"<b>{GLib.markup_escape_text(it['title'])}</b>")
+        sub = "  ·  ".join(x for x in (it.get("uploader"), it.get("album"), it.get("year")) if x) or "Artista desconhecido"
+        sl = Gtk.Label(label=sub, xalign=0)
+        sl.set_ellipsize(3)
+        sl.get_style_context().add_class("dim-label")
+        vb.pack_start(t, False, False, 0)
+        vb.pack_start(sl, False, False, 0)
+        hb.pack_start(vb, True, True, 6)
+        d = Gtk.Label(label=it.get("duration", ""))
+        d.get_style_context().add_class("dim-label")
+        hb.pack_start(d, False, False, 4)
+        hb.pack_start(self._offline_badge(it), False, False, 0)
+        hb.pack_start(self._make_heart(it), False, False, 0)
+        row.add(hb)
+        row.item = it
+        return row
+
+    def _render_lib_hits(self):
+        """Mostra os achados da biblioteca: poucos em 'Tudo', todos no filtro 'Biblioteca'."""
+        self._clear(self.lib_results_list)
+        hits = self._lib_hits
+        shown = hits if self._search_filter == "library" else hits[:LIB_PREVIEW]
+        for it in shown:
+            self.lib_results_list.add(self._lib_result_row(it))
+        self.lib_results_list.show_all()
+        more = len(hits) - len(shown)
+        self.lib_more_btn.set_label(f"Ver todos os {len(hits)} resultados")
+        self.lib_more_btn.set_visible(more > 0)
+
+    def _search_library_start(self, query, token):
+        if self.db is None:
+            return
+        try:
+            self._net_pool.submit(self._search_library_thread, query, token)
+        except RuntimeError:
+            pass
+
+    def _search_library_thread(self, query, token):
+        t0 = time.perf_counter()
+        try:
+            items = self.db.search(query, 200)
+            total = self.db.count_tracks()
+        except Exception:
+            items, total = [], 0
+        if token == self.search_token:
+            GLib.idle_add(self._populate_library_results, items, total, (time.perf_counter() - t0) * 1000, token)
+
+    def _populate_library_results(self, items, total, ms, token):
+        if token != self.search_token:
+            return False
+        self._lib_hits = [self._normalize_track(it) for it in items]
+        engine = "FTS5" if self.db is not None and self.db.fts else "LIKE"
+        n = len(self._lib_hits)
+        self.lib_results_status.set_text(f"{n} resultado(s) · {total} faixas indexadas ({engine}) · {ms:.1f} ms")
+        self._apply_search_filter()
+        return False
 
     def _search_catalog_thread(self, query, token):
         q = urllib.parse.quote(query)
@@ -3217,6 +3423,11 @@ class MusicPlayerApp(Gtk.Window):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         page.set_border_width(20)
 
+        crumb = Gtk.Button(label="‹  Minhas Playlists")
+        crumb.set_relief(Gtk.ReliefStyle.NONE)
+        crumb.set_halign(Gtk.Align.START)
+        crumb.connect("clicked", lambda b: self.navigate("playlists"))
+        page.pack_start(crumb, False, False, 0)
         kicker = Gtk.Label(xalign=0)
         kicker.set_markup('<span size="small" weight="bold" letter_spacing="2048">PLAYLIST</span>')
         kicker.get_style_context().add_class("dim-label")
@@ -3224,18 +3435,27 @@ class MusicPlayerApp(Gtk.Window):
         self.pl_title_label = self._section_label("Selecione uma Playlist")
         self.pl_title_label.set_ellipsize(3)
         page.pack_start(self.pl_title_label, False, False, 0)
+        self.pl_meta_label = Gtk.Label(xalign=0)
+        self.pl_meta_label.get_style_context().add_class("dim-label")
+        page.pack_start(self.pl_meta_label, False, False, 0)
 
         pl_actions_box = Gtk.Box(spacing=8)
         btn_play_pl = Gtk.Button(label="▶  Tocar Playlist")
         btn_play_pl.get_style_context().add_class("suggested-action")
         btn_play_pl.connect("clicked", self.on_play_entire_playlist)
+        btn_shuffle_pl = Gtk.Button(label="Aleatório")
+        btn_shuffle_pl.connect("clicked", lambda b: self.selected_playlist and
+                               self._play_playlist_by_name(self.selected_playlist, shuffle=True))
         btn_append_pl = Gtk.Button(label="+ À Fila")
         btn_append_pl.connect("clicked", self.on_append_playlist_to_queue)
         btn_rename_pl = Gtk.Button(label="Renomear")
         btn_rename_pl.connect("clicked", self.on_rename_current_playlist)
         btn_del_pl = Gtk.Button(label="Excluir Playlist")
         btn_del_pl.connect("clicked", self.on_delete_current_playlist)
-        for b in (btn_play_pl, btn_append_pl, btn_rename_pl, btn_del_pl):
+        btn_dl_pl = Gtk.Button(label="Baixar")
+        btn_dl_pl.set_tooltip_text("Baixa em MP3 as faixas selecionadas da playlist")
+        btn_dl_pl.connect("clicked", lambda b: self.on_download_list(b, self.pl_tracks_list))
+        for b in (btn_play_pl, btn_shuffle_pl, btn_append_pl, btn_dl_pl, btn_rename_pl, btn_del_pl):
             pl_actions_box.pack_start(b, False, False, 0)
         page.pack_start(pl_actions_box, False, False, 0)
 
@@ -3279,7 +3499,10 @@ class MusicPlayerApp(Gtk.Window):
         btn_queue.connect("clicked", self.on_favorites_add_to_queue)
         btn_save = Gtk.Button(label="Salvar como Playlist")
         btn_save.connect("clicked", self.on_save_favorites_as_playlist)
-        for b in (btn_play_all, btn_shuffle, btn_queue, btn_save):
+        btn_fav_dl = Gtk.Button(label="Baixar")
+        btn_fav_dl.set_tooltip_text("Baixa em MP3 as faixas selecionadas")
+        btn_fav_dl.connect("clicked", lambda b: self.on_download_list(b, self.favorites_list))
+        for b in (btn_play_all, btn_shuffle, btn_queue, btn_save, btn_fav_dl):
             btns.pack_start(b, False, False, 0)
         tab_box.pack_start(btns, False, False, 0)
 
@@ -4024,6 +4247,7 @@ class MusicPlayerApp(Gtk.Window):
         return self.main_stack.get_visible_child_name()
 
     def _select_nav(self, name):
+        name = {"playlist": "playlists"}.get(name, name)      # dentro de uma playlist, o destaque fica em Minhas Playlists
         for row in self.nav_list.get_children():
             if getattr(row, "nav_name", None) == name:
                 self.nav_list.select_row(row)
@@ -4040,9 +4264,10 @@ class MusicPlayerApp(Gtk.Window):
         elif name == "webradio":
             if not self._webradio_loaded:
                 self.on_webradio_search()          # 1ª visita: top rádios do Brasil
-        elif name == "mylib":
-            self.mylib_entry.grab_focus()
-            self._mylib_run()
+        elif name == "playlists":
+            self._render_playlists_page_if_dirty()
+        elif name == "profile":
+            self._render_profile()
 
     def navigate(self, name):
         cur = self.main_stack.get_visible_child_name()
@@ -4083,7 +4308,6 @@ class MusicPlayerApp(Gtk.Window):
             self.side_revealer.set_reveal_child(True)
             revealed = True
         self._panel_lock = True
-        self.btn_queue_toggle.set_active(revealed and name == "queue")
         self.btn_lyrics_toggle.set_active(revealed and name == "lyrics")
         self._panel_lock = False
 
@@ -4096,6 +4320,8 @@ class MusicPlayerApp(Gtk.Window):
         if not item:
             self.mostrar_mensagem("Nenhuma faixa tocando no momento.")
             return
+        if self._is_live(item):
+            return
         self._open_artist_in_wiki(self._guess_artist(item))
 
     def _open_playlist(self, name):
@@ -4103,10 +4329,6 @@ class MusicPlayerApp(Gtk.Window):
             return
         self.selected_playlist = name
         self.render_playlist_tracks()
-        for row in self.playlists_list.get_children():
-            if getattr(row, "pl_name", None) == name:
-                self.playlists_list.select_row(row)
-                break
         self.navigate("playlist")
 
     def on_rename_current_playlist(self, button=None):
@@ -4119,10 +4341,11 @@ class MusicPlayerApp(Gtk.Window):
         return None
 
     def _update_now_playing_card(self, item):
-        artist = self._guess_artist(item) or item.get("uploader", "")
+        artist = "" if self._is_live(item) else (self._guess_artist(item) or item.get("uploader", ""))
         self.now_artist_lbl.set_text(artist)
         self.now_artist_btn.set_sensitive(bool(artist))
         self.now_artist_btn.set_opacity(1.0 if artist else 0.0)
+        self._refresh_music_controls(item)
         self._refresh_hearts()
 
     def _current_item(self):
@@ -4325,8 +4548,11 @@ class MusicPlayerApp(Gtk.Window):
         return False
 
     def _on_main_page_changed(self, stack, _pspec):
-        if self._fav_dirty and stack.get_visible_child_name() == "favorites":
+        name = stack.get_visible_child_name()
+        if self._fav_dirty and name == "favorites":
             self.render_favorites()
+        if name == "queue":
+            self._on_queue_visibility()      # monta a lista (em lotes) só quando a página aparece
 
     def _favorites_items_for_action(self):
         rows = self.favorites_list.get_selected_rows()
@@ -4402,12 +4628,12 @@ class MusicPlayerApp(Gtk.Window):
         item_q.connect("activate", lambda w: self.add_items_bulk(sel))
         item_pl = Gtk.MenuItem(label="Adicionar à Playlist")
         item_pl.connect("activate", lambda w: self.on_add_selection_to_playlist(items_to_add=sel))
-        item_dl = Gtk.MenuItem(label="Baixar")
-        item_dl.connect("activate", lambda w: self.on_download(None))
+        item_dl = self._download_menu_item(sel)
         item_rm = Gtk.MenuItem(label="Remover das Favoritas")
         item_rm.connect("activate", lambda w: self.set_favorites(sel, False))
         for it in (item_play, item_q, self._radio_menu_item(row.item), item_pl, item_dl, Gtk.SeparatorMenuItem(), item_rm):
-            menu.append(it)
+            if it is not None:
+                menu.append(it)
         menu.show_all()
         menu.popup_at_pointer(event)
         return True
@@ -4573,6 +4799,28 @@ class MusicPlayerApp(Gtk.Window):
         lbl.set_markup(f"<b>{GLib.markup_escape_text(text)}</b>")
         return lbl
 
+    @staticmethod
+    def _fmt_long(seconds):
+        """Duração por extenso: 45 s, 12 min, 3 h 05 min."""
+        seconds = int(seconds or 0)
+        if seconds < 60:
+            return f"{seconds} s"
+        m = seconds // 60
+        if m < 60:
+            return f"{m} min"
+        h, m = divmod(m, 60)
+        return f"{h} h {m:02d} min"
+
+    def _open_url(self, url):
+        try:
+            Gtk.show_uri_on_window(self, url, Gdk.CURRENT_TIME)
+        except Exception:
+            try:
+                subprocess.Popen(["xdg-open", url], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            except Exception as e:
+                self.mostrar_mensagem(f"Não foi possível abrir o link: {e}")
+
     def _fmt_duration(self, seconds):
         if not seconds:
             return "0:00"
@@ -4664,52 +4912,324 @@ class MusicPlayerApp(Gtk.Window):
 
     # ---------- Gerenciamento de Playlists ----------
     def render_playlists(self):
-        for child in list(self.playlists_list.get_children()):
-            self.playlists_list.remove(child)
-
-        for pl_name in sorted(self.playlists.keys()):
-            row = Gtk.ListBoxRow()
-            lbl = Gtk.Label(label=f"🎵 {pl_name}", xalign=0)
-            lbl.set_margin_start(6)
-            lbl.set_margin_top(4)
-            lbl.set_margin_bottom(4)
-            row.add(lbl)
-            row.pl_name = pl_name
-            row.pl_key = self._norm_key(pl_name)
-            self.playlists_list.add(row)
-
-        self.playlists_list.show_all()
+        """Marca a página Minhas Playlists como desatualizada (remonta já, se estiver aberta)."""
+        self._pl_page_dirty = True
+        if self._current_view() == "playlists":
+            self._render_playlists_page()
         self._render_home_tiles()
 
-    def _playlist_filter_func(self, row, *_args):
-        key = self._pl_filter_key
-        return (not key) or key in getattr(row, "pl_key", "")
+    def _playlist_totals(self, tracks):
+        secs = 0
+        for t in tracks:
+            if isinstance(t, dict):
+                secs += _clock_to_seconds(t.get("duration"))
+        return len(tracks), secs
+
+    def _build_page_playlists(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.set_border_width(20)
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        title = Gtk.Label(xalign=0)
+        title.set_markup('<span size="xx-large" weight="bold">Minhas Playlists</span>')
+        head.pack_start(title, True, True, 0)
+        btn_from_queue = Gtk.Button(label="Salvar a fila atual")
+        btn_from_queue.set_tooltip_text("Cria uma playlist com as músicas que estão na fila")
+        btn_from_queue.connect("clicked", self.on_save_queue_as_playlist)
+        head.pack_end(btn_from_queue, False, False, 0)
+        btn_new = Gtk.Button(label="+ Nova playlist")
+        btn_new.get_style_context().add_class("suggested-action")
+        btn_new.connect("clicked", self.on_create_playlist_dialog)
+        head.pack_end(btn_new, False, False, 0)
+        page.pack_start(head, False, False, 0)
+
+        self.pl_summary = Gtk.Label(xalign=0)
+        self.pl_summary.get_style_context().add_class("dim-label")
+        page.pack_start(self.pl_summary, False, False, 0)
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.pl_filter_entry = Gtk.SearchEntry()
+        self.pl_filter_entry.set_placeholder_text("Filtrar playlists pelo nome...")
+        self.pl_filter_entry.set_width_chars(30)
+        self.pl_filter_entry.connect("search-changed", self.on_playlist_filter_changed)
+        self.pl_filter_entry.connect("stop-search", lambda e: e.set_text(""))
+        bar.pack_start(self.pl_filter_entry, False, False, 0)
+        sort_lbl = Gtk.Label(label="Ordenar por")
+        sort_lbl.get_style_context().add_class("dim-label")
+        bar.pack_start(sort_lbl, False, False, 6)
+        self.pl_sort_combo = Gtk.ComboBoxText()
+        for label, _key in PLAYLIST_SORTS:
+            self.pl_sort_combo.append_text(label)
+        self.pl_sort_combo.set_active(0)
+        self.pl_sort_combo.connect("changed", self.on_playlist_sort_changed)
+        bar.pack_start(self.pl_sort_combo, False, False, 0)
+        page.pack_start(bar, False, False, 0)
+
+        self.pl_stack = Gtk.Stack()
+        self.pl_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.pl_flow = Gtk.FlowBox()
+        self.pl_flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.pl_flow.set_homogeneous(True)
+        self.pl_flow.set_min_children_per_line(1)
+        self.pl_flow.set_max_children_per_line(10)
+        self.pl_flow.set_column_spacing(10)
+        self.pl_flow.set_row_spacing(10)
+        self.pl_flow.set_valign(Gtk.Align.START)
+        self.pl_flow.set_halign(Gtk.Align.START)
+        self.pl_flow.set_filter_func(lambda ch: (not self._pl_filter_key) or self._pl_filter_key in ch.pl_key)
+        self.pl_flow.set_sort_func(self._playlist_sort_func)
+        scroll.add(self.pl_flow)
+        self.pl_stack.add_named(scroll, "grid")
+
+        empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        empty.set_valign(Gtk.Align.CENTER)
+        empty.set_halign(Gtk.Align.CENTER)
+        ic = Gtk.Image.new_from_icon_name("view-list-symbolic", Gtk.IconSize.DIALOG)
+        ic.set_pixel_size(64)
+        ic.get_style_context().add_class("dim-label")
+        empty.pack_start(ic, False, False, 0)
+        et = Gtk.Label(xalign=0.5)
+        et.set_markup("<b>Nenhuma playlist ainda</b>")
+        empty.pack_start(et, False, False, 0)
+        es = Gtk.Label(label="Crie uma agora, ou salve a fila atual, ou use + Playlist\nem qualquer lista de músicas.")
+        es.set_justify(Gtk.Justification.CENTER)
+        es.get_style_context().add_class("dim-label")
+        empty.pack_start(es, False, False, 0)
+        eb = Gtk.Button(label="+ Nova playlist")
+        eb.set_halign(Gtk.Align.CENTER)
+        eb.get_style_context().add_class("suggested-action")
+        eb.connect("clicked", self.on_create_playlist_dialog)
+        empty.pack_start(eb, False, False, 4)
+        self.pl_stack.add_named(empty, "empty")
+        page.pack_start(self.pl_stack, True, True, 0)
+        return page
+
+    def _playlist_sort_func(self, a, b):
+        mode = self._pl_sort
+        def key(c):
+            if mode == "count":
+                return (-c.pl_count, c.pl_key)
+            if mode == "dur":
+                return (-c.pl_secs, c.pl_key)
+            if mode == "new":
+                return (-c.pl_idx, c.pl_key)
+            return (c.pl_key,)
+        ka, kb = key(a), key(b)
+        return (ka > kb) - (ka < kb)
 
     def on_playlist_filter_changed(self, entry):
         self._pl_filter_key = self._norm_key(entry.get_text())
-        self.playlists_list.invalidate_filter()
+        self.pl_flow.invalidate_filter()
 
-    def on_playlist_selected(self, listbox, row):
-        if not row:
+    def on_playlist_sort_changed(self, combo):
+        i = combo.get_active()
+        if 0 <= i < len(PLAYLIST_SORTS):
+            self._pl_sort = PLAYLIST_SORTS[i][1]
+            self.pl_flow.invalidate_sort()
+
+    def _render_playlists_page_if_dirty(self):
+        if self._pl_page_dirty:
+            self._render_playlists_page()
+
+    def _render_playlists_page(self):
+        self._pl_page_dirty = False
+        self._clear(self.pl_flow)
+        tot_tracks = tot_secs = 0
+        for idx, (name, tracks) in enumerate(self.playlists.items()):
+            n, secs = self._playlist_totals(tracks)
+            tot_tracks += n
+            tot_secs += secs
+            self.pl_flow.add(self._playlist_card(name, tracks, n, secs, idx))
+        self.pl_flow.show_all()
+        np_ = len(self.playlists)
+        if np_:
+            self.pl_summary.set_text(
+                f"{np_} {'playlist' if np_ == 1 else 'playlists'} · {tot_tracks} {'faixa' if tot_tracks == 1 else 'faixas'}"
+                + (f" · {self._fmt_long(tot_secs)} de música" if tot_secs else ""))
+        else:
+            self.pl_summary.set_text("Suas coleções de músicas ficam aqui.")
+        self.pl_stack.set_visible_child_name("grid" if np_ else "empty")
+        self.pl_flow.invalidate_filter()
+        self.pl_flow.invalidate_sort()
+
+    def _playlist_card(self, name, tracks, n, secs, idx):
+        child = Gtk.FlowBoxChild()
+        child.pl_name, child.pl_key = name, self._norm_key(name)
+        child.pl_count, child.pl_secs, child.pl_idx = n, secs, idx
+
+        COVER = 136
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_border_width(6)
+        box.pack_start(self._playlist_cover(tracks, COVER), False, False, 0)
+        t = Gtk.Label(xalign=0)
+        t.set_ellipsize(3)
+        t.set_width_chars(14)
+        t.set_max_width_chars(16)
+        t.set_markup(f"<b>{GLib.markup_escape_text(name)}</b>")
+        box.pack_start(t, False, False, 0)
+        sub = f"{n} {'faixa' if n == 1 else 'faixas'}" + (f" · {self._fmt_long(secs)}" if secs else "")
+        sl = Gtk.Label(label=sub, xalign=0)
+        sl.set_ellipsize(3)
+        sl.set_max_width_chars(18)
+        sl.get_style_context().add_class("dim-label")
+        box.pack_start(sl, False, False, 0)
+
+        card = Gtk.Button()
+        card.set_relief(Gtk.ReliefStyle.NONE)
+        card.set_focus_on_click(False)
+        card.add(box)
+        card.set_tooltip_text(f"{name}\nClique para abrir · botão direito para opções")
+        card.connect("clicked", lambda b, nm=name: self._open_playlist(nm))
+        card.connect("button-press-event", self._on_playlist_card_press, name)
+
+        ov = Gtk.Overlay()
+        ov.add(card)
+        play = Gtk.Button.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON)
+        play.get_style_context().add_class("suggested-action")
+        play.get_style_context().add_class("circular")
+        play.set_halign(Gtk.Align.END)
+        play.set_valign(Gtk.Align.START)
+        play.set_margin_top(6 + COVER - 40)
+        play.set_margin_end(12)
+        play.set_tooltip_text("Tocar playlist")
+        play.set_sensitive(n > 0)
+        play.connect("clicked", lambda b, nm=name: self._play_playlist_by_name(nm))
+        ov.add_overlay(play)
+        child.add(ov)
+        return child
+
+    def _playlist_cover(self, tracks, size):
+        """Mosaico 2x2 com as capas das 4 primeiras faixas distintas; 1 capa grande se houver menos de 4."""
+        picks, seen = [], set()
+        for t in tracks:
+            if not isinstance(t, dict) or self._is_live(t):
+                continue
+            k = self._track_key(t)
+            if k in seen or not (t.get("path") or t.get("id")):
+                continue
+            seen.add(k)
+            picks.append(t)
+            if len(picks) == 4:
+                break
+        grid = Gtk.Grid()
+        grid.set_size_request(size, size)
+        grid.set_halign(Gtk.Align.CENTER)
+        if len(picks) >= 4:
+            half = size // 2
+            for t, (cx, cy) in zip(picks, ((0, 0), (1, 0), (0, 1), (1, 1))):
+                img = Gtk.Image.new_from_icon_name("audio-x-generic-symbolic", Gtk.IconSize.DND)
+                img.set_size_request(half, half)
+                grid.attach(img, cx, cy, 1, 1)
+                self._submit_art(self._load_square_into, t, img, half)
+        else:
+            img = Gtk.Image.new_from_icon_name("audio-x-generic-symbolic", Gtk.IconSize.DIALOG)
+            img.set_pixel_size(48)
+            img.set_size_request(size, size)
+            grid.attach(img, 0, 0, 1, 1)
+            if picks:
+                self._submit_art(self._load_square_into, picks[0], img, size)
+        return grid
+
+    def _load_square_into(self, item, image, side):
+        """Capa recortada em quadrado (centro) e redimensionada — usada no mosaico das playlists."""
+        try:
+            if item.get("path"):
+                data, _ = self._local_cover_cached(item)
+            else:
+                url = f"https://i.ytimg.com/vi/{item['id']}/mqdefault.jpg"
+                data = self._art_cache.get(url)
+                if data is None:
+                    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                    with urllib.request.urlopen(req, timeout=6) as resp:
+                        data = resp.read()
+                    while len(self._art_cache) >= 300:
+                        try:
+                            del self._art_cache[next(iter(self._art_cache))]
+                        except (StopIteration, KeyError, RuntimeError):
+                            break
+                    self._art_cache[url] = data
+            if not data:
+                return
+            loader = GdkPixbuf.PixbufLoader()
+            loader.write(data)
+            loader.close()
+            pb = loader.get_pixbuf()
+            w, h = pb.get_width(), pb.get_height()
+            side_px = min(w, h)
+            pb = pb.new_subpixbuf((w - side_px) // 2, (h - side_px) // 2, side_px, side_px)
+            pb = pb.scale_simple(side, side, GdkPixbuf.InterpType.BILINEAR)
+            GLib.idle_add(image.set_from_pixbuf, pb)
+        except Exception:
+            pass
+
+    def _on_playlist_card_press(self, btn, event, name):
+        if event.button != 3 or event.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        menu = Gtk.Menu()
+        entries = (
+            ("Abrir", lambda w: self._open_playlist(name)),
+            ("Tocar", lambda w: self._play_playlist_by_name(name)),
+            ("Tocar em ordem aleatória", lambda w: self._play_playlist_by_name(name, shuffle=True)),
+            ("Adicionar à fila", lambda w: self._append_playlist_by_name(name)),
+            None,
+            ("Duplicar", lambda w: self._duplicate_playlist(name)),
+            ("Renomear", lambda w: self._rename_playlist(name)),
+            None,
+            ("Excluir", lambda w: self._delete_playlist_by_name(name)),
+        )
+        for e in entries:
+            if e is None:
+                menu.append(Gtk.SeparatorMenuItem())
+                continue
+            mi = Gtk.MenuItem(label=e[0])
+            mi.connect("activate", e[1])
+            menu.append(mi)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
+
+    def _duplicate_playlist(self, name):
+        tracks = self.playlists.get(name)
+        if tracks is None:
             return
-        self._open_playlist(row.pl_name)
+        new, i = f"{name} (cópia)", 2
+        while new in self.playlists:
+            new, i = f"{name} (cópia {i})", i + 1
+        self.playlists[new] = [dict(t) for t in tracks]
+        self._save_json(PLAYLISTS_FILE, self.playlists)
+        self.render_playlists()
+        self.show_toast(f"Playlist duplicada como '{new}'.")
+
+    def _refresh_playlist_header(self):
+        name = self.selected_playlist
+        if not name or name not in self.playlists:
+            self.pl_title_label.set_markup("<b>Selecione uma Playlist</b>")
+            self.pl_meta_label.set_text("")
+            return
+        tracks = self.playlists[name]
+        n, secs = self._playlist_totals(tracks)
+        self.pl_title_label.set_markup(
+            f'<span size="xx-large" weight="bold">{GLib.markup_escape_text(name)}</span>')
+        off = sum(1 for t in tracks if isinstance(t, dict) and t.get("path"))
+        meta = f"{n} {'faixa' if n == 1 else 'faixas'}"
+        if secs:
+            meta += f" · {self._fmt_long(secs)}"
+        if off:
+            meta += f" · {off} offline"
+        self.pl_meta_label.set_text(meta)
 
     def render_playlist_tracks(self):
         for child in list(self.pl_tracks_list.get_children()):
             self.pl_tracks_list.remove(child)
 
+        self._refresh_playlist_header()
         if not self.selected_playlist or self.selected_playlist not in self.playlists:
-            self.pl_title_label.set_markup("<b>Selecione uma Playlist</b>")
             return
-
-        tracks = self.playlists[self.selected_playlist]
-        title_txt = f"{self.selected_playlist}  ·  {len(tracks)} faixas"
-        self.pl_title_label.set_markup(f'<span size="xx-large" weight="bold">{GLib.markup_escape_text(title_txt)}</span>')
-
-        for i, item in enumerate(tracks):
-            row = self._create_playlist_track_row(i, item)
-            self.pl_tracks_list.add(row)
-
+        for i, item in enumerate(self.playlists[self.selected_playlist]):
+            self.pl_tracks_list.add(self._create_playlist_track_row(i, item))
         self.pl_tracks_list.show_all()
 
     def _create_playlist_track_row(self, i, item):
@@ -4747,8 +5267,7 @@ class MusicPlayerApp(Gtk.Window):
                 item = tracks[i]
                 lbl = child.get_child().get_children()[0]
                 lbl.set_text(f"{i+1}. {item['title']} ({item.get('duration','')})")
-        title_txt = f"{self.selected_playlist}  ·  {len(tracks)} faixas"
-        self.pl_title_label.set_markup(f'<span size="xx-large" weight="bold">{GLib.markup_escape_text(title_txt)}</span>')
+        self._refresh_playlist_header()
 
     def on_create_playlist_dialog(self, button=None):
         dialog = Gtk.MessageDialog(
@@ -4805,7 +5324,7 @@ class MusicPlayerApp(Gtk.Window):
             self.render_playlists()
             self.show_toast(f"Fila salva como '{name}'!")
 
-    def _play_playlist_by_name(self, name):
+    def _play_playlist_by_name(self, name, shuffle=False):
         tracks = self.playlists.get(name)
         if tracks is None:
             return
@@ -4814,11 +5333,13 @@ class MusicPlayerApp(Gtk.Window):
             return
         self.stop_radio(notify=False)
         self.queue = list(tracks)
+        if shuffle:
+            random.shuffle(self.queue)
         self._save_queue()
         self.render_queue()
         self.current_index = 0
         self.play_current()
-        self.show_toast(f"Tocando playlist: {name}")
+        self.show_toast(f"Tocando playlist: {name}" + (" (aleatório)" if shuffle else ""))
 
     def _append_playlist_by_name(self, name):
         tracks = self.playlists.get(name)
@@ -4838,10 +5359,10 @@ class MusicPlayerApp(Gtk.Window):
         self._save_json(PLAYLISTS_FILE, self.playlists)
         if self.selected_playlist == name:
             self.selected_playlist = None
-        self.render_playlists()
         self.render_playlist_tracks()
         if self._current_view() == "playlist":
-            self.go_back() if self._nav_history else self.navigate("home")
+            self.navigate("playlists")
+        self.render_playlists()
         self.show_toast("Playlist excluída.")
 
     def _rename_playlist(self, name):
@@ -4879,10 +5400,6 @@ class MusicPlayerApp(Gtk.Window):
         self._save_json(PLAYLISTS_FILE, self.playlists)
         self.render_playlists()
         self.render_playlist_tracks()
-        for row in self.playlists_list.get_children():
-            if getattr(row, "pl_name", None) == self.selected_playlist:
-                self.playlists_list.select_row(row)
-                break
         self.show_toast(f"Playlist renomeada para '{new_name}'")
 
     def on_play_entire_playlist(self, button):
@@ -4896,33 +5413,6 @@ class MusicPlayerApp(Gtk.Window):
     def on_delete_current_playlist(self, button):
         if self.selected_playlist:
             self._delete_playlist_by_name(self.selected_playlist)
-
-    def on_playlists_button_press(self, widget, event):
-        """Botão direito em 'Suas Playlists': tocar, adicionar à fila, renomear, excluir."""
-        if event.button != 3:
-            return False
-        row = widget.get_row_at_y(int(event.y))
-        if row is None or not hasattr(row, "pl_name"):
-            return False
-        widget.select_row(row)
-        self.selected_playlist = row.pl_name
-        self.render_playlist_tracks()
-        name = row.pl_name
-
-        menu = Gtk.Menu()
-        item_play = Gtk.MenuItem(label="Tocar playlist")
-        item_play.connect("activate", lambda w: self._play_playlist_by_name(name))
-        item_queue = Gtk.MenuItem(label="Adicionar à fila")
-        item_queue.connect("activate", lambda w: self._append_playlist_by_name(name))
-        item_rename = Gtk.MenuItem(label="Renomear")
-        item_rename.connect("activate", lambda w: self._rename_playlist(name))
-        item_delete = Gtk.MenuItem(label="Excluir")
-        item_delete.connect("activate", lambda w: self._delete_playlist_by_name(name))
-        for it in (item_play, item_queue, item_rename, Gtk.SeparatorMenuItem(), item_delete):
-            menu.append(it)
-        menu.show_all()
-        menu.popup_at_pointer(event)
-        return True
 
     def on_pl_track_activated(self, listbox, row):
         if hasattr(row, "item"):
@@ -4939,11 +5429,12 @@ class MusicPlayerApp(Gtk.Window):
             item_play.connect("activate", lambda w: self.play_item(row.item))
             item_add_q = Gtk.MenuItem(label="Adicionar à Fila")
             item_add_q.connect("activate", lambda w: self.add_to_queue(row.item))
-            item_dl = Gtk.MenuItem(label="Baixar")
-            item_dl.connect("activate", lambda w: self.on_download(None))
-            item_like = self._like_menu_item([r.item for r in widget.get_selected_rows() if hasattr(r, "item")])
+            sel_items = [r.item for r in widget.get_selected_rows() if hasattr(r, "item")]
+            item_dl = self._download_menu_item(sel_items)
+            item_like = self._like_menu_item(sel_items)
             for it in (item_play, item_add_q, self._radio_menu_item(row.item), item_like, item_dl):
-                menu.append(it)
+                if it is not None:
+                    menu.append(it)
             menu.show_all()
             menu.popup_at_pointer(event)
             return True
@@ -4961,6 +5452,8 @@ class MusicPlayerApp(Gtk.Window):
         self.search_spinner.start()
         self.mostrar_mensagem("Buscando...")
         self.navigate("search")
+        self._lib_hits = []
+        self.lib_results_status.set_text("")
         self._apply_search_filter()
         is_link = query.startswith(("http://", "https://"))
         self.search_status.set_text("Resultados para “%s”" % query if not is_link else "Link colado")
@@ -4973,6 +5466,7 @@ class MusicPlayerApp(Gtk.Window):
             self.search_albums_flow.show_all()
         else:
             threading.Thread(target=self._search_catalog_thread, args=(query, current_token), daemon=True).start()
+            self._search_library_start(query, current_token)
 
         for child in list(self.results_list.get_children()):
             self.results_list.remove(child)
@@ -5162,7 +5656,7 @@ class MusicPlayerApp(Gtk.Window):
     # ---------- Fila e Histórico (Renderizações Otimizadas) ----------
     def _queue_panel_open(self):
         try:
-            return bool(self.side_revealer.get_reveal_child()) and self.side_stack.get_visible_child_name() == "queue"
+            return self.main_stack.get_visible_child_name() == "queue"
         except Exception:
             return True
 
@@ -5352,8 +5846,10 @@ class MusicPlayerApp(Gtk.Window):
         self.stop_radio(notify=False)
         self._save_queue()
         self.current_index = -1
+        self._resume = None
         self.mpv.stop()
         self._set_mpv_idle(True)
+        self._refresh_music_controls(None)
         self.render_queue()
 
     def on_queue_activated(self, listbox, row):
@@ -5541,11 +6037,11 @@ class MusicPlayerApp(Gtk.Window):
             item_pl.connect("activate", lambda w: self.on_add_selection_to_playlist(items_to_add=[r.item for r in widget.get_selected_rows()]))
             item_del = Gtk.MenuItem(label="Excluir Selecionadas")
             item_del.connect("activate", lambda w: self.on_delete_selected_queue(None))
-            item_dl = Gtk.MenuItem(label="Baixar Selecionadas")
-            item_dl.connect("activate", lambda w: self.on_download(None))
+            item_dl = self._download_menu_item([r.item for r in widget.get_selected_rows()], "Baixar Selecionadas")
             item_like = self._like_menu_item([r.item for r in widget.get_selected_rows()])
             for it in (item_play, self._radio_menu_item(row.item), item_pl, item_like, item_del, item_dl):
-                menu.append(it)
+                if it is not None:
+                    menu.append(it)
             menu.show_all()
             menu.popup_at_pointer(event)
             return True
@@ -5601,7 +6097,8 @@ class MusicPlayerApp(Gtk.Window):
             item_pl.connect("activate", lambda w: self.on_add_selection_to_playlist(items_to_add=[r.item for r in widget.get_selected_rows()]))
             item_like = self._like_menu_item([r.item for r in widget.get_selected_rows()])
             for it in (item_play, item_add_q, self._radio_menu_item(row.item), item_pl, item_like):
-                menu.append(it)
+                if it is not None:
+                    menu.append(it)
             menu.show_all()
             menu.popup_at_pointer(event)
             return True
@@ -6358,7 +6855,7 @@ class MusicPlayerApp(Gtk.Window):
 
     # ---------- Aba Wiki (Com Cancelamento) ----------
     def on_wiki_use_current(self, button):
-        if 0 <= self.current_index < len(self.queue):
+        if 0 <= self.current_index < len(self.queue) and not self._is_live(self.queue[self.current_index]):
             name = self._guess_artist(self.queue[self.current_index])
             if name:
                 self.wiki_entry.set_text(name)
@@ -6785,6 +7282,8 @@ class MusicPlayerApp(Gtk.Window):
             return
         self._missing_skips = 0
         self._radio_pending_next = False
+        self._resume = None                 # tocou algo: a faixa restaurada na abertura não vale mais
+        self._remember_last_played()
 
         self._play_token += 1
         self._track_started = False
@@ -6996,6 +7495,7 @@ class MusicPlayerApp(Gtk.Window):
 
     def on_mpv_time_change(self, pos):
         self._mpris_pos = pos or 0
+        self._stats_tick()
         if pos and self.track_duration and self.track_duration - pos <= PRELOAD_MAX_S:
             self.on_mpv_time_remaining(self.track_duration - pos)     # pré-carregamento da próxima faixa (gapless)
         if pos and pos > 0.5 and not self._track_started:
@@ -7006,12 +7506,14 @@ class MusicPlayerApp(Gtk.Window):
             sec = int(pos)
             if sec != getattr(self, "_shown_sec", None):   # texto só muda 1x por segundo
                 self._shown_sec = sec
-                self.time_label.set_text(f"{self._fmt_duration(pos)} / {self._fmt_duration(self.track_duration)}")
+                self.time_cur_label.set_text(self._fmt_duration(pos))
+                self.time_dur_label.set_text(self._fmt_duration(self.track_duration))
         return False
 
     def on_mpv_duration_change(self, duration):
         self.track_duration = duration or 0
         self.seek_scale.set_range(0, max(float(duration or 0), 1.0))
+        self.time_dur_label.set_text(self._fmt_duration(self.track_duration))
         self._shown_sec = None
         self._mpris_notify("Metadata")
         return False
@@ -7064,14 +7566,98 @@ class MusicPlayerApp(Gtk.Window):
         self.btn_playpause.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.LARGE_TOOLBAR))
         return False
 
+    # ---------- Retomar a última faixa ao reabrir o app ----------
+    def _remember_last_played(self, schedule=True):
+        """Guarda no config (barato: 1 chave pequena, gravação com atraso) qual faixa da fila está atual."""
+        item = self._current_item()
+        value = {"key": track_key(item), "idx": self.current_index} if item else None
+        if value == self.config.get("last_played"):
+            return
+        if value is None:
+            self.config.pop("last_played", None)
+        else:
+            self.config["last_played"] = value
+        if schedule:
+            self._schedule_config_save()
+
+    def _resume_index(self):
+        """Índice, na fila atual, da faixa restaurada na abertura; None se não houver ou se saiu da fila."""
+        r = getattr(self, "_resume", None)
+        if not r:
+            return None
+        i = r.get("idx", -1)
+        if 0 <= i < len(self.queue) and track_key(self.queue[i]) == r.get("key"):
+            return i
+        for j, t in enumerate(self.queue):          # a fila mudou de ordem: acha pela chave da faixa
+            if track_key(t) == r.get("key"):
+                return j
+        return None
+
+    def _restore_last_played(self):
+        """Ao abrir: mostra no player a faixa que tocava ao fechar (parada, sem baixar nada).
+        O play toca ESSA faixa, em vez de recomeçar a fila pela primeira."""
+        lp = self.config.get("last_played")
+        if not isinstance(lp, dict) or not self.queue:
+            return
+        try:
+            self._resume = {"idx": int(lp.get("idx", -1)), "key": str(lp.get("key") or "")}
+        except (TypeError, ValueError):
+            self._resume = None
+            return
+        idx = self._resume_index()
+        if idx is None:
+            self._resume = None
+            return
+        self.current_index = idx
+        item = self.queue[idx]
+        self.now_playing_label.set_text(item["title"])
+        dur = str(item.get("duration") or "")
+        if re.match(r"^\d+(:\d{2}){1,2}$", dur):
+            self.time_cur_label.set_text("0:00")
+            self.time_dur_label.set_text(dur)
+        self._update_now_playing_card(item)
+        self._mpris_notify("Metadata", "CanGoNext", "CanGoPrevious")
+        GLib.timeout_add(1500, self._restore_cover, item)     # depois que a interface assentou
+
+    def _restore_cover(self, item):
+        if self._play_token == 0 and not self._closing:
+            threading.Thread(target=self._restore_cover_thread, args=(item,), daemon=True).start()
+        return False
+
+    def _restore_cover_thread(self, item):
+        """Capa da faixa restaurada: sem notificação e sem tocar nada."""
+        try:
+            if item.get("path"):
+                data, _ = self._local_cover_cached(item)
+                size = (48, 48)
+            elif self._is_live(item):
+                fav = item.get("favicon") or ""
+                if not fav.startswith(("http://", "https://")):
+                    return
+                data, size = None, (48, 48)
+                req = urllib.request.Request(fav, headers={"User-Agent": USER_AGENT})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = resp.read(2_000_000)
+            else:
+                size = (64, 48)
+                req = urllib.request.Request(f"https://i.ytimg.com/vi/{item['id']}/mqdefault.jpg",
+                                             headers={"User-Agent": USER_AGENT})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = resp.read()
+            if data and self._play_token == 0:         # se já tocou algo, quem manda é a nova faixa
+                GLib.idle_add(self.thumbnail_img.set_from_pixbuf, self._decode_scaled(data, *size))
+        except Exception:
+            pass
+
     def toggle_playback(self):
-        """Play/Pause: se nada está carregado, começa pela primeira faixa da fila."""
+        """Play/Pause: se nada está carregado, toca a faixa que estava tocando ao fechar (ou a primeira da fila)."""
         if self._mpv_idle:
             if not self.queue:
                 self.show_toast("Sua fila está vazia. Escolha ou adicione músicas para tocar.")
                 self.mostrar_mensagem("Escolha ou adicione músicas à fila para começar.")
                 return
-            self.current_index = 0
+            idx = self._resume_index()      # faixa que estava tocando ao fechar o app (se ainda está na fila)
+            self.current_index = idx if idx is not None else 0
             self.play_current()
             return
         self.mpv.pause_toggle()
@@ -7105,7 +7691,29 @@ class MusicPlayerApp(Gtk.Window):
     def _radio_key(self, t):
         return self._norm_key(t.get("title", "")) + "|" + self._norm_key(t.get("artist") or t.get("uploader") or "")
 
+    @staticmethod
+    def _is_live(item):
+        """Rádio web (transmissão ao vivo): sem download, letra, artista, álbum nem Mix."""
+        return bool(item) and bool(item.get("webradio") or item.get("stream_url"))
+
+    def _refresh_music_controls(self, item=None):
+        """Liga/desliga no player os recursos que só fazem sentido para músicas."""
+        if item is None:
+            item = self._current_item()
+        live = self._is_live(item)
+        self.btn_download_ctrl.set_sensitive(not live)
+        self.btn_download_ctrl.set_tooltip_text("Rádios ao vivo não podem ser baixadas" if live
+                                                else "Baixar a música que está tocando (MP3)")
+        self.btn_radio.set_sensitive(not live)
+        self.btn_radio.set_tooltip_text("O Mix não está disponível em rádios ao vivo" if live
+                                        else "Mix: continua tocando músicas parecidas com a faixa atual")
+        btn_lyr = getattr(self, "btn_reload_lyrics", None)
+        if btn_lyr is not None:
+            btn_lyr.set_visible(not live)
+
     def _radio_menu_item(self, item):
+        if self._is_live(item):
+            return None          # transmissão ao vivo não tem "músicas parecidas"
         mi = Gtk.MenuItem(label="Iniciar Mix da Faixa")
         mi.connect("activate", lambda w: self.start_radio(item))
         return mi
@@ -7134,6 +7742,10 @@ class MusicPlayerApp(Gtk.Window):
             if item is None:
                 self._radio_set_button(False)
                 self.mostrar_mensagem("Toque uma música primeiro, ou use o botão direito > Iniciar Mix da Faixa.")
+                return
+            if self._is_live(item):
+                self._radio_set_button(False)
+                self.show_toast("O Mix não está disponível em rádios ao vivo.")
                 return
             self.start_radio(item, play_now=False)
         else:
@@ -7479,7 +8091,7 @@ class MusicPlayerApp(Gtk.Window):
     def _selection_lists(self):
         return [self.results_list, self.queue_list, self.pl_tracks_list, self.history_list,
                 self.favorites_list, self.discover_tracks_list, self.offline_tracks_list,
-                self.webradio_list, self.mylib_list]
+                self.webradio_list, self.lib_results_list]
 
     def _wire_selection_tracking(self):
         """Só UMA lista mantém seleção por vez; a última em que você clicou é a 'ativa'.
@@ -7514,24 +8126,54 @@ class MusicPlayerApp(Gtk.Window):
         return []
 
     def on_download(self, button):
-        items = self.get_active_selection()
+        """Baixa a SELEÇÃO da lista ativa (itens 'Baixar' dos menus de contexto)."""
+        self._download_selection(self.get_active_selection(), getattr(self, "_active_list", None))
+
+    def on_download_list(self, button, listbox):
+        """Botão 'Baixar' dedicado de uma lista: age só nas linhas selecionadas DELA."""
+        items = [r.item for r in listbox.get_selected_rows() if hasattr(r, "item")]
+        self._download_selection(items, listbox)
+
+    def on_download_current(self, button=None):
+        """Botão de download do player: baixa a música que está tocando agora."""
+        item = self._current_item()
+        if item is None:
+            self.mostrar_mensagem("Nenhuma música tocando no momento.")
+            return
+        if self._is_live(item):
+            self.mostrar_mensagem("Rádios ao vivo não podem ser baixadas.")
+            return
+        if item.get("path"):
+            self.mostrar_mensagem("Esta música já está offline no seu computador.")
+            return
+        self._download_single_dialog(item)
+
+    def _download_selection(self, items, source=None):
         if not items:
             self.mostrar_mensagem("Selecione uma ou mais faixas para baixar.")
             return
-        online = [i for i in items if not i.get("path") and not i.get("webradio")]
+        online = [i for i in items if not i.get("path") and not self._is_live(i)]
         if not online:
             self.mostrar_mensagem("As faixas selecionadas já estão offline ou são rádios ao vivo (não baixáveis).")
             return
         if len(online) < len(items):
-            self.show_toast(f"{len(items) - len(online)} faixa(s) offline ignorada(s).")
+            self.show_toast(f"{len(items) - len(online)} faixa(s) offline ou rádio(s) ignorada(s).")
         items = online
-        if getattr(self, "_active_list", None) is self.discover_tracks_list:
+        if source is self.discover_tracks_list:
             self._download_dtracks(items)  # recomendadas ainda não têm id do YouTube
             return
         if len(items) == 1:
             self._download_single_dialog(items[0])
         else:
             self._download_bulk_dialog(items)
+
+    def _download_menu_item(self, items, label="Baixar"):
+        """Item 'Baixar' do menu de contexto; None quando só há rádios ao vivo na seleção."""
+        if items and all(self._is_live(i) for i in items):
+            return None
+        mi = Gtk.MenuItem(label=label)
+        mi.connect("activate", lambda w: self.on_download(None))
+        return mi
 
     def _download_single_dialog(self, item):
         item = self._normalize_track(item)
@@ -8072,7 +8714,7 @@ class MusicPlayerApp(Gtk.Window):
         else:
             greeting = "BEM-VINDO"
             title = APP_NAME
-            sub = "Defina seu nome em Sobre › Perfil de usuário para uma recepção personalizada."
+            sub = "Defina seu nome em Perfil para uma recepção personalizada."
 
         self.welcome_greeting.set_markup(f'<span size="small" weight="bold" letter_spacing="2048">{esc(greeting)}</span>')
         self.welcome_name.set_markup(f'<span size="xx-large" weight="bold">{esc(title)}</span>')
@@ -8165,42 +8807,65 @@ class MusicPlayerApp(Gtk.Window):
         btn_profile.set_image(Gtk.Image.new_from_icon_name("avatar-default-symbolic", Gtk.IconSize.BUTTON))
         btn_profile.set_always_show_image(True)
         btn_profile.set_halign(Gtk.Align.START)
-        btn_profile.connect("clicked", self.on_open_profile)
+        btn_profile.connect("clicked", lambda b: self.navigate("profile"))
 
         btn_installer = Gtk.Button(label="Atualizar ou desinstalar")
-        btn_installer.set_image(Gtk.Image.new_from_icon_name("system-software-update-symbolic", Gtk.IconSize.BUTTON))
+        btn_installer.set_image(Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON))
         btn_installer.set_always_show_image(True)
         btn_installer.set_tooltip_text("Abre o instalador: atualizar, diagnosticar problemas ou desinstalar")
         btn_installer.connect("clicked", self.on_open_installer)
+
+        btn_github = Gtk.Button(label="GitHub")
+        btn_github.set_image(Gtk.Image.new_from_icon_name("web-browser-symbolic", Gtk.IconSize.BUTTON))
+        btn_github.set_always_show_image(True)
+        btn_github.set_tooltip_text(f"Abrir {APP_URL} no navegador")
+        btn_github.connect("clicked", lambda b: self._open_url(APP_URL))
 
         btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_row.set_halign(Gtk.Align.START)
         btn_row.pack_start(btn_profile, False, False, 0)
         btn_row.pack_start(btn_installer, False, False, 0)
+        btn_row.pack_start(btn_github, False, False, 0)
         page.pack_start(btn_row, False, False, 4)
 
         # --- Visão geral ---
         page.pack_start(self._about_heading("Visão geral"), False, False, 0)
         page.pack_start(self._about_text(
             f"A {GLib.markup_escape_text(APP_NAME)} é uma biblioteca musical leve para desktop Linux. Busca faixas no YouTube, reproduz apenas o áudio, "
-            "organiza sua fila, playlists, favoritas e histórico, mostra letras, descobre artistas parecidos e exibe "
-            "biografia e discografia, tudo usando os widgets e o tema nativos do GTK, sem CSS customizado."
+            "organiza sua fila, playlists, favoritas e histórico, toca suas músicas offline e rádios web, mostra letras, descobre artistas parecidos, "
+            "exibe biografia e discografia e monta um perfil com as suas estatísticas de escuta, tudo usando os widgets e o tema nativos do GTK, sem CSS customizado."
         ), False, False, 0)
 
-        # --- Abas ---
-        page.pack_start(self._about_heading("Abas do aplicativo"), False, False, 0)
+        # --- Navegação ---
+        page.pack_start(self._about_heading("Navegação"), False, False, 0)
         for name, desc in (
-            ("Barra lateral", "Início, Favoritas, Recentes e Sobre, além das suas playlists sempre à mão (botão direito: tocar, renomear, excluir)."),
-            ("Início", "Vitrines: atalho para suas curtidas, o que tocou recentemente (duplo clique toca; botão direito abre o menu) e o \"Em alta\" por país (padrão: Brasil) com os artistas (duplo clique abre; botão direito: tocar populares, fila, mix, playlist) e as músicas mais ouvidas do ranking. Os cartões de artista da Busca e de \"Fãs também ouvem\", e todos os cartões de álbum, funcionam do mesmo jeito (um clique seleciona o cartão; duplo clique abre)."),
-            ("Busca", "Uma busca só para músicas (YouTube), artistas e álbuns (Deezer), com filtros Tudo / Músicas / Artistas / Álbuns."),
+            ("Barra superior", "Voltar (Alt+←) e a busca no centro (Enter ou clique na lupa). A busca também aceita um link: cole-o ali, ou use Ctrl+V em qualquer lugar do app, para tocá-lo na hora."),
+            ("Barra lateral", "Início, Fila de Reprodução, Recentes, Minhas Playlists, Favoritas, Músicas Offline, Rádios Web, Perfil, Corrigir e Atualizar a Fonoteca e Sobre. A página aberta fica destacada; Corrigir e Atualizar abre o instalador em vez de uma página."),
+            ("Início", "Vitrines: atalhos para suas curtidas, suas playlists e suas músicas offline, o que tocou recentemente (duplo clique toca; botão direito abre o menu) e o \"Em alta\" por país (padrão: Brasil) com os artistas (duplo clique abre; botão direito: tocar populares, fila, mix, playlist) e as músicas mais ouvidas do ranking. Os cartões de artista e de álbum funcionam do mesmo jeito em todo o app: um clique seleciona, duplo clique abre."),
+            ("Busca", "Uma busca só. Primeiro vem \"Na sua biblioteca\" (instantâneo, SQLite FTS5, em tudo que é seu: playlists, favoritas, recentes e músicas offline), depois as músicas (YouTube), os artistas e os álbuns (Deezer). Filtros: Tudo / Biblioteca / Músicas / Artistas / Álbuns. Em \"Tudo\" a biblioteca mostra os primeiros resultados; \"Ver todos\" (ou o filtro Biblioteca) mostra o resto."),
             ("Artista e álbuns", "Biografia, faixas populares, discografia em capas e artistas parecidos. Abra um álbum para ver e tocar as faixas."),
-            ("Mix", "Botão Mix no player (ou botão direito > Iniciar Mix da Faixa): a fila se abastece sozinha com músicas parecidas, sem fim. Usa o mix automático do YouTube e, se ele falhar, as músicas do artista no Deezer."),
-            ("Fila e Letra", "Painel que desliza à direita, aberto pelos botões do player: fila reordenável (clique e segure para arrastar uma ou várias faixas selecionadas; uma linha mostra onde vão ficar; ou use as setas) e letra da música atual."),
-            ("Rádios Web", "Estações de rádio online gratuitas (Radio-Browser): busque por país, gênero ou nome e ouça na hora."),
-            ("Buscar na Biblioteca", "Busca instantânea (SQLite FTS5) por título, artista ou álbum em tudo que é seu: playlists, favoritas, recentes e músicas offline."),
-            ("Equalizador (EQ)", "Botão EQ no player (ou Ctrl+E): 10 bandas de ±12 dB, presets Flat, Rock, Pop, Bass Boost, Vocal e Jazz, e a opção de reprodução sem pausa."),
-            ("Favoritas", "Curta músicas com o ♡ (ou tecla L): tocar tudo, aleatório, adicionar à fila ou salvar como playlist."),
+            ("Fila de Reprodução", "Fila reordenável (clique e segure para arrastar uma ou várias faixas selecionadas; uma linha mostra onde vão ficar; ou use as setas), com botões para salvar como playlist, baixar e excluir as selecionadas."),
             ("Recentes", f"Histórico das últimas {HISTORY_LIMIT} faixas tocadas."),
+            ("Minhas Playlists", "Tela própria com um cartão em mosaico de capas para cada playlist, resumo (playlists, faixas e duração total), filtro pelo nome e ordenação por nome, mais faixas, maior duração ou criação. Clique no cartão para abrir; o botão ▶ toca; botão direito: tocar, aleatório, fila, duplicar, renomear, excluir. Dentro da playlist: tocar, aleatório, fila, baixar as selecionadas, renomear, excluir e remover faixas. \"+ Playlist\" em qualquer lista, ou \"Salvar a fila atual\", cria e alimenta playlists."),
+            ("Favoritas", "Curta músicas e rádios com o ♡ (ou tecla L): tocar tudo, aleatório, adicionar à fila ou salvar como playlist."),
+            ("Músicas Offline", "Escolha uma pasta de músicas do computador: a Fonoteca indexa as tags (título, artista, álbum e capa), navega pelas pastas, toca a pasta com as subpastas, embaralha e adiciona à fila ou a playlists. \"Completar dados online\" preenche o que faltar. As faixas offline ganham um selo, usam a letra do próprio arquivo quando existe, e a pasta pode ser reindexada quando quiser."),
+            ("Rádios Web", "Estações ao vivo do Radio-Browser: busque por nome, país ou gênero (abre com as do Brasil). Dois cliques, ou o botão ▶, ouvem na hora; ♡ guarda a estação nas Favoritas; botão direito: fila ou playlist. O player mostra a estação e a música que está no ar, quando a rádio informa. Por serem transmissões ao vivo, rádios não têm download, letra, Mix, artista nem álbum: esses botões ficam desativados enquanto uma rádio toca."),
+            ("Perfil", "Seu nome (usado na saudação do Início), um nível que sobe conforme você ouve, números de escuta e de biblioteca, curiosidades, artistas, músicas e rádios mais ouvidos, gráficos de horários e dos últimos 14 dias, backup (exportar/importar), atalho para a pasta de dados e informações técnicas do sistema (versões do mpv, yt-dlp e ffmpeg, banco de dados). As estatísticas são calculadas só neste computador."),
+            ("Corrigir e Atualizar a Fonoteca", "Abre o instalador: atualizar, diagnosticar problemas ou desinstalar. Depois de atualizar, feche e reabra a Fonoteca."),
+            ("Sobre", "Esta página: o que o app faz, como foi feito, serviços usados, onde ficam os dados, atalhos e um botão para o GitHub do projeto."),
+        ):
+            page.pack_start(self._about_card(name, desc), False, False, 0)
+
+        # --- Player ---
+        page.pack_start(self._about_heading("Player"), False, False, 0)
+        for name, desc in (
+            ("Controles", "Na linha dos botões: ♥ curte a faixa, Letra, aleatório, anterior, play/pause, próxima, repetir a fila, Mix e download. Abaixo, o progresso (clique ou arraste para pular). À esquerda ficam a capa, o título e o botão do artista (abre a página dele); à direita, o equalizador e o volume. Ao reabrir o app, a última música aparece parada no player e o play retoma exatamente ela."),
+            ("Volume", "O ícone de alto-falante silencia e restaura (ou tecla M); a roda do mouse sobre ele, ou o controle deslizante, ajusta o volume."),
+            ("Mix", "Botão Mix no player (ou botão direito > Iniciar Mix da Faixa): a fila se abastece sozinha com músicas parecidas, sem fim. Usa o mix automático do YouTube e, se ele falhar, as músicas do artista no Deezer. Não funciona em rádios ao vivo."),
+            ("Letra", "Botão Letra: painel que desliza à direita com a letra da música atual, sem tirar você da página em que está. Usa a letra do arquivo nas músicas offline e a do LRCLIB nas demais."),
+            ("Equalizador (EQ)", "No player, acima do volume: interruptor liga/desliga e botão com o preset atual, que abre a janela do equalizador (ou Ctrl+E): 10 bandas de ±12 dB, presets Flat, Rock, Pop, Bass Boost, Vocal e Jazz, e a opção de reprodução sem pausa."),
+            ("Downloads", "O botão de download do player baixa a música que está tocando em MP3, com capa e tags. Para baixar várias, selecione-as e use o botão Baixar da lista ou o menu de botão direito. Rádios ao vivo e faixas que já estão offline não são baixadas."),
+            ("Teclas de mídia", "A Fonoteca se anuncia ao desktop (MPRIS): teclas de mídia, o widget de mídia do painel e as notificações mostram e controlam a faixa atual."),
         ):
             page.pack_start(self._about_card(name, desc), False, False, 0)
 
@@ -8214,6 +8879,7 @@ class MusicPlayerApp(Gtk.Window):
             ("Metadados limpos", "Cada resultado do YouTube é comparado com faixas do Deezer (palavras do título, artista e duração) para exibir título e artista corretos. Sem correspondência, o título é higienizado por expressões regulares.", "Deezer + regex"),
             ("Persistência", "Playlists, favoritas, histórico e o índice de faixas ficam num banco SQLite (library.db) com busca FTS5, gravado em segundo plano e só no que mudou. Fila e configurações seguem em JSON atômico (arquivo temporário + os.replace). Os .json antigos são importados sozinhos na 1ª abertura.", "SQLite + FTS5"),
             ("Áudio sem pausa", "Faltando ~15 s para o fim da faixa, o yt-dlp resolve a próxima em segundo plano e o mpv a recebe com loadfile append, encadeando sem silêncio. O equalizador usa filtros lavfi enviados por IPC (set_property af).", "gapless + lavfi"),
+            ("Estatísticas do perfil", "A cada segundo de reprodução contínua (pausas e saltos não contam) a Fonoteca soma o tempo por dia e por hora; uma reprodução é contada depois de cerca de 30 s ouvidos, ou da metade de uma faixa curta. Tudo é gravado em stats.json, de forma agrupada e sem enviar nada à internet.", "stats.json"),
             ("Downloads", "Áudio extraído e convertido para MP3 na melhor qualidade pelo yt-dlp, com progresso lido da saída do processo. Capa do álbum, artista, álbum, ano, nº da faixa e gênero (Deezer) são gravados como tags ID3 no arquivo.", "yt-dlp + ffmpeg"),
         ):
             page.pack_start(self._about_card(name, desc, tag), False, False, 0)
@@ -8225,7 +8891,7 @@ class MusicPlayerApp(Gtk.Window):
             ("Deezer API", "Refino de metadados na busca, álbum/ano/capa da aba Letra, busca de artistas, artistas relacionados, faixas mais populares, discografia, faixas de cada álbum e os rankings por país (playlists oficiais \"Top <país>\" do Deezer Charts). Uso não comercial.", "api.deezer.com"),
             ("LRCLIB", "Fonte das letras. Usa a letra simples ou, se não houver, a sincronizada sem os marcadores de tempo.", "lrclib.net"),
             ("Wikipédia (pt/en)", "Biografia do artista (texto sob licença CC BY-SA 4.0). Tenta primeiro a versão em português; se não achar, usa a inglesa. Só aceita páginas de músicos e bandas.", "wikipedia.org"),
-            ("Radio-Browser", "Diretório aberto de rádios web: busca por país, gênero e nome, e o endereço do stream. Uso gratuito, sem chave.", "api.radio-browser.info"),
+            ("Radio-Browser", "Diretório aberto de rádios web: busca por país, gênero e nome, e o endereço do stream. Ao ouvir uma estação, o app avisa o diretório (contagem de cliques, usada no ranking de popularidade). Uso gratuito, sem chave.", "api.radio-browser.info"),
             ("YouTube (via yt-dlp)", "Busca de vídeos e stream de áudio. As miniaturas da faixa atual vêm do servidor de imagens do YouTube.", "youtube.com · i.ytimg.com"),
         ) + TRANSLATE_CARDS:
             page.pack_start(self._about_card(name, desc, tag), False, False, 0)
@@ -8249,10 +8915,13 @@ class MusicPlayerApp(Gtk.Window):
             ("queue.json", "Fila de reprodução."),
             ("*.json.bak", "Cópias dos antigos playlists/favorites/history.json, deixadas após a migração para o SQLite."),
             ("profile.json", "Nome de usuário."),
+            ("stats.json", "Estatísticas de escuta do Perfil (tempo, mais ouvidas, horários). Fica só neste computador."),
+            ("library.json", "Índice das tags da pasta de músicas offline."),
+            ("covers/", "Capas extraídas dos arquivos locais."),
         ):
             page.pack_start(self._about_card(name, desc), False, False, 0)
         page.pack_start(self._about_text(
-            "Para trocar de PC, use Perfil de usuário › Exportar: nome, playlists, favoritas e histórico vão para um único arquivo, "
+            "Para trocar de PC, use Perfil › Exportar perfil: nome, playlists, favoritas e histórico vão para um único arquivo, "
             "que pode ser restaurado com Importar.", dim=True), False, False, 0)
 
         # --- Licença e créditos ---
@@ -8276,6 +8945,7 @@ class MusicPlayerApp(Gtk.Window):
             "<tt>M</tt>  Mudo\n"
             "<tt>L</tt>  Curtir / descurtir a faixa atual\n"
             "<tt>Ctrl+F</tt>  Ir para a busca\n"
+            "<tt>Ctrl+E</tt>  Abrir o equalizador\n"
             "<tt>Alt+←</tt>  Voltar\n"
             "<tt>Ctrl+V</tt>  Colar link e tocar\n"
             "Rolar o mouse sobre o botão de volume ajusta o volume."
@@ -8315,80 +8985,521 @@ class MusicPlayerApp(Gtk.Window):
         return box, value
 
     def on_open_profile(self, button=None):
-        dialog = Gtk.Dialog(title="Perfil de usuário", transient_for=self, modal=True)
-        dialog.set_default_size(420, -1)
-        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
-        btn_ok = dialog.add_button("Salvar", Gtk.ResponseType.OK)
-        btn_ok.get_style_context().add_class("suggested-action")
-        dialog.set_default_response(Gtk.ResponseType.OK)
+        self.navigate("profile")
 
-        content = dialog.get_content_area()
-        content.set_spacing(10)
-        content.set_border_width(16)
+    # ---------- Estatísticas de escuta ----------
+    WEEKDAYS = ("às segundas-feiras", "às terças-feiras", "às quartas-feiras", "às quintas-feiras",
+                "às sextas-feiras", "aos sábados", "aos domingos")
+    LEVELS = ((0, "Ouvinte de primeira viagem"), (1, "Ouvinte casual"), (10, "Ouvinte dedicado"),
+              (50, "Melômano"), (200, "Lenda da Fonoteca"))     # (horas ouvidas, título)
 
-        content.pack_start(self._section_label("Nome do usuário"), False, False, 0)
-        name_entry = Gtk.Entry()
-        name_entry.set_text(self.profile.get("name", ""))
-        name_entry.set_placeholder_text("Como devemos te chamar?")
-        name_entry.set_max_length(40)
-        name_entry.set_activates_default(True)
-        content.pack_start(name_entry, False, False, 0)
+    @staticmethod
+    def _new_stats():
+        return {"since": datetime.date.today().isoformat(), "plays": 0, "seconds": 0.0, "radio_seconds": 0.0,
+                "artists": {}, "tracks": {}, "stations": {}, "days": {},
+                "hours": [0.0] * 24, "weekdays": [0.0] * 7}
 
-        content.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 4)
+    def _load_stats(self):
+        raw = self._load_json(STATS_FILE, None)
+        st = self._new_stats()
+        if isinstance(raw, dict):
+            for k in ("plays", "seconds", "radio_seconds"):
+                if isinstance(raw.get(k), (int, float)):
+                    st[k] = raw[k]
+            for k in ("artists", "tracks", "stations", "days"):
+                if isinstance(raw.get(k), dict):
+                    st[k] = raw[k]
+            for k, n in (("hours", 24), ("weekdays", 7)):
+                v = raw.get(k)
+                if isinstance(v, list) and len(v) == n and all(isinstance(x, (int, float)) for x in v):
+                    st[k] = [float(x) for x in v]
+            if isinstance(raw.get("since"), str):
+                st["since"] = raw["since"]
+        return st
 
-        stats_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, homogeneous=True)
-        stat_pl, lbl_pl = self._make_stat("Playlists")
-        stat_tr, lbl_tr = self._make_stat("Faixas salvas")
-        stat_hi, lbl_hi = self._make_stat("No histórico")
-        for s in (stat_pl, stat_tr, stat_hi):
-            stats_box.pack_start(s, True, True, 0)
-        content.pack_start(stats_box, False, False, 0)
+    def _stats_tick(self):
+        """Chamado a cada atualização de tempo do mpv: soma só reprodução contínua (pausas e seeks não contam)."""
+        now = time.monotonic()
+        last, self._stat_last_t = self._stat_last_t, now
+        if self._mpv_paused or self._mpv_idle or not last:
+            return
+        dt = now - last
+        if not (0 < dt <= 3.0):
+            return
+        item = self._current_item()
+        if not item:
+            return
+        key = track_key(item)
+        ctx = (self._play_token, key)
+        live = self._is_live(item)
+        if ctx != self._stat_ctx:
+            self._stat_ctx, self._stat_secs, self._stat_counted = ctx, 0.0, False
+            self._stat_artist = "" if live else (self._guess_artist(item) or item.get("uploader") or "").strip()
+        st = self.stats
+        st["seconds"] += dt
+        nowdt = datetime.datetime.now()
+        day = nowdt.date().isoformat()
+        st["days"][day] = st["days"].get(day, 0.0) + dt
+        st["hours"][nowdt.hour] += dt
+        st["weekdays"][nowdt.weekday()] += dt
+        self._stat_secs += dt
+        if live:
+            st["radio_seconds"] += dt
+            e = st["stations"].setdefault(key, {"t": item.get("title", ""), "s": 0.0, "n": 0})
+            e["s"] += dt
+        elif self._stat_artist:
+            a = st["artists"].setdefault(self._stat_artist, {"n": 0, "s": 0.0})
+            a["s"] += dt
+        dur = self.track_duration or 0
+        need = 30.0 if (live or dur <= 0) else max(10.0, min(30.0, dur * 0.5))
+        if not self._stat_counted and self._stat_secs >= need:
+            self._stat_counted = True
+            if live:
+                st["stations"][key]["n"] += 1
+            else:
+                st["plays"] += 1
+                if self._stat_artist:
+                    st["artists"][self._stat_artist]["n"] += 1
+                e = st["tracks"].setdefault(key, {"n": 0})
+                e.update({"t": item.get("title", ""), "a": item.get("uploader", ""), "i": item.get("id", ""),
+                          "d": item.get("duration", ""), "p": item.get("path", "")})
+                e["n"] += 1
+        if self._stats_save_id is None:
+            self._stats_save_id = GLib.timeout_add_seconds(45, self._stats_flush_timer)
 
-        def refresh_stats():
-            n_pl, n_tr, n_un = self._profile_stats()
-            for lbl, val in ((lbl_pl, n_pl), (lbl_tr, n_tr), (lbl_hi, len(self.history))):
-                lbl.set_markup(f'<span size="xx-large" weight="bold">{val}</span>')
-            stat_tr.set_tooltip_text(f"Total de faixas nas playlists ({n_un} únicas, sem contar repetições)")
+    def _stats_flush_timer(self):
+        self._stats_save_id = None
+        self._stats_flush()
+        return False
 
-        refresh_stats()
+    def _stats_flush(self):
+        st = self.stats
+        if len(st["tracks"]) > 600:
+            st["tracks"] = dict(sorted(st["tracks"].items(), key=lambda kv: -kv[1].get("n", 0))[:400])
+        if len(st["artists"]) > 400:
+            st["artists"] = dict(sorted(st["artists"].items(), key=lambda kv: -kv[1].get("s", 0))[:300])
+        if len(st["stations"]) > 150:
+            st["stations"] = dict(sorted(st["stations"].items(), key=lambda kv: -kv[1].get("s", 0))[:100])
+        if len(st["days"]) > 450:
+            st["days"] = {k: st["days"][k] for k in sorted(st["days"])[-400:]}
+        self._save_json(STATS_FILE, st, compact=True)
 
-        content.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 4)
+    def _stats_streaks(self):
+        """(sequência atual, recorde) de dias seguidos com pelo menos 30 s de música."""
+        days = sorted(d for d, v in self.stats["days"].items() if v >= 30)
+        dates = []
+        for d in days:
+            try:
+                dates.append(datetime.date.fromisoformat(d))
+            except ValueError:
+                pass
+        best = run = 0
+        prev = None
+        for d in dates:
+            run = run + 1 if prev is not None and (d - prev).days == 1 else 1
+            best = max(best, run)
+            prev = d
+        cur = 0
+        today = datetime.date.today()
+        if dates and (today - dates[-1]).days <= 1:
+            cur, d = 1, dates[-1]
+            have = set(dates)
+            while d - datetime.timedelta(days=1) in have:
+                d -= datetime.timedelta(days=1)
+                cur += 1
+        return cur, best
 
-        content.pack_start(self._section_label("Backup e transferência"), False, False, 0)
-        content.pack_start(self._about_text(
-            "Exporte nome, playlists e histórico para um único arquivo e importe-o em outro computador.",
-            dim=True), False, False, 0)
+    def _profile_level(self, hours):
+        title, nxt = self.LEVELS[0][1], None
+        for i, (h, name) in enumerate(self.LEVELS):
+            if hours >= h:
+                title = name
+                nxt = self.LEVELS[i + 1] if i + 1 < len(self.LEVELS) else None
+        return title, nxt
 
-        backup_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, homogeneous=True)
+    # ---------- Tela do perfil ----------
+    def _pf_card(self, title, body, expand=False):
+        frame = Gtk.Frame()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(12)
+        t = Gtk.Label(xalign=0)
+        t.set_markup(f'<span size="large" weight="bold">{GLib.markup_escape_text(title)}</span>')
+        box.pack_start(t, False, False, 0)
+        box.pack_start(body, True, True, 0)
+        frame.add(box)
+        return frame
+
+    def _pf_chart(self, kind):
+        da = Gtk.DrawingArea()
+        da.set_size_request(-1, 120)
+        da.set_has_tooltip(True)
+        da.connect("draw", self._draw_chart, kind)
+        da.connect("query-tooltip", self._chart_tooltip, kind)
+        return da
+
+    def _chart_series(self, kind):
+        """(valores em segundos, rótulos, índice destacado, rótulos completos p/ tooltip)."""
+        if kind == "hours":
+            vals = list(self.stats["hours"])
+            peak = max(range(24), key=lambda i: vals[i]) if any(vals) else None
+            return vals, [f"{h}h" if h % 3 == 0 else "" for h in range(24)], peak, [f"{h:02d}h" for h in range(24)]
+        today = datetime.date.today()
+        days = [today - datetime.timedelta(days=13 - i) for i in range(14)]
+        vals = [float(self.stats["days"].get(d.isoformat(), 0.0)) for d in days]
+        return (vals, [str(d.day) if i % 2 == 0 or i == 13 else "" for i, d in enumerate(days)], 13,
+                [d.strftime("%d/%m") for d in days])
+
+    def _draw_chart(self, widget, cr, kind):
+        vals, labels, hi, _full = self._chart_series(kind)
+        w, h = widget.get_allocated_width(), widget.get_allocated_height()
+        ctx = widget.get_style_context()
+        fg = ctx.get_color(Gtk.StateFlags.NORMAL)
+        found, accent = ctx.lookup_color("theme_selected_bg_color")
+        if not found:
+            accent = fg
+        n = len(vals)
+        mx = max(vals) or 1.0
+        pad_b, gap = 16, 3
+        chart_h = h - pad_b - 2
+        bw = (w - gap * (n - 1)) / n
+        for i, v in enumerate(vals):
+            bh = max(2.0, chart_h * v / mx) if v > 0 else 2.0
+            x = i * (bw + gap)
+            if v > 0 and i == hi:
+                cr.set_source_rgba(accent.red, accent.green, accent.blue, 1.0)
+            else:
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.30 if v > 0 else 0.12)
+            cr.rectangle(x, chart_h - bh + 1, bw, bh)
+            cr.fill()
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.65)
+        cr.set_font_size(10)
+        for i, lab in enumerate(labels):
+            if lab:
+                cr.move_to(i * (bw + gap), h - 3)
+                cr.show_text(lab)
+        return False
+
+    def _chart_tooltip(self, widget, x, y, keyboard, tooltip, kind):
+        vals, _labels, _hi, full = self._chart_series(kind)
+        n = len(vals)
+        w = max(widget.get_allocated_width(), 1)
+        i = min(n - 1, max(0, int(x / w * n)))
+        tooltip.set_text(f"{full[i]}: {self._fmt_long(vals[i]) if vals[i] >= 1 else 'sem reprodução'}")
+        return True
+
+    def _build_page_profile(self):
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        page.set_border_width(20)
+
+        # --- Cabeçalho: avatar, nome editável, nível e progresso ---
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        avatar = Gtk.Image.new_from_icon_name("avatar-default-symbolic", Gtk.IconSize.DIALOG)
+        avatar.set_pixel_size(72)
+        head.pack_start(avatar, False, False, 0)
+        ht = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        ht.set_valign(Gtk.Align.CENTER)
+        kicker = Gtk.Label(xalign=0)
+        kicker.set_markup('<span size="small" weight="bold" letter_spacing="2048">PERFIL</span>')
+        kicker.get_style_context().add_class("dim-label")
+        ht.pack_start(kicker, False, False, 0)
+        self.pf_name = Gtk.Entry()
+        self.pf_name.set_width_chars(26)
+        self.pf_name.set_max_length(40)
+        self.pf_name.set_placeholder_text("Como devemos te chamar?")
+        self.pf_name.set_tooltip_text("Enter ou clicar fora salva o nome")
+        self.pf_name.connect("activate", self._commit_profile_name)
+        self.pf_name.connect("focus-out-event", lambda w, e: self._commit_profile_name() and False)
+        ht.pack_start(self.pf_name, False, False, 0)
+        self.pf_level = Gtk.Label(xalign=0)
+        self.pf_level.set_line_wrap(True)
+        ht.pack_start(self.pf_level, False, False, 0)
+        self.pf_progress = Gtk.ProgressBar()
+        self.pf_progress.set_show_text(True)
+        self.pf_progress.set_size_request(280, -1)
+        ht.pack_start(self.pf_progress, False, False, 0)
+        head.pack_start(ht, True, True, 0)
+        page.pack_start(head, False, False, 0)
+
+        # --- Números (escuta e biblioteca) ---
+        self.pf_vals = {}
+        tiles = self._make_flow(2, 8, stretch=False)
+        tiles.set_homogeneous(False)
+        for key, cap in (("time", "Tempo de escuta"), ("plays", "Reproduções"), ("streak", "Sequência de dias"),
+                         ("avg", "Média por dia ativo"), ("playlists", "Playlists"), ("pltracks", "Faixas em playlists"),
+                         ("favs", "Favoritas"), ("offline", "Músicas offline"), ("queue", "Na fila agora"),
+                         ("artists", "Artistas na biblioteca")):
+            box, val = self._make_stat(cap)
+            box.set_border_width(10)
+            box.set_size_request(150, -1)
+            fr = Gtk.Frame()
+            fr.add(box)
+            tiles.add(fr)
+            self.pf_vals[key] = (val, box)
+        page.pack_start(tiles, False, False, 0)
+
+        # --- Curiosidades geradas a partir dos dados ---
+        self.pf_insights = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        page.pack_start(self._pf_card("Curiosidades", self.pf_insights), False, False, 0)
+
+        # --- Mais ouvidos ---
+        tops = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12, homogeneous=True)
+        self.pf_top_artists = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.pf_top_tracks = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.pf_top_stations = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        tops.pack_start(self._pf_card("Artistas mais ouvidos", self.pf_top_artists), True, True, 0)
+        tops.pack_start(self._pf_card("Músicas mais tocadas", self.pf_top_tracks), True, True, 0)
+        tops.pack_start(self._pf_card("Rádios mais ouvidas", self.pf_top_stations), True, True, 0)
+        page.pack_start(tops, False, False, 0)
+
+        # --- Quando você ouve ---
+        charts = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12, homogeneous=True)
+        charts.pack_start(self._pf_card("Horários em que você ouve", self._pf_chart("hours")), True, True, 0)
+        charts.pack_start(self._pf_card("Últimos 14 dias", self._pf_chart("days")), True, True, 0)
+        page.pack_start(charts, False, False, 0)
+        self.pf_charts = charts
+
+        # --- Backup, dados e estatísticas ---
+        bk = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        bk.pack_start(self._about_text(
+            "Exporte nome, playlists, favoritas e histórico para um único arquivo e importe-o em outro computador. "
+            "As estatísticas de escuta ficam só neste computador.", dim=True), False, False, 0)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.set_halign(Gtk.Align.START)
         btn_export = Gtk.Button(label="Exportar perfil…")
         btn_export.set_image(Gtk.Image.new_from_icon_name("document-save-symbolic", Gtk.IconSize.BUTTON))
         btn_export.set_always_show_image(True)
+        btn_export.connect("clicked", lambda b: self._export_profile(self, self.pf_name.get_text().strip()))
         btn_import = Gtk.Button(label="Importar perfil…")
         btn_import.set_image(Gtk.Image.new_from_icon_name("document-open-symbolic", Gtk.IconSize.BUTTON))
         btn_import.set_always_show_image(True)
-        backup_row.pack_start(btn_export, True, True, 0)
-        backup_row.pack_start(btn_import, True, True, 0)
-        content.pack_start(backup_row, False, False, 0)
+        btn_import.connect("clicked", self._on_profile_import)
+        btn_folder = Gtk.Button(label="Abrir pasta de dados")
+        btn_folder.set_image(Gtk.Image.new_from_icon_name("folder-symbolic", Gtk.IconSize.BUTTON))
+        btn_folder.set_always_show_image(True)
+        btn_folder.connect("clicked", lambda b: self._open_url("file://" + CONFIG_DIR))
+        btn_reset = Gtk.Button(label="Zerar estatísticas")
+        btn_reset.get_style_context().add_class("destructive-action")
+        btn_reset.connect("clicked", self._on_stats_reset)
+        for b in (btn_export, btn_import, btn_folder, btn_reset):
+            row.pack_start(b, False, False, 0)
+        bk.pack_start(row, False, False, 0)
+        page.pack_start(self._pf_card("Backup e dados", bk), False, False, 0)
 
-        btn_export.connect("clicked", lambda b: self._export_profile(dialog, name_entry.get_text().strip()))
+        # --- Sistema (técnico) ---
+        self.pf_sys_grid = Gtk.Grid()
+        self.pf_sys_grid.set_column_spacing(16)
+        self.pf_sys_grid.set_row_spacing(4)
+        self.pf_sys = {}
+        for i, (key, cap) in enumerate((("app", "Fonoteca"), ("db", "Banco de dados"), ("data", "Pasta de dados"),
+                                        ("python", "Python / GTK"), ("mpv", "mpv"), ("ytdlp", "yt-dlp"),
+                                        ("ffmpeg", "ffmpeg"))):
+            c = Gtk.Label(label=cap, xalign=0)
+            c.get_style_context().add_class("dim-label")
+            v = Gtk.Label(label="…", xalign=0)
+            v.set_selectable(True)
+            v.set_line_wrap(True)
+            self.pf_sys_grid.attach(c, 0, i, 1, 1)
+            self.pf_sys_grid.attach(v, 1, i, 1, 1)
+            self.pf_sys[key] = v
+        page.pack_start(self._pf_card("Sistema", self.pf_sys_grid), False, False, 0)
 
-        def _do_import(b):
-            if self._import_profile(dialog):
-                name_entry.set_text(self.profile.get("name", ""))
-                refresh_stats()
+        scroll.add(page)
+        self.pf_scroll = scroll
+        return scroll
 
-        btn_import.connect("clicked", _do_import)
+    def _commit_profile_name(self, *args):
+        new = self.pf_name.get_text().strip()
+        if new != (self.profile.get("name") or ""):
+            self.profile["name"] = new
+            self._save_profile()
+            self._refresh_home_greeting()
+            self.show_toast(f"Perfil salvo. Olá, {new}!" if new else "Nome removido do perfil.")
+        return True
 
-        dialog.show_all()
-        response = dialog.run()
-        new_name = name_entry.get_text().strip()
-        dialog.destroy()
+    def _on_profile_import(self, button=None):
+        if self._import_profile(self):
+            self.pf_name.set_text(self.profile.get("name", ""))
+            self._refresh_home_greeting()
+            self._render_profile()
 
-        if response == Gtk.ResponseType.OK:
-            if new_name != (self.profile.get("name") or ""):
-                self.profile["name"] = new_name
-                self._save_profile()
-                self.show_toast(f"Perfil salvo. Olá, {new_name}!" if new_name else "Nome removido do perfil.")
+    def _on_stats_reset(self, button=None):
+        if not self._confirm_action("Zerar todas as estatísticas de escuta (tempo, mais ouvidas, horários)? "
+                                    "Playlists, favoritas e histórico não são afetados."):
+            return
+        self.stats = self._new_stats()
+        self._stat_ctx = None
+        self._stats_flush()
+        self._render_profile()
+        self.show_toast("Estatísticas zeradas.")
+
+    def _pf_top_rows(self, box, rows, empty, on_click=None):
+        """rows: [(rótulo, valor_texto, fração 0..1, payload)]."""
+        self._clear(box)
+        if not rows:
+            box.pack_start(self._placeholder(empty), False, False, 0)
+        for i, (label, val, frac, payload) in enumerate(rows, 1):
+            btn = Gtk.Button()
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.set_focus_on_click(False)
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            lbl = Gtk.Label(label=f"{i}. {label}", xalign=0)
+            lbl.set_ellipsize(3)
+            lbl.set_max_width_chars(24)
+            hb.pack_start(lbl, True, True, 0)
+            v = Gtk.Label(label=val)
+            v.get_style_context().add_class("dim-label")
+            hb.pack_start(v, False, False, 0)
+            bar = Gtk.LevelBar()
+            bar.set_min_value(0)
+            bar.set_max_value(1)
+            bar.set_value(max(0.03, min(1.0, frac)))
+            vb.pack_start(hb, False, False, 0)
+            vb.pack_start(bar, False, False, 0)
+            btn.add(vb)
+            if on_click and payload is not None:
+                btn.connect("clicked", lambda b, pl=payload: on_click(pl))
+                btn.set_tooltip_text("Clique para abrir")
+            else:
+                btn.set_sensitive(on_click is None)
+            box.pack_start(btn, False, False, 0)
+        box.show_all()
+
+    def _render_profile(self):
+        if not hasattr(self, "pf_name"):
+            return
+        st = self.stats
+        if not self.pf_name.has_focus():
+            self.pf_name.set_text(self.profile.get("name", ""))
+
+        hours = st["seconds"] / 3600.0
+        title, nxt = self._profile_level(hours)
+        try:
+            since = datetime.date.fromisoformat(st["since"]).strftime("%d/%m/%Y")
+        except ValueError:
+            since = st["since"]
+        self.pf_level.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>  ·  contando desde {since}")
+        if nxt:
+            base = max(h for h, _n in self.LEVELS if h <= hours)
+            self.pf_progress.set_fraction(min(1.0, (hours - base) / max(nxt[0] - base, 1)))
+            self.pf_progress.set_text(f"{max(nxt[0] - hours, 0):.1f} h para “{nxt[1]}”")
+        else:
+            self.pf_progress.set_fraction(1.0)
+            self.pf_progress.set_text("Nível máximo alcançado")
+
+        cur, best = self._stats_streaks()
+        active_days = sum(1 for v in st["days"].values() if v >= 30)
+        n_pl, n_tr, n_un = self._profile_stats()
+        lib_artists = {self._norm_key(t.get("uploader") or "") for src in (self.favorites, self.history,
+                       *self.playlists.values(), list(self.lib_index.values()) if self.lib_root else [])
+                       for t in src if isinstance(t, dict) and t.get("uploader")}
+        lib_artists.discard("")
+        vals = {
+            "time": self._fmt_long(st["seconds"]), "plays": str(st["plays"]),
+            "streak": f"{cur} {'dia' if cur == 1 else 'dias'}",
+            "avg": self._fmt_long(st["seconds"] / active_days) if active_days else "—",
+            "playlists": str(n_pl), "pltracks": str(n_un), "favs": str(len(self.favorites)),
+            "offline": str(len(self.lib_index) if self.lib_root else 0), "queue": str(len(self.queue)),
+            "artists": str(len(lib_artists)),
+        }
+        tips = {"streak": f"Recorde: {best} {'dia' if best == 1 else 'dias'} seguidos (30 s ou mais por dia)",
+                "plays": "Uma reprodução conta depois de ~30 s ouvidos (ou metade da faixa, se for curta)",
+                "pltracks": f"Faixas únicas nas playlists ({n_tr} no total, contando repetições)",
+                "time": f"Inclui {self._fmt_long(st['radio_seconds'])} de rádios web" if st["radio_seconds"] else "Soma só reprodução contínua",
+                "avg": f"{active_days} dias com música"}
+        for k, (lbl, box) in self.pf_vals.items():
+            lbl.set_markup(f'<span size="x-large" weight="bold">{GLib.markup_escape_text(vals[k])}</span>')
+            box.set_tooltip_text(tips.get(k))
+
+        # Curiosidades
+        self._clear(self.pf_insights)
+        facts = []
+        if any(st["hours"]):
+            ph = max(range(24), key=lambda i: st["hours"][i])
+            per = "de madrugada" if ph < 5 else "de manhã" if ph < 12 else "à tarde" if ph < 18 else "à noite"
+            facts.append(f"Seu horário favorito é por volta das {ph}h ({per}).")
+        if any(st["weekdays"]):
+            wd = max(range(7), key=lambda i: st["weekdays"][i])
+            facts.append(f"Você ouve mais música {self.WEEKDAYS[wd]}.")
+        if st["artists"]:
+            top_a = max(st["artists"].items(), key=lambda kv: (kv[1].get("n", 0), kv[1].get("s", 0)))
+            na = top_a[1].get("n", 0)
+            facts.append(f"Artista do momento: {top_a[0]} ({na} {'reprodução' if na == 1 else 'reproduções'}).")
+        if st["seconds"] >= 1800:
+            facts.append(f"Em média, uma música sua dura {self._fmt_long(st['seconds'] / max(st['plays'], 1))} de escuta.")
+        if self.favorites:
+            off = sum(1 for t in self.favorites if t.get("path"))
+            facts.append(f"{off} de {len(self.favorites)} favoritas já estão offline.")
+        if best >= 2:
+            facts.append(f"Seu recorde é de {best} dias seguidos ouvindo música.")
+        if not facts:
+            facts.append("Ouça algumas músicas e a Fonoteca começa a montar o seu retrato musical aqui.")
+        for f in facts:
+            self.pf_insights.pack_start(self._about_text(GLib.markup_escape_text("•  " + f)), False, False, 0)
+        self.pf_insights.show_all()
+
+        # Rankings
+        arts = sorted(st["artists"].items(), key=lambda kv: (-kv[1].get("n", 0), -kv[1].get("s", 0)))[:5]
+        mx = max([a[1].get("n", 0) for a in arts] or [1]) or 1
+        self._pf_top_rows(self.pf_top_artists,
+                          [(n, f"{d.get('n', 0)}×", d.get("n", 0) / mx, n) for n, d in arts],
+                          "Nenhum artista ainda.", self._open_artist_in_wiki)
+        trs = sorted(st["tracks"].values(), key=lambda d: -d.get("n", 0))[:5]
+        mx = max([t.get("n", 0) for t in trs] or [1]) or 1
+        self._pf_top_rows(self.pf_top_tracks,
+                          [((t.get("t") or "?") + (f" — {t['a']}" if t.get("a") else ""), f"{t.get('n', 0)}×",
+                            t.get("n", 0) / mx, t) for t in trs],
+                          "Nenhuma música ainda.",
+                          lambda t: self.play_item(self._normalize_track({"id": t.get("i", ""), "title": t.get("t", ""),
+                                                                           "uploader": t.get("a", ""), "duration": t.get("d", ""),
+                                                                           **({"path": t["p"], "offline": True} if t.get("p") else {})})))
+        sts = sorted(st["stations"].values(), key=lambda d: -d.get("s", 0))[:5]
+        mx = max([x.get("s", 0) for x in sts] or [1]) or 1
+        self._pf_top_rows(self.pf_top_stations,
+                          [(x.get("t") or "Rádio", self._fmt_long(x.get("s", 0)), x.get("s", 0) / mx, None) for x in sts],
+                          "Nenhuma rádio ainda.")
+        self.pf_charts.queue_draw()
+        for ch in self.pf_charts.get_children():
+            ch.queue_draw()
+        self._render_sysinfo()
+
+    def _render_sysinfo(self):
+        n = self.db.count_tracks() if self.db is not None else 0
+        try:
+            size = os.path.getsize(DB_FILE)
+        except OSError:
+            size = 0
+        engine = ("FTS5" if self.db.fts else "LIKE") if self.db is not None else "indisponível (modo JSON)"
+        self.pf_sys["app"].set_text(f"{APP_VERSION}")
+        self.pf_sys["db"].set_text(f"SQLite · {size / 1024 / 1024:.1f} MB · {n} faixas indexadas · busca {engine}")
+        self.pf_sys["data"].set_text(CONFIG_DIR)
+        self.pf_sys["python"].set_text(
+            f"{sys.version.split()[0]} / GTK {Gtk.get_major_version()}.{Gtk.get_minor_version()}.{Gtk.get_micro_version()}")
+        if self._sysinfo is None:
+            self._sysinfo = {}
+            threading.Thread(target=self._sysinfo_thread, daemon=True).start()
+        else:
+            self._apply_sysinfo()
+
+    def _sysinfo_thread(self):
+        info = {}
+        for key, cmd in (("mpv", ["mpv", "--version"]), ("ytdlp", ["yt-dlp", "--version"]),
+                         ("ffmpeg", ["ffmpeg", "-version"])):
+            try:
+                out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=5)
+                info[key] = out.strip().splitlines()[0][:90]
+            except Exception:
+                info[key] = "não encontrado" if not shutil.which(cmd[0]) else "indisponível"
+        self._sysinfo = info
+        GLib.idle_add(self._apply_sysinfo)
+
+    def _apply_sysinfo(self):
+        for k, v in (self._sysinfo or {}).items():
+            if k in self.pf_sys:
+                self.pf_sys[k].set_text(v)
+        return False
 
     def on_open_installer(self, button=None):
         path = _find_installer_file()
@@ -8602,14 +9713,36 @@ class MusicPlayerApp(Gtk.Window):
         self._schedule_config_save()
         self._refresh_eq_button()
 
+    def on_eq_switch(self, sw, _pspec):
+        """Interruptor do EQ no player (a janela do equalizador acompanha)."""
+        if self._eq_ui_lock:
+            return
+        on = sw.get_active()
+        dlg = getattr(self, "_audio_dialog", None)
+        if dlg is not None:
+            dlg._set_switch(on)
+        self.eq_enabled = on
+        self.apply_eq()
+
     def _refresh_eq_button(self):
-        ctx = self.btn_eq.get_style_context()
-        if self.eq_enabled and any(abs(g) >= 0.05 for g in self.eq_gains):
-            ctx.add_class("suggested-action")
-            self.btn_eq.set_tooltip_text(f"Equalizador ligado ({self.eq_preset}) - Ctrl+E")
+        """Sincroniza o interruptor e o botão de preset do player com o estado do equalizador."""
+        if getattr(self, "eq_switch", None) is None:
+            return
+        name = eq_preset_name(self.eq_gains)
+        self.eq_preset = name
+        self._eq_ui_lock = True
+        try:
+            self.eq_switch.set_active(bool(self.eq_enabled))
+        finally:
+            self._eq_ui_lock = False
+        self.eq_preset_lbl.set_text(name)
+        ctx = self.eq_preset_lbl.get_style_context()
+        if self.eq_enabled:
+            ctx.remove_class("dim-label")
         else:
-            ctx.remove_class("suggested-action")
-            self.btn_eq.set_tooltip_text("Equalizador e opções de áudio (Ctrl+E)")
+            ctx.add_class("dim-label")
+        self.btn_eq_preset.set_tooltip_text(
+            f"Equalizador {'ligado' if self.eq_enabled else 'desligado'} - preset {name}. Clique para abrir (Ctrl+E)")
 
     def set_gapless(self, on):
         self.gapless_enabled = bool(on)
@@ -8857,6 +9990,9 @@ class MusicPlayerApp(Gtk.Window):
         mi.connect("activate", lambda w: self.on_add_selection_to_playlist(items_to_add=sel))
         menu.append(mi)
         menu.append(self._like_menu_item(sel))
+        dl = self._download_menu_item(sel)
+        if dl is not None:
+            menu.append(dl)
         menu.show_all()
         menu.popup_at_pointer(event)
         return True
@@ -8908,100 +10044,8 @@ class MusicPlayerApp(Gtk.Window):
         GLib.idle_add(self._notify, APP_NAME, f"Rádio: {item.get('title', '')}", "audio-x-generic")
 
     # ======================================================================
-    # Buscar na Biblioteca (SQLite FTS5)
+    # (a busca na biblioteca, SQLite FTS5, é a 1ª seção dos resultados da busca)
     # ======================================================================
-    def _build_page_mylib(self):
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        page.set_border_width(20)
-        title = Gtk.Label(xalign=0)
-        title.set_markup('<span size="xx-large" weight="bold">Buscar na Biblioteca</span>')
-        page.pack_start(title, False, False, 0)
-        self.mylib_entry = Gtk.SearchEntry()
-        self.mylib_entry.set_placeholder_text("Título, artista ou álbum de qualquer música sua (playlists, favoritas, recentes, offline)...")
-        self.mylib_entry.connect("search-changed", self._on_mylib_changed)
-        self.mylib_entry.connect("stop-search", lambda e: e.set_text(""))
-        page.pack_start(self.mylib_entry, False, False, 0)
-        self.mylib_status = Gtk.Label(xalign=0)
-        self.mylib_status.get_style_context().add_class("dim-label")
-        page.pack_start(self.mylib_status, False, False, 0)
-        sw = Gtk.ScrolledWindow()
-        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.mylib_list = Gtk.ListBox()
-        self.mylib_list.set_activate_on_single_click(False)
-        self.mylib_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
-        self.mylib_list.connect("row-activated", lambda lb, r: self.play_item(r.item))
-        self.mylib_list.connect("button-press-event", lambda w, e: self._simple_track_menu(w, e))
-        self.mylib_list.set_placeholder(self._placeholder("Digite para buscar."))
-        sw.add(self.mylib_list)
-        page.pack_start(sw, True, True, 0)
-        return page
-
-    def _on_mylib_changed(self, entry):
-        if self._mylib_timer:
-            GLib.source_remove(self._mylib_timer)
-        self._mylib_timer = GLib.timeout_add(120, self._mylib_run)      # debounce curto
-
-    def _mylib_run(self):
-        self._mylib_timer = None
-        self.mylib_token += 1
-        token = self.mylib_token
-        text = self.mylib_entry.get_text().strip()
-        if self.db is None:
-            self.mylib_status.set_text("Banco de dados indisponível nesta sessão.")
-            return False
-        try:
-            self._net_pool.submit(self._mylib_thread, text, token)
-        except RuntimeError:
-            pass
-        return False
-
-    def _mylib_thread(self, text, token):
-        t0 = time.perf_counter()
-        try:
-            items = self.db.search(text, 200) if text else []
-            total = self.db.count_tracks()
-        except Exception:
-            items, total = [], 0
-        GLib.idle_add(self._mylib_populate, items, total, text, (time.perf_counter() - t0) * 1000, token)
-
-    def _mylib_populate(self, items, total, text, ms, token):
-        if token != self.mylib_token:
-            return False
-        for child in list(self.mylib_list.get_children()):
-            self.mylib_list.remove(child)
-        for it in items:
-            it = self._normalize_track(it)
-            row = Gtk.ListBoxRow()
-            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            hb.set_border_width(4)
-            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
-            t = Gtk.Label(xalign=0)
-            t.set_ellipsize(3)
-            t.set_markup(f"<b>{GLib.markup_escape_text(it['title'])}</b>")
-            sub = "  ·  ".join(x for x in (it.get("uploader"), it.get("album"), it.get("year")) if x) or "Artista desconhecido"
-            s = Gtk.Label(label=sub, xalign=0)
-            s.set_ellipsize(3)
-            s.get_style_context().add_class("dim-label")
-            vb.pack_start(t, False, False, 0)
-            vb.pack_start(s, False, False, 0)
-            hb.pack_start(vb, True, True, 6)
-            d = Gtk.Label(label=it.get("duration", ""))
-            d.get_style_context().add_class("dim-label")
-            hb.pack_start(d, False, False, 4)
-            hb.pack_start(self._offline_badge(it), False, False, 0)
-            hb.pack_start(self._make_heart(it), False, False, 0)
-            row.add(hb)
-            row.item = it
-            self.mylib_list.add(row)
-        self.mylib_list.show_all()
-        engine = "FTS5" if self.db is not None and self.db.fts else "LIKE"
-        if text:
-            self.mylib_status.set_text(f"{len(items)} resultado(s) em {ms:.1f} ms · {total} faixas indexadas ({engine})")
-        else:
-            self.mylib_status.set_text(f"{total} faixas indexadas ({engine}).")
-        self.mylib_list.set_placeholder(self._placeholder("Nenhum resultado." if text else "Digite para buscar."))
-        return False
-
     # ---------- Encerramento ----------
     def on_destroy(self, widget):
         self._closing = True
@@ -9027,12 +10071,14 @@ class MusicPlayerApp(Gtk.Window):
         self._art_pool.shutdown(wait=False)
         self._preload_pool.shutdown(wait=False)
         self._net_pool.shutdown(wait=False)
-        if getattr(self, "_mylib_timer", None):
-            GLib.source_remove(self._mylib_timer)
-            self._mylib_timer = None
         if self._config_save_id:
             GLib.source_remove(self._config_save_id)
             self._config_save_id = None
+        if getattr(self, "_stats_save_id", None):
+            GLib.source_remove(self._stats_save_id)
+            self._stats_save_id = None
+        self._stats_flush()
+        self._remember_last_played(schedule=False)   # faixa atual vai junto no config.json
         if not self.is_maximized():  # maximizada, get_size() devolveria a tela toda e estragaria o "restaurar"
             self.config["win_w"], self.config["win_h"] = self.get_size()
         self._save_json(CONFIG_FILE, self.config)
