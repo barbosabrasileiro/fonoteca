@@ -71,7 +71,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Gio
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.0.1"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
@@ -218,6 +218,10 @@ STATS_FILE = os.path.join(CONFIG_DIR, "stats.json")       # estatísticas de esc
 FAVORITES_FILE = os.path.join(CONFIG_DIR, "favorites.json")
 LIBRARY_FILE = os.path.join(CONFIG_DIR, "library.json")   # índice de tags da biblioteca local
 DB_FILE = os.path.join(CONFIG_DIR, "library.db")          # SQLite: faixas, playlists, favoritas, histórico (+FTS5)
+# Cache de capas baixadas da rede (miniaturas do YouTube, capas do Deezer): só descartável, por isso fica em ~/.cache
+ART_CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), APP_ID, "art")
+ART_CACHE_TTL = 60 * 86400                 # após 60 dias a cópia é considerada velha (só usada se a rede falhar)
+ART_CACHE_MAX_BYTES = 200 * 1024 * 1024
 COVERS_DIR = os.path.join(CONFIG_DIR, "covers")           # capas extraídas dos arquivos
 AUDIO_EXTS = (".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".mp4", ".aac", ".wav", ".wma", ".webm", ".mka")
 
@@ -760,6 +764,82 @@ def _clean_lib_index(raw):
             if isinstance(p, str) and os.path.isabs(p) and isinstance(e, dict) and isinstance(e.get("path"), str):
                 out[p] = e
     return out
+
+
+_ART_NAME_RE = re.compile(r"[0-9a-f]{32}\.img")
+
+
+def looks_like_image(data):
+    """JPEG, PNG, GIF ou WebP pelos primeiros bytes (não grava no cache uma página de erro HTML)."""
+    return (isinstance(data, (bytes, bytearray)) and (
+        data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:4] == b"GIF8"
+        or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")))
+
+
+def _art_disk_path(url):
+    return os.path.join(ART_CACHE_DIR, hashlib.sha1(url.encode("utf-8", "replace")).hexdigest()[:32] + ".img")
+
+
+def art_disk_get(url, allow_stale=False):
+    """Bytes da capa no cache em disco, ou None. Cópia mais velha que o TTL só vale com allow_stale."""
+    path = _art_disk_path(url)
+    try:
+        if not allow_stale and time.time() - os.path.getmtime(path) > ART_CACHE_TTL:
+            return None
+        with open(path, "rb") as f:
+            data = f.read(HTTP_MAX_IMAGE + 1)
+        return data if looks_like_image(data) and len(data) <= HTTP_MAX_IMAGE else None
+    except OSError:
+        return None
+
+
+def art_disk_put(url, data):
+    """Grava a capa no cache em disco (atômico: temporário + rename). Falha de disco nunca é erro."""
+    tmp = None
+    try:
+        os.makedirs(ART_CACHE_DIR, mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="art.", suffix=".tmp", dir=ART_CACHE_DIR)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, _art_disk_path(url))
+    except OSError:
+        log.debug("cache de capa em disco indisponível", exc_info=True)
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+
+
+def prune_art_cache(folder=None, max_bytes=None, ttl=None):
+    """Remove do cache de capas as cópias vencidas (TTL) e, passando do teto de tamanho, as mais antigas."""
+    folder = folder or ART_CACHE_DIR
+    max_bytes = ART_CACHE_MAX_BYTES if max_bytes is None else max_bytes
+    ttl = ART_CACHE_TTL if ttl is None else ttl
+    try:
+        now, entries = time.time(), []
+        for n in os.listdir(folder):
+            p = os.path.join(folder, n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if n.endswith(".tmp") and now - st.st_mtime > 3600:          # sobra de gravação interrompida
+                with contextlib.suppress(OSError):
+                    os.remove(p)
+            elif _ART_NAME_RE.fullmatch(n):
+                if now - st.st_mtime > ttl:
+                    with contextlib.suppress(OSError):
+                        os.remove(p)
+                else:
+                    entries.append((st.st_mtime, st.st_size, p))
+        total = sum(e[1] for e in entries)
+        for _, size, p in sorted(entries):
+            if total <= max_bytes:
+                break
+            with contextlib.suppress(OSError):
+                os.remove(p)
+                total -= size
+    except OSError:
+        pass
 
 
 def prune_cover_cache(folder, max_bytes=300 * 1024 * 1024):
@@ -2201,6 +2281,7 @@ class MusicPlayerApp(Gtk.Window):
         self._wiki_forced = None
         self.album_artist_name = ""
         self._art_cache = {}
+        self._sq_cache = {}                   # (faixa, lado) -> pixbuf quadrado pronto (mosaico das playlists)
         self._art_lock = threading.Lock()
         self._art_bytes = 0
         self._lyrics_for_token = None         # _play_token da faixa cuja letra já foi buscada
@@ -2339,7 +2420,8 @@ class MusicPlayerApp(Gtk.Window):
         self.now_playing_label = Gtk.Label(label="Nenhuma música em execução", xalign=0)
         self.now_playing_label.set_ellipsize(3)
         self.now_playing_label.set_max_width_chars(28)
-        # Botão do artista: plano, com ícone de pessoa (clicável: abre a Wiki do artista)
+        # Botão do artista: com a moldura de botão do tema (deixa claro que é clicável), ícone de pessoa
+        # e seta; abre a Wiki do artista
         self.now_artist_btn = Gtk.Button()
         self.now_artist_lbl = Gtk.Label(label="", xalign=0)
         self.now_artist_lbl.set_ellipsize(3)
@@ -2349,7 +2431,13 @@ class MusicPlayerApp(Gtk.Window):
         artist_box.pack_start(self.now_artist_lbl, True, True, 0)
         artist_box.pack_start(Gtk.Image.new_from_icon_name("go-next-symbolic", Gtk.IconSize.MENU), False, False, 0)
         self.now_artist_btn.add(artist_box)
-        self.now_artist_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.now_artist_btn.set_relief(Gtk.ReliefStyle.NORMAL)
+        try:   # moldura nativa do tema, só mais compacta (só neste botão) para não aumentar a altura da barra
+            _chip_css = Gtk.CssProvider()
+            _chip_css.load_from_data(b"button { padding: 1px 8px; min-height: 0; min-width: 0; }")
+            self.now_artist_btn.get_style_context().add_provider(_chip_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        except Exception:
+            log.debug("CSS compacto do botão do artista indisponível", exc_info=True)
         self.now_artist_btn.set_halign(Gtk.Align.START)
         self.now_artist_btn.set_focus_on_click(False)
         self.now_artist_btn.set_sensitive(False)
@@ -2861,9 +2949,13 @@ class MusicPlayerApp(Gtk.Window):
         side.pack_end(ver, False, False, 0)
         return side
 
+    # Itens que ganham uma linha separadora ACIMA: Início | Fila | Recentes | Playlists... | Rádios Web | Perfil...
+    _NAV_SEPARATED = ("queue", "playlists", "profile")
+
     def _nav_header(self, row, before):
-        """Linha separando a biblioteca (acima) de perfil, manutenção e sobre (abaixo)."""
-        if getattr(row, "nav_name", "") == "profile":
+        """Linhas que dividem a barra lateral em grupos: (Início) / (Fila, Recentes) / (Playlists,
+        Favoritas, Offline, Rádios Web) / (Perfil, manutenção e Sobre)."""
+        if getattr(row, "nav_name", "") in self._NAV_SEPARATED:
             if row.get_header() is None:
                 sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
                 sep.set_margin_top(4)
@@ -5316,6 +5408,7 @@ class MusicPlayerApp(Gtk.Window):
     def _start_ytdlp_check(self):
         threading.Thread(target=self._check_ytdlp_update, daemon=True).start()
         threading.Thread(target=prune_cover_cache, args=(COVERS_DIR,), daemon=True).start()   # manutenção em 2º plano
+        threading.Thread(target=prune_art_cache, daemon=True).start()
         return False
 
     # ---------- Gerenciamento de Playlists ----------
@@ -5485,12 +5578,13 @@ class MusicPlayerApp(Gtk.Window):
         sl.get_style_context().add_class("dim-label")
         box.pack_start(sl, False, False, 0)
 
-        card = Gtk.Button()
+        card = Gtk.ToggleButton()          # 'ativo' = cartão selecionado (mesmo padrão dos outros cartões)
         card.set_relief(Gtk.ReliefStyle.NONE)
         card.set_focus_on_click(False)
         card.add(box)
-        card.set_tooltip_text(f"{name}\nClique para abrir · botão direito para opções")
-        card.connect("clicked", lambda b, nm=name: self._open_playlist(nm))
+        card.set_tooltip_text(f"{name}\nDuplo clique para abrir · botão direito para opções")
+        card.connect("button-press-event", self._on_card_select_press)    # 1º handler: clique simples só seleciona
+        card.connect("destroy", self._on_card_destroy)
         card.connect("button-press-event", self._on_playlist_card_press, name)
 
         ov = Gtk.Overlay()
@@ -5531,14 +5625,14 @@ class MusicPlayerApp(Gtk.Window):
                 img = Gtk.Image.new_from_icon_name("audio-x-generic-symbolic", Gtk.IconSize.DND)
                 img.set_size_request(half, half)
                 grid.attach(img, cx, cy, 1, 1)
-                self._submit_art(self._load_square_into, t, img, half)
+                self._set_square(t, img, half)
         else:
             img = Gtk.Image.new_from_icon_name("audio-x-generic-symbolic", Gtk.IconSize.DIALOG)
             img.set_pixel_size(48)
             img.set_size_request(size, size)
             grid.attach(img, 0, 0, 1, 1)
             if picks:
-                self._submit_art(self._load_square_into, picks[0], img, size)
+                self._set_square(picks[0], img, size)
         return grid
 
     def _load_square_into(self, item, image, side):
@@ -5550,10 +5644,7 @@ class MusicPlayerApp(Gtk.Window):
                 url = yt_thumb_url(item.get("id"))
                 if not url:
                     return
-                data = self._art_cache.get(url)
-                if data is None:
-                    data = http_get(url, max_bytes=HTTP_MAX_IMAGE, timeout=6)
-                    self._art_cache_put(url, data)
+                data = self._art_fetch(url)
             if not data:
                 return
             loader = GdkPixbuf.PixbufLoader()
@@ -5564,11 +5655,41 @@ class MusicPlayerApp(Gtk.Window):
             side_px = min(w, h)
             pb = pb.new_subpixbuf((w - side_px) // 2, (h - side_px) // 2, side_px, side_px)
             pb = pb.scale_simple(side, side, GdkPixbuf.InterpType.BILINEAR)
+            key = self._sq_key(item, side)
+            if key is not None:
+                with self._art_lock:
+                    self._sq_cache[key] = pb
+                    while len(self._sq_cache) > 256:
+                        self._sq_cache.pop(next(iter(self._sq_cache)))
             GLib.idle_add(image.set_from_pixbuf, pb)
         except Exception:
+            log.debug("capa do mosaico indisponível", exc_info=True)
+
+    def _sq_key(self, item, side):
+        """Chave do pixbuf quadrado pronto: YouTube por id; arquivo local por caminho + data de modificação."""
+        try:
+            if item.get("path"):
+                return ("f", item["path"], int(os.path.getmtime(item["path"])), side)
+            if valid_video_id(item.get("id")):
+                return ("y", item["id"], side)
+        except OSError:
             pass
+        return None
+
+    def _set_square(self, item, img, side):
+        """Mosaico: se o pixbuf pronto está na memória, aplica já (sem piscar ao voltar à página);
+        senão carrega em segundo plano (disco/rede)."""
+        key = self._sq_key(item, side)
+        pb = self._sq_cache.get(key) if key is not None else None
+        if pb is not None:
+            img.set_from_pixbuf(pb)
+        else:
+            self._submit_art(self._load_square_into, item, img, side)
 
     def _on_playlist_card_press(self, btn, event, name):
+        if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
+            GLib.idle_add(self._open_playlist_idle, name)    # adiado: navegar remonta os cartões
+            return True
         if event.button != 3 or event.type != Gdk.EventType.BUTTON_PRESS:
             return False
         menu = Gtk.Menu()
@@ -5593,6 +5714,10 @@ class MusicPlayerApp(Gtk.Window):
         menu.show_all()
         menu.popup_at_pointer(event)
         return True
+
+    def _open_playlist_idle(self, name):
+        self._open_playlist(name)
+        return False
 
     def _duplicate_playlist(self, name):
         tracks = self.playlists.get(name)
@@ -6696,6 +6821,14 @@ class MusicPlayerApp(Gtk.Window):
         artwork = meta.get("artwork")
         if artwork:
             self._submit_art(self._load_artwork_into, artwork, self.lyrics_art_img, 80)   # pool (máx. 4), sem thread nova
+        else:
+            # Sem capa de álbum: usa a miniatura do YouTube (a mesma do rodapé do player), só se não achou
+            # e só para faixa do YouTube (local e rádio não têm miniatura; ficam com o ícone padrão).
+            item = self._current_item()
+            if item and not item.get("path") and not item.get("stream_url"):
+                thumb = yt_thumb_url(item.get("id"))
+                if thumb:
+                    self._submit_art(self._load_artwork_into, thumb, self.lyrics_art_img, 80, 60)
 
     def _update_lyrics_ui(self, text):
         buffer = self.lyrics_text_view.get_buffer()
@@ -6713,14 +6846,31 @@ class MusicPlayerApp(Gtk.Window):
 
     def _load_artwork_into(self, url, image_widget, size, height=None):
         try:
-            data = self._art_cache.get(url)
-            if data is None:
-                data = http_get(url, max_bytes=HTTP_MAX_IMAGE, timeout=6)
-                self._art_cache_put(url, data)
+            data = self._art_fetch(url)
             pixbuf = self._decode_scaled(data, size, height or size)
             GLib.idle_add(image_widget.set_from_pixbuf, pixbuf)
         except Exception:
             log.debug("capa não carregada: %s", url, exc_info=True)
+
+    def _art_fetch(self, url, timeout=6):
+        """Bytes da capa: memória -> disco (~/.cache/fonoteca/art) -> rede. Só vai à rede se não houver cópia
+        válida; sem rede, usa a cópia em disco mesmo vencida. Levanta exceção se não houver de onde tirar."""
+        data = self._art_cache.get(url)
+        if data is not None:
+            return data
+        data = art_disk_get(url)
+        if data is None:
+            try:
+                data = http_get(url, max_bytes=HTTP_MAX_IMAGE, timeout=timeout)
+                if not looks_like_image(data):
+                    raise ValueError("a resposta não é uma imagem")
+                art_disk_put(url, data)
+            except Exception:
+                data = art_disk_get(url, allow_stale=True)       # offline: melhor uma capa velha que nenhuma
+                if data is None:
+                    raise
+        self._art_cache_put(url, data)
+        return data
 
     def _art_cache_put(self, url, data):
         """Cache de capas limitado por quantidade E por bytes (descarta as mais antigas primeiro)."""
