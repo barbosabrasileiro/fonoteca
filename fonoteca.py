@@ -32,6 +32,7 @@ import tempfile
 import random
 import urllib.request
 import urllib.parse
+import urllib.error
 import shutil
 import unicodedata
 import difflib
@@ -40,7 +41,16 @@ import weakref
 import contextlib
 import signal
 import atexit
+import logging
+import importlib.util
+import stat as _stat
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:  # bloqueio de instância única (só existe em sistemas POSIX)
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 try:  # Python sem o módulo sqlite3: a Fonoteca segue funcionando com os arquivos JSON
     import sqlite3
@@ -61,13 +71,20 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Gio
 # ----------------------------------------------------------------------
 APP_NAME = "Fonoteca"
 APP_ID = "fonoteca"
-APP_VERSION = "3.1.0"
+APP_VERSION = "4.0.0"
 APP_TAGLINE = "Uma biblioteca musical para descobrir, organizar e ouvir música."
 APP_AUTHOR = "Josuel Barbosa"
 APP_YEAR = "2026"
 APP_LICENSE = "GPL-3.0-or-later"
 APP_URL = "https://github.com/barbosabrasileiro/fonoteca"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+{APP_URL})"
+
+# Registro de eventos. Falhas que antes eram engolidas em silêncio agora deixam rastro (stderr);
+# FONOTECA_DEBUG=1 liga o nível detalhado.
+logging.basicConfig(
+    level=logging.DEBUG if os.environ.get("FONOTECA_DEBUG") else logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger(APP_ID)
 
 # Serviços opcionais. Desligados por padrão por questões de termos de uso:
 # o endpoint público "gtx" do Google Tradutor não é uma API oficial.
@@ -81,12 +98,71 @@ LEGACY_CONFIG_DIR = os.path.expanduser("~/.config/yt_music_player")
 
 
 def _migrate_legacy_config():
+    """Copia a pasta antiga para a nova de forma atômica: copia para um diretório temporário e só
+    então renomeia. Uma falha no meio (disco cheio) não deixa uma CONFIG_DIR pela metade."""
     if os.path.isdir(CONFIG_DIR) or not os.path.isdir(LEGACY_CONFIG_DIR):
         return
+    tmp_dir = CONFIG_DIR + ".migrating"
     try:
-        shutil.copytree(LEGACY_CONFIG_DIR, CONFIG_DIR)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.copytree(LEGACY_CONFIG_DIR, tmp_dir)
+        os.replace(tmp_dir, CONFIG_DIR)
     except Exception:
-        pass
+        log.warning("migração da pasta antiga falhou; será tentada de novo na próxima abertura", exc_info=True)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _secure_runtime_dir():
+    """Pasta privada (0700, do próprio usuário) para socket, log e arquivos temporários do mpv/MPRIS.
+    Antes eles ficavam em /tmp com nome previsível, onde outro usuário local podia plantar um
+    symlink ou um socket falso no mesmo caminho."""
+    uid = os.getuid()
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    candidates = []
+    if base and os.path.isdir(base):
+        candidates.append(os.path.join(base, APP_ID))
+    candidates.append(os.path.join(tempfile.gettempdir(), f"{APP_ID}-{uid}"))
+    for path in candidates:
+        try:
+            try:
+                os.mkdir(path, 0o700)
+            except FileExistsError:
+                pass
+            st = os.lstat(path)           # lstat: não segue symlink
+            if _stat.S_ISDIR(st.st_mode) and st.st_uid == uid:
+                if st.st_mode & 0o077:
+                    os.chmod(path, 0o700)
+                return path
+        except OSError:
+            continue
+    return tempfile.mkdtemp(prefix=f"{APP_ID}-")     # 0700 por construção
+
+
+def _open_private(path, mode="wb"):
+    """Abre um arquivo novo sem seguir symlink (O_NOFOLLOW) e com permissão 0600."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    return os.fdopen(os.open(path, flags, 0o600), mode)
+
+
+def _acquire_instance_lock():
+    """Garante uma única instância (duas disputariam config/queue/stats). Devolve o arquivo de lock
+    (mantê-lo aberto mantém o bloqueio) ou None se outra instância já está rodando."""
+    if fcntl is None or os.environ.get("FONOTECA_ALLOW_MULTI"):
+        return True
+    try:
+        fd = os.open(os.path.join(RUNTIME_DIR, "instance.lock"),
+                     os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        f = os.fdopen(fd, "w")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except BlockingIOError:
+        return None
+    except OSError:
+        log.warning("não foi possível criar o bloqueio de instância única", exc_info=True)
+        return True
+
+
+_JSON_WRITE_LOCK = threading.Lock()
 
 
 def _find_icon_file():
@@ -95,7 +171,7 @@ def _find_icon_file():
     for base in (
         here,
         os.path.join(here, "assets"),
-        f"/usr/share/icons/hicolor/256x256/apps",
+        "/usr/share/icons/hicolor/256x256/apps",
         os.path.expanduser("~/.local/share/icons/hicolor/256x256/apps"),
         "/usr/share/pixmaps",
     ):
@@ -125,7 +201,13 @@ def _find_installer_file():
 
 
 _migrate_legacy_config()
-os.makedirs(CONFIG_DIR, exist_ok=True)
+os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+try:   # histórico de escuta, fila e biblioteca não devem ser legíveis por outros usuários
+    if os.stat(CONFIG_DIR).st_mode & 0o077:
+        os.chmod(CONFIG_DIR, 0o700)
+except OSError:
+    pass
+RUNTIME_DIR = _secure_runtime_dir()
 
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 QUEUE_FILE = os.path.join(CONFIG_DIR, "queue.json")
@@ -150,8 +232,8 @@ PLAYLIST_SORTS = (("Nome (A–Z)", "name"), ("Mais faixas", "count"),
 LIB_PREVIEW = 6            # resultados da biblioteca mostrados na busca em "Tudo" (o filtro Biblioteca mostra todos)
 
 # Socket por processo: duas instâncias do app não derrubam o mpv uma da outra.
-MPV_SOCKET = os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpv_{os.getpid()}.sock")
-MPV_LOG = os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpv_{os.getpid()}.log")
+MPV_SOCKET = os.path.join(RUNTIME_DIR, f"mpv_{os.getpid()}.sock")
+MPV_LOG = os.path.join(RUNTIME_DIR, f"mpv_{os.getpid()}.log")
 
 DEEZER_API = "https://api.deezer.com"
 WIKIPEDIA_HOSTS = ("https://pt.wikipedia.org", "https://en.wikipedia.org")
@@ -194,6 +276,8 @@ def _clock_to_seconds(txt):
     try:
         parts = [int(x) for x in str(txt or "").split(":")]
     except ValueError:
+        return 0
+    if any(p < 0 for p in parts):        # tag corrompida ("-1:30") não pode virar duração negativa
         return 0
     sec = 0
     for x in parts:
@@ -398,18 +482,26 @@ def _reap_orphan_mpv():
     queda de energia do app). Só mexe em mpv da Fonoteca cujo app dono não existe mais."""
     uid, me = os.getuid(), os.getpid()
     tmp = tempfile.gettempdir()
-    prefix = f"--input-ipc-server={os.path.join(tmp, APP_ID + '_mpv')}"
-    legacy = prefix + ".sock"                       # versões antigas: um socket só, sem PID
     try:
         names = [n for n in os.listdir("/proc") if n.isdigit()]
     except OSError:
         return
 
     def app_alive(pid):
+        # aceita "python3 fonoteca.py", "python3 /caminho/fonoteca.py" e o launcher "fonoteca"
         argv = _proc_cmdline(pid)
-        return any(os.path.basename(a) == f"{APP_ID}.py" for a in argv[1:3])
+        if not argv or os.path.basename(argv[0]) == "mpv":
+            return False
+        return any(os.path.basename(a) in (f"{APP_ID}.py", APP_ID) for a in argv[:4])
 
     others_running = any(int(n) != me and app_alive(n) for n in names)
+    ipc = "--input-ipc-server="
+    # (diretório, regex do socket, regex do log) das versões atuais e antigas; o grupo 1 é o PID do app dono
+    layouts = (
+        (RUNTIME_DIR, re.compile(r"^mpv_(\d+)\.sock$"), "mpv_{}.log"),
+        (tmp, re.compile(rf"^{APP_ID}_mpv_(\d+)\.sock$"), APP_ID + "_mpv_{}.log"),
+        (tmp, re.compile(rf"^{APP_ID}_mpv()\.sock$"), APP_ID + "_mpv.log"),     # versões antigas: sem PID
+    )
     for n in names:
         pid = int(n)
         if pid == me:
@@ -422,24 +514,30 @@ def _reap_orphan_mpv():
         argv = _proc_cmdline(n)
         if not argv or os.path.basename(argv[0]) != "mpv":
             continue
-        sock_arg = next((a for a in argv if a.startswith(prefix) and a.endswith(".sock")), None)
-        if not sock_arg:
+        sock_path = next((a[len(ipc):] for a in argv if a.startswith(ipc)), None)
+        if not sock_path:
             continue
-        mid = sock_arg[len(prefix):-len(".sock")]       # "" (antigo) ou "_<pid do app>"
-        if sock_arg == legacy:
-            orphan = not others_running
-        else:
-            orphan = mid.startswith("_") and mid[1:].isdigit() and not app_alive(mid[1:])
+        orphan, log_path = False, None
+        for folder, rx, log_fmt in layouts:
+            if os.path.dirname(sock_path) != folder:
+                continue
+            m = rx.match(os.path.basename(sock_path))
+            if not m:
+                continue
+            owner = m.group(1)
+            orphan = (not others_running) if owner == "" else not app_alive(owner)
+            log_path = os.path.join(folder, log_fmt.format(owner))
+            break
         if not orphan:
             continue
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             continue
-        for path in (sock_arg[len("--input-ipc-server="):],
-                     os.path.join(tmp, f"{APP_ID}_mpv{mid}.log")):
+        for path in (sock_path, log_path):
             try:
-                os.remove(path)
+                if path:
+                    os.remove(path)
             except OSError:
                 pass
 
@@ -466,34 +564,229 @@ def _install_exit_handlers(app):
 # ======================================================================
 # Normalização de faixas e chave de identidade (usadas pelo app e pelo banco)
 # ======================================================================
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_YT_HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")
+_FIELD_MAX = 1000            # tamanho máximo de campos de texto de uma faixa (dado vindo de JSON/backup/rede)
+
+
+def safe_http_url(value, max_len=2048):
+    """A URL, se for http(s) bem formada; senão "". Bloqueia file://, edl://, ytdl://, lavf:// etc.,
+    que o mpv/urllib aceitariam e que não têm lugar em dados vindos de rede, banco ou backup."""
+    if not isinstance(value, str):
+        return ""
+    v = value.strip()
+    if not v or len(v) > max_len or any(c in v for c in "\x00\r\n"):
+        return ""
+    try:
+        p = urllib.parse.urlsplit(v)
+    except ValueError:
+        return ""
+    return v if p.scheme.lower() in ("http", "https") and p.netloc else ""
+
+
+def valid_video_id(vid):
+    return isinstance(vid, str) and bool(_VIDEO_ID_RE.match(vid))
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Não segue redirecionamento para fora de http(s) (ex.: file://, ftp://)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not safe_http_url(newurl):
+            raise urllib.error.HTTPError(newurl, code, "redirecionamento bloqueado", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _make_safe_opener():
+    """Opener só com http/https (sem file://, ftp://, data:), respeitando proxies do ambiente."""
+    op = urllib.request.OpenerDirector()
+    for h in (urllib.request.ProxyHandler, urllib.request.HTTPHandler, urllib.request.HTTPSHandler,
+              _SafeRedirectHandler, urllib.request.HTTPDefaultErrorHandler,
+              urllib.request.HTTPErrorProcessor, urllib.request.UnknownHandler):
+        op.add_handler(h())
+    return op
+
+
+_SAFE_OPENER = _make_safe_opener()
+HTTP_MAX_JSON = 4 * 1024 * 1024          # respostas JSON de APIs
+HTTP_MAX_IMAGE = 8 * 1024 * 1024         # capas e favicons
+
+
+def http_get(url, max_bytes=HTTP_MAX_JSON, timeout=8, headers=None):
+    """GET http(s) com limite de tamanho: lê no máximo max_bytes (+1) e rejeita respostas maiores.
+    Todas as consultas de rede do app passam por aqui."""
+    if not safe_http_url(url):
+        raise ValueError("URL não permitida (só http/https)")
+    h = {"User-Agent": USER_AGENT}
+    if headers:
+        h.update(headers)
+    with _SAFE_OPENER.open(urllib.request.Request(url, headers=h), timeout=timeout) as resp:
+        data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(f"resposta maior que o limite de {max_bytes} bytes")
+    return data
+
+
+def http_json(url, max_bytes=HTTP_MAX_JSON, timeout=8):
+    return json.loads(http_get(url, max_bytes=max_bytes, timeout=timeout).decode("utf-8"))
+
+
+def yt_thumb_url(vid):
+    """Miniatura do YouTube, ou None se o id for inválido (evita injetar caminho na URL)."""
+    return f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg" if valid_video_id(vid) else None
+
+
+def _txt(v, limit=_FIELD_MAX):
+    return v[:limit] if isinstance(v, str) else (str(v)[:limit] if isinstance(v, (int, float)) and not isinstance(v, bool) else "")
+
+
 def normalize_track(item):
-    """Esquema único de uma faixa. Mantém campos extras de faixas offline (path...) e de rádios web."""
+    """Esquema único de uma faixa. Mantém campos extras de faixas offline (path...) e de rádios web.
+    Todo campo é coagido para o tipo esperado e limitado em tamanho: a faixa pode vir de um JSON
+    editado/corrompido ou de um backup de terceiros."""
     if not isinstance(item, dict):
         item = {}
-    uploader = str(item.get("uploader") or item.get("artist") or "")
-    duration = str(item.get("duration") or item.get("duration_fmt") or "0:00")
+    uploader = _txt(item.get("uploader") or item.get("artist"))
+    duration = _txt(item.get("duration") or item.get("duration_fmt")) or "0:00"
     out = {
-        "id": str(item.get("id") or ""),
-        "title": str(item.get("title") or "Sem título"),
+        "id": _txt(item.get("id"), 300),
+        "title": _txt(item.get("title")) or "Sem título",
         "uploader": uploader,
         "artist": uploader,
         "duration": duration,
         "duration_fmt": duration,
         "verified": bool(item.get("verified")),
     }
-    if item.get("path"):
-        out.update({k: item[k] for k in ("path", "offline", "album", "year", "track_no", "cover_url") if item.get(k)})
-    if item.get("stream_url"):   # estação de rádio web (Radio-Browser)
-        out.update({k: item[k] for k in ("stream_url", "webradio", "favicon", "country", "tags") if item.get(k)})
+    path = item.get("path")
+    if isinstance(path, str) and path and os.path.isabs(path) and len(path) <= 4096 and "\x00" not in path:
+        out["path"] = path
+        if item.get("offline"):
+            out["offline"] = True
+        for k in ("album",):
+            if _txt(item.get(k)):
+                out[k] = _txt(item.get(k))
+        for k in ("year", "track_no"):
+            v = item.get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                if v:
+                    out[k] = v
+            elif _txt(v, 16):
+                out[k] = _txt(v, 16)
+        cover = safe_http_url(item.get("cover_url"))
+        if cover:
+            out["cover_url"] = cover
+    stream = safe_http_url(item.get("stream_url"))
+    if stream:   # estação de rádio web (Radio-Browser): só http/https
+        out["stream_url"] = stream
+        if item.get("webradio"):
+            out["webradio"] = True
+        fav = safe_http_url(item.get("favicon"))
+        if fav:
+            out["favicon"] = fav
+        if _txt(item.get("country"), 80):
+            out["country"] = _txt(item.get("country"), 80)
+        tags = item.get("tags")
+        if isinstance(tags, (list, tuple)):
+            tags = ", ".join(str(t) for t in tags[:8])
+        if _txt(tags, 300):
+            out["tags"] = _txt(tags, 300)
     return out
 
 
 def track_key(t):
     """Chave estável de uma faixa: arquivo local, id (YouTube/rádio) ou título|artista."""
-    if t.get("path"):
-        return "file:" + t["path"]
-    tid = (t.get("id") or "").strip()
-    return tid or f"{(t.get('title') or '').lower()}|{(t.get('uploader') or '').lower()}"
+    path = t.get("path")
+    if isinstance(path, str) and path:
+        return "file:" + path
+    tid = _txt(t.get("id"), 300).strip()
+    return tid or f"{_txt(t.get('title')).lower()}|{_txt(t.get('uploader')).lower()}"
+
+
+def safe_filename(name, max_bytes=180, fallback="Faixa"):
+    """Nome de arquivo seguro: sem separadores/controles, sem ponto ou hífen inicial (arquivo oculto /
+    parecer opção de linha de comando) e limitado em BYTES UTF-8 (ext4/ecryptfs: 255 por nome)."""
+    name = re.sub(r'[\x00-\x1f\x7f\\/*?:"<>|]', "", name or "")
+    name = name.strip().strip(".").lstrip("-").strip()
+    raw = name.encode("utf-8")
+    if len(raw) > max_bytes:
+        name = raw[:max_bytes].decode("utf-8", "ignore").rstrip()
+    return name or fallback
+
+
+def unique_base(base, ext):
+    """Devolve base (ou "base (2)", "base (3)"...) de modo que base+ext ainda não exista: um download
+    em lote não sobrescreve em silêncio um arquivo que já está lá."""
+    if not os.path.exists(base + ext):
+        return base
+    n = 2
+    while os.path.exists(f"{base} ({n}){ext}"):
+        n += 1
+    return f"{base} ({n})"
+
+
+def _sanitize_config(cfg):
+    """config.json pode ter sido editado à mão ou corrompido: coage os campos que o app usa sem
+    checar de novo (antes um 'win_w' não numérico derrubava o app na abertura)."""
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    def num(key, default, lo, hi):
+        try:
+            v = int(cfg.get(key, default))
+        except (TypeError, ValueError, OverflowError):
+            v = default
+        cfg[key] = max(lo, min(hi, v))
+
+    num("volume", 100, 0, 100)
+    num("win_w", 1040, 400, 16000)
+    num("win_h", 720, 300, 16000)
+    if not isinstance(cfg.get("library_root", ""), str):
+        cfg["library_root"] = ""
+    if "chart_country" in cfg and not isinstance(cfg["chart_country"], str):
+        cfg.pop("chart_country")
+    if "library_online_meta" in cfg:
+        cfg["library_online_meta"] = bool(cfg["library_online_meta"])
+    lp = cfg.get("last_played")
+    if lp is not None and not (isinstance(lp, dict) and isinstance(lp.get("key"), str)
+                               and isinstance(lp.get("idx"), int)):
+        cfg.pop("last_played", None)
+    return cfg
+
+
+def _clean_lib_index(raw):
+    """Índice da biblioteca local lido do JSON: só entradas {caminho absoluto: dict com 'path'}."""
+    out = {}
+    if isinstance(raw, dict):
+        for p, e in raw.items():
+            if isinstance(p, str) and os.path.isabs(p) and isinstance(e, dict) and isinstance(e.get("path"), str):
+                out[p] = e
+    return out
+
+
+def prune_cover_cache(folder, max_bytes=300 * 1024 * 1024):
+    """Apaga do cache de capas os arquivos de nomenclatura antiga (são refeitos sob demanda) e, se
+    passar de max_bytes, os menos recentes. Roda em segundo plano na abertura."""
+    try:
+        entries = []
+        for n in os.listdir(folder):
+            p = os.path.join(folder, n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if not re.fullmatch(r"[0-9a-f]{24}\.jpg", n):
+                with contextlib.suppress(OSError):
+                    os.remove(p)
+                continue
+            entries.append((st.st_atime, st.st_size, p))
+        total = sum(e[1] for e in entries)
+        for _, size, p in sorted(entries):
+            if total <= max_bytes:
+                break
+            with contextlib.suppress(OSError):
+                os.remove(p)
+                total -= size
+    except OSError:
+        pass
 
 
 def _unaccent_text(text):
@@ -521,9 +814,10 @@ class LibraryDB:
         self._closed = False
         self._lock = threading.RLock()
         self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db")
-        self._pl_snap = {}      # nome -> tupla de chaves (último estado gravado)
+        self._pl_snap = {}      # nome -> tupla de chaves (último estado CONFIRMADO no banco)
         self._fav_snap = None
         self._hist_snap = None
+        self.rconn, self._rlock = None, self._lock
         # isolation_level=None: autocommit; as transações são controladas explicitamente em _tx().
         self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=15)
         try:
@@ -532,6 +826,7 @@ class LibraryDB:
             self._migrate_legacy(legacy_files or {})
             with self._tx() as c:
                 self._prune(c)
+            self._open_reader(path)
         except Exception:
             self._writer.shutdown(wait=False)
             try:
@@ -539,6 +834,18 @@ class LibraryDB:
             except Exception:
                 pass
             raise
+
+    def _open_reader(self, path):
+        """Conexão só de leitura (WAL permite ler enquanto o escritor grava): buscas e leituras da
+        interface não esperam mais uma sincronização/gravação longa segurando o lock do escritor."""
+        try:
+            rc = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=15)
+            rc.create_function("unaccent", 1, lambda s: _unaccent_text(str(s or "")).lower())
+            rc.execute("PRAGMA query_only=ON")
+            self.rconn, self._rlock = rc, threading.Lock()
+        except sqlite3.Error:
+            log.warning("conexão de leitura separada indisponível; usando a principal", exc_info=True)
+            self.rconn, self._rlock = self.conn, self._lock
 
     # ---------- infraestrutura ----------
     @contextlib.contextmanager
@@ -568,8 +875,8 @@ class LibraryDB:
     def _guard(fn, *args):
         try:
             fn(*args)
-        except Exception as exc:   # falha de gravação nunca derruba a interface
-            print(f"[{APP_NAME}] erro ao gravar no banco: {exc}", file=sys.stderr)
+        except Exception:   # falha de gravação nunca derruba a interface (e o snapshot não avança: será refeita)
+            log.error("erro ao gravar no banco", exc_info=True)
 
     def _init_schema(self):
         with self._lock:
@@ -708,6 +1015,21 @@ class LibraryDB:
                           [(i, self._upsert_track(c, t)) for i, t in enumerate(tracks)])
             self._prune(c)
 
+    # O snapshot (o que a interface compara para decidir se há o que gravar) só avança DEPOIS do commit.
+    # Antes ele avançava antes da gravação: se ela falhasse (disco cheio, banco travado) a interface
+    # passava a achar que estava salvo e nunca tentava de novo (perda silenciosa de dados).
+    def _w_playlists_commit(self, order, changed, keys):
+        self._w_playlists(order, changed)
+        self._pl_snap = keys
+
+    def _w_favorites_commit(self, tracks, keys):
+        self._w_favorites(tracks)
+        self._fav_snap = keys
+
+    def _w_history_commit(self, tracks, keys):
+        self._w_history(tracks)
+        self._hist_snap = keys
+
     def _w_sync_local(self, tracks, sig=""):
         """Delta-sync do espelho da biblioteca local. Três níveis de economia:
         1) `sig` (mtime+tamanho do library.json, que o app só regrava quando algo muda) igual ao da última
@@ -749,22 +1071,19 @@ class LibraryDB:
         if keys == self._pl_snap:
             return
         changed = {n: [dict(t) for t in playlists[n]] for n in keys if self._pl_snap.get(n) != keys[n]}
-        self._pl_snap = keys
-        self._submit(self._w_playlists, list(keys), changed)
+        self._submit(self._w_playlists_commit, list(keys), changed, keys)
 
     def save_favorites(self, tracks):
         keys = tuple(track_key(t) for t in tracks)
         if keys == self._fav_snap:
             return
-        self._fav_snap = keys
-        self._submit(self._w_favorites, [dict(t) for t in tracks])
+        self._submit(self._w_favorites_commit, [dict(t) for t in tracks], keys)
 
     def save_history(self, tracks):
         keys = tuple(track_key(t) for t in tracks)
         if keys == self._hist_snap:
             return
-        self._hist_snap = keys
-        self._submit(self._w_history, [dict(t) for t in tracks])
+        self._submit(self._w_history_commit, [dict(t) for t in tracks], keys)
 
     def sync_local(self, tracks, sig=""):
         """Espelha o índice da biblioteca local na tabela tracks (para a busca FTS), em segundo plano.
@@ -782,8 +1101,8 @@ class LibraryDB:
 
     def load_playlists(self):
         out = {}
-        with self._lock:
-            rows = self.conn.execute(
+        with self._rlock:
+            rows = (self.rconn or self.conn).execute(
                 "SELECT p.name, t.data FROM playlists p "
                 "LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id "
                 "LEFT JOIN tracks t ON t.id = pt.track_id ORDER BY p.position, p.id, pt.position").fetchall()
@@ -796,8 +1115,8 @@ class LibraryDB:
         return out
 
     def _load_ordered(self, sql):
-        with self._lock:
-            rows = self.conn.execute(sql).fetchall()
+        with self._rlock:
+            rows = (self.rconn or self.conn).execute(sql).fetchall()
         return [d for d in (self._loads(r[0]) for r in rows) if d]
 
     def load_favorites(self):
@@ -815,17 +1134,18 @@ class LibraryDB:
         toks = re.findall(r"[^\W_]+", text or "")
         if not toks:
             return []
-        with self._lock:
+        with self._rlock:
             try:
+                rc = self.rconn or self.conn
                 if self.fts:
                     q = " ".join('"%s"*' % t.replace('"', "") for t in toks)
-                    rows = self.conn.execute(
+                    rows = rc.execute(
                         "SELECT t.data FROM tracks_fts JOIN tracks t ON t.id = tracks_fts.rowid "
                         "WHERE tracks_fts MATCH ? ORDER BY bm25(tracks_fts, 4.0, 2.0, 1.0) LIMIT ?",
                         (q, limit)).fetchall()
                 else:
                     where = " AND ".join(["unaccent(title || ' ' || artist || ' ' || album) LIKE ?"] * len(toks))
-                    rows = self.conn.execute(
+                    rows = rc.execute(
                         f"SELECT data FROM tracks WHERE {where} LIMIT ?",
                         [f"%{_unaccent_text(t).lower()}%" for t in toks] + [limit]).fetchall()
             except sqlite3.Error:
@@ -833,8 +1153,8 @@ class LibraryDB:
         return [d for d in (self._loads(r[0]) for r in rows) if d]
 
     def count_tracks(self):
-        with self._lock:
-            return self.conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+        with self._rlock:
+            return (self.rconn or self.conn).execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
 
     # ---------- migração dos .json legados ----------
     @staticmethod
@@ -878,6 +1198,10 @@ class LibraryDB:
             return
         self._closed = True
         self._writer.shutdown(wait=True)
+        if self.rconn is not None and self.rconn is not self.conn:
+            with self._rlock:
+                with contextlib.suppress(sqlite3.Error):
+                    self.rconn.close()
         with self._lock:
             try:
                 self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -973,9 +1297,7 @@ def webradio_search(name="", country_code="", tag="", limit=80, timeout=8):
     last_err = None
     for base in WEBRADIO_SERVERS:
         try:
-            req = urllib.request.Request(f"{base}/json/stations/search?{qs}", headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            data = http_json(f"{base}/json/stations/search?{qs}", timeout=timeout)
             if isinstance(data, list):
                 return [s for s in data if isinstance(s, dict)]
         except Exception as exc:
@@ -985,9 +1307,9 @@ def webradio_search(name="", country_code="", tag="", limit=80, timeout=8):
 
 def webradio_to_track(st):
     """Estação do Radio-Browser -> faixa do app (toca como qualquer outra, via fila)."""
-    url = (st.get("url_resolved") or st.get("url") or "").strip()
+    url = safe_http_url(st.get("url_resolved") or "") or safe_http_url(st.get("url") or "")
     uuid = (st.get("stationuuid") or "").strip()
-    if not url or not uuid:
+    if not url or not uuid or not re.match(r"^[A-Za-z0-9-]{8,64}$", uuid):
         return None
     tags = ", ".join([t for t in (st.get("tags") or "").split(",") if t][:4])
     country = st.get("country") or st.get("countrycode") or ""
@@ -1003,10 +1325,10 @@ def webradio_register_click(uuid):
     """Boa prática da API: avisa que a estação foi ouvida (ajuda o ranking). Falha em silêncio."""
     for base in WEBRADIO_SERVERS[:2]:
         try:
-            req = urllib.request.Request(f"{base}/json/url/{urllib.parse.quote(uuid)}", headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=6):
-                return
+            http_get(f"{base}/json/url/{urllib.parse.quote(uuid)}", max_bytes=65536, timeout=6)
+            return
         except Exception:
+            log.debug("webradio_register_click falhou em %s", base, exc_info=True)
             continue
 
 
@@ -1020,11 +1342,13 @@ PRELOAD_LATE_S = 4
 
 def resolve_stream_url(video_url, timeout=30):
     """URL direta do áudio (yt-dlp -g). Bloqueante: use em thread. Devolve None se falhar."""
+    if not safe_http_url(video_url):
+        return None
     try:
         out = subprocess.run(
             ["yt-dlp", "-g", "-f", "bestaudio/best", "--no-playlist", "--no-warnings",
-             "--socket-timeout", "10", video_url],
-            capture_output=True, text=True, timeout=timeout)
+             "--socket-timeout", "10", "--", video_url],
+            capture_output=True, text=True, errors="replace", timeout=timeout)
     except (subprocess.SubprocessError, OSError):
         return None
     if out.returncode != 0:
@@ -1068,8 +1392,9 @@ class MPVController:
             except Exception:
                 try:
                     proc.kill()
+                    proc.wait(timeout=2)         # colhe o processo: sem zumbi
                 except Exception:
-                    pass
+                    log.debug("mpv não encerrou", exc_info=True)
         try:
             os.remove(MPV_SOCKET)
         except OSError:
@@ -1092,7 +1417,7 @@ class MPVController:
                 pass
 
         try:
-            log_file = open(MPV_LOG, "w")
+            log_file = _open_private(MPV_LOG, "w")      # 0600, sem seguir symlink, em pasta privada
         except OSError:
             log_file = subprocess.DEVNULL
         try:
@@ -1116,6 +1441,7 @@ class MPVController:
                 stderr=subprocess.STDOUT,
             )
         except (FileNotFoundError, OSError):
+            log.warning("não foi possível iniciar o mpv", exc_info=True)
             return False
         finally:
             if log_file is not subprocess.DEVNULL:
@@ -1124,15 +1450,20 @@ class MPVController:
         for _ in range(50):
             if os.path.exists(MPV_SOCKET):
                 break
+            if self.proc.poll() is not None:      # mpv morreu ao iniciar: não espera os 5 s inteiros
+                log.warning("mpv encerrou ao iniciar (código %s); veja %s", self.proc.returncode, MPV_LOG)
+                return False
             time.sleep(0.1)
         else:
+            self._cleanup()
             return False
 
         try:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.sock.connect(MPV_SOCKET)
         except OSError:
-            self.sock = None
+            log.warning("falha ao conectar ao socket do mpv", exc_info=True)
+            self._cleanup()                       # não deixa um mpv sem controle rodando
             return False
 
         self._running = True
@@ -1193,6 +1524,10 @@ class MPVController:
                 if msg.get("event") == "end-file" and msg.get("reason") == "eof":
                     if "on_track_end" in self.callbacks:
                         GLib.idle_add(self.callbacks["on_track_end"])
+                elif msg.get("event") == "end-file" and msg.get("reason") == "error":
+                    # yt-dlp/rede falhou ao abrir: o loadfile "deu certo", o erro só chega aqui
+                    if "on_track_error" in self.callbacks:
+                        GLib.idle_add(self.callbacks["on_track_error"], str(msg.get("file_error") or "erro"))
 
                 elif msg.get("event") == "property-change":
                     name = msg.get("name")
@@ -1448,7 +1783,7 @@ class MprisService:
         self.conn = None
         for n in (0, 1):
             try:
-                os.remove(os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpris_art_{os.getpid()}_{n}.jpg"))
+                os.remove(os.path.join(RUNTIME_DIR, f"mpris_art_{os.getpid()}_{n}.jpg"))
             except OSError:
                 pass
 
@@ -1466,7 +1801,7 @@ class MprisService:
         return "Paused" if a._mpv_paused else "Playing"
 
     def _loop(self):
-        return "Track" if self.app.is_repeat else "None"
+        return "Playlist" if self.app.is_repeat else "None"       # "Repetir fila"
 
     def _volume(self):
         a = self.app
@@ -1556,7 +1891,7 @@ class MprisService:
             if iface != _MPRIS_PLAYER:
                 return False
             if name == "LoopStatus":
-                a.btn_repeat.set_active(value.get_string() == "Track")
+                a.btn_repeat.set_active(value.get_string() in ("Track", "Playlist"))
                 return True
             if name == "Shuffle":
                 a.btn_shuffle.set_active(bool(value.get_boolean()))
@@ -1645,7 +1980,7 @@ class MprisService:
             if not src_path or not os.path.isfile(src_path):
                 return
             self._art_toggle ^= 1
-            dst = os.path.join(tempfile.gettempdir(), f"{APP_ID}_mpris_art_{os.getpid()}_{self._art_toggle}.jpg")
+            dst = os.path.join(RUNTIME_DIR, f"mpris_art_{os.getpid()}_{self._art_toggle}.jpg")
             shutil.copyfile(src_path, dst)
             self._art_url = "file://" + urllib.parse.quote(dst)
             self._art_key = key
@@ -1834,12 +2169,7 @@ class MusicPlayerApp(Gtk.Window):
             "width": 540,
             "height": 740,
         })
-        if not isinstance(self.config, dict):
-            self.config = {"volume": 100}
-        try:
-            self.config["volume"] = max(0, min(100, int(self.config.get("volume", 100))))
-        except (TypeError, ValueError):
-            self.config["volume"] = 100
+        self.config = _sanitize_config(self.config)
 
         self.set_default_size(self.config.get("win_w", 1040), self.config.get("win_h", 720))
         self.set_position(Gtk.WindowPosition.CENTER)
@@ -1859,7 +2189,7 @@ class MusicPlayerApp(Gtk.Window):
         self._hearts = weakref.WeakSet()
         # Biblioteca local (Músicas Offline)
         _lib = self._load_json(LIBRARY_FILE, {})
-        self.lib_index = _lib.get("tracks", {}) if isinstance(_lib, dict) else {}
+        self.lib_index = _clean_lib_index(_lib.get("tracks", {}) if isinstance(_lib, dict) else {})
         self.lib_root = self.config.get("library_root", "")
         self.lib_dir = self.lib_root
         self._lib_album_cache = {}
@@ -1871,6 +2201,9 @@ class MusicPlayerApp(Gtk.Window):
         self._wiki_forced = None
         self.album_artist_name = ""
         self._art_cache = {}
+        self._art_lock = threading.Lock()
+        self._art_bytes = 0
+        self._lyrics_for_token = None         # _play_token da faixa cuja letra já foi buscada
         self._art_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="art")  # capas: no máx. 4 downloads simultâneos
         self._dl_procs = set()
         self._pl_busy = False
@@ -2182,6 +2515,7 @@ class MusicPlayerApp(Gtk.Window):
             callbacks={
                 "on_track_end": self.on_track_finished,
                 "on_load_error": self.on_load_error,
+                "on_track_error": self.on_track_error,
                 "on_time_change": self.on_mpv_time_change,
                 "on_duration_change": self.on_mpv_duration_change,
                 "on_pause_change": self.on_mpv_pause_change,
@@ -2249,9 +2583,14 @@ class MusicPlayerApp(Gtk.Window):
             missing.append("mpv")
         if not shutil.which("yt-dlp"):
             missing.append("yt-dlp")
+        # opcionais: o app abre sem eles, mas perde um recurso (aviso no log, sem diálogo)
+        if not shutil.which("ffmpeg"):
+            log.warning("ffmpeg não encontrado: downloads em MP3 e capas embutidas não vão funcionar")
+        if importlib.util.find_spec("cairo") is None:      # python3-gi-cairo: necessário p/ os handlers 'draw' do GTK
+            log.warning("pycairo/python3-gi-cairo ausente: gráficos do Perfil e o indicador de arrastar da fila podem falhar")
 
         if missing:
-            msg = f"As seguintes dependências necessárias não foram encontradas no sistema:\n\n• " + "\n• ".join(missing)
+            msg = "As seguintes dependências necessárias não foram encontradas no sistema:\n\n• " + "\n• ".join(missing)
             msg += "\n\nPor favor, instale-as via gerenciador de pacotes para utilizar o aplicativo."
             dialog = Gtk.MessageDialog(
                 transient_for=self,
@@ -2799,7 +3138,7 @@ class MusicPlayerApp(Gtk.Window):
             # sem on_click: um clique simples não toca; só duplo clique (ou menu do botão direito)
             card = self._card(
                 item.get("title", ""), item.get("uploader", ""), (160, 90), icon="audio-x-generic",
-                url=f"https://i.ytimg.com/vi/{item['id']}/mqdefault.jpg" if item.get("id") else None,
+                url=yt_thumb_url(item.get("id")) if not item.get("path") else None,
                 local_item=item if item.get("path") else None)
             card.set_tooltip_text(f"{item.get('title', '')}\nDuplo clique para tocar · botão direito para opções")
             card.connect("button-press-event", self._on_recent_card_press, item)
@@ -3641,7 +3980,8 @@ class MusicPlayerApp(Gtk.Window):
 
     def _lib_sort_key(self, item):
         tn = str(item.get("track_no") or "")
-        return (int(tn) if tn.isdigit() else 9999, os.path.basename(item["path"]).lower())
+        # isascii: "²" e "①" passam em isdigit() mas int() levanta ValueError
+        return (int(tn) if tn.isascii() and tn.isdigit() else 9999, os.path.basename(item.get("path") or "").lower())
 
     def _lib_tracks_under(self, folder, recursive=True):
         """Faixas de uma pasta. Recursivo usa o índice; se ele estiver vazio, lê a pasta direto."""
@@ -3929,9 +4269,36 @@ class MusicPlayerApp(Gtk.Window):
                          daemon=True).start()
 
     def _lib_scan_thread(self, root, old, token):
+        """Envelope: qualquer falha inesperada na varredura libera o estado 'indexando' (antes a
+        interface podia ficar presa nele) e deixa o motivo no log."""
+        try:
+            self._lib_scan_thread_impl(root, old, token)
+        except Exception:
+            log.error("varredura da biblioteca falhou", exc_info=True)
+            GLib.idle_add(self._lib_scan_failed, token)
+
+    def _lib_scan_failed(self, token):
+        if token == self._lib_scan_token:
+            self._lib_scanning = False
+            self.lib_status.set_text("Falha ao indexar a biblioteca (veja o log).")
+        return False
+
+    def _lib_scan_thread_impl(self, root, old, token):
         """Varre a pasta. Só relê tags de arquivos novos/alterados (mtime+tamanho)."""
         found = []
+        seen_dirs = set()                       # (dispositivo, inode): symlink para um ancestral não vira laço
         for base, dirs, names in os.walk(root, followlinks=True):
+            if token != self._lib_scan_token:   # nova varredura/pasta trocada: para de caminhar
+                return
+            try:
+                st = os.stat(base)
+            except OSError:
+                dirs[:] = []
+                continue
+            if (st.st_dev, st.st_ino) in seen_dirs:
+                dirs[:] = []
+                continue
+            seen_dirs.add((st.st_dev, st.st_ino))
             dirs[:] = [d for d in dirs if not d.startswith(".")]
             for n in names:
                 if n.lower().endswith(AUDIO_EXTS) and not n.startswith("."):
@@ -3967,7 +4334,7 @@ class MusicPlayerApp(Gtk.Window):
                         path, meta = fut.result()
                         new_index[path] = meta
                     except Exception:
-                        pass
+                        log.debug("tags ilegíveis", exc_info=True)
                     done += 1
                     if done % 25 == 0:
                         GLib.idle_add(self.lib_status.set_text, f"Indexando... {done}/{total}")
@@ -4021,6 +4388,7 @@ class MusicPlayerApp(Gtk.Window):
     def _lib_enrich_thread(self, paths, token, force):
         found = checked = errors = 0
         total = len(paths)
+        root = self.lib_root              # raiz de quando começou: trocar de pasta no meio não grava índice misturado
         try:
             for n, path in enumerate(paths, start=1):
                 if token != self._lib_scan_token:
@@ -4044,11 +4412,11 @@ class MusicPlayerApp(Gtk.Window):
                 if res and self._lib_apply_online(entry, res):
                     found += 1
                 entry["online_checked"] = True
-                if checked % 20 == 0:
-                    self._save_json(LIBRARY_FILE, {"root": self.lib_root, "tracks": dict(self.lib_index)}, compact=True)
+                if checked % 20 == 0 and token == self._lib_scan_token:
+                    self._save_json(LIBRARY_FILE, {"root": root, "tracks": dict(self.lib_index)}, compact=True)
                 time.sleep(0.25)             # respeita o limite de requisições do Deezer
             if checked and token == self._lib_scan_token:
-                self._save_json(LIBRARY_FILE, {"root": self.lib_root, "tracks": dict(self.lib_index)}, compact=True)
+                self._save_json(LIBRARY_FILE, {"root": root, "tracks": dict(self.lib_index)}, compact=True)
                 GLib.idle_add(self._lib_enrich_done, found, checked)
         finally:
             GLib.idle_add(self._lib_enrich_finished)
@@ -4310,6 +4678,8 @@ class MusicPlayerApp(Gtk.Window):
         self._panel_lock = True
         self.btn_lyrics_toggle.set_active(revealed and name == "lyrics")
         self._panel_lock = False
+        if revealed and name == "lyrics" and getattr(self, "_lyrics_for_token", None) != self._play_token:
+            self.search_current_lyrics()
 
     def _on_panel_toggle(self, btn, name):
         if not self._panel_lock:
@@ -4334,11 +4704,6 @@ class MusicPlayerApp(Gtk.Window):
     def on_rename_current_playlist(self, button=None):
         if self.selected_playlist:
             self._rename_playlist(self.selected_playlist)
-
-    def _current_item(self):
-        if 0 <= self.current_index < len(self.queue):
-            return self.queue[self.current_index]
-        return None
 
     def _update_now_playing_card(self, item):
         artist = "" if self._is_live(item) else (self._guess_artist(item) or item.get("uploader", ""))
@@ -4645,7 +5010,12 @@ class MusicPlayerApp(Gtk.Window):
                 with open(path, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception:
-                pass
+                # Arquivo ilegível/corrompido: guarda uma cópia antes que o próximo salvamento o sobrescreva.
+                log.warning("JSON ilegível: %s", path, exc_info=True)
+                try:
+                    os.replace(path, f"{path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
+                except OSError:
+                    pass
         return default
 
     def _save_queue(self):
@@ -4667,8 +5037,22 @@ class MusicPlayerApp(Gtk.Window):
             self.db = LibraryDB(DB_FILE, {"playlists": PLAYLISTS_FILE, "favorites": FAVORITES_FILE,
                                           "history": HISTORY_FILE})
         except Exception as exc:
-            print(f"[{APP_NAME}] banco SQLite indisponível, usando JSON: {exc}", file=sys.stderr)
+            log.error("banco SQLite indisponível: %s", exc, exc_info=True)
             self.db = None
+            if sqlite3 is not None and isinstance(exc, sqlite3.DatabaseError) and os.path.exists(DB_FILE):
+                # Banco corrompido: guarda uma cópia e recria do zero. Os .json gravados no último
+                # encerramento limpo (playlists/favoritas/histórico) são reimportados pela migração.
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                for suffix in ("", "-wal", "-shm"):
+                    with contextlib.suppress(OSError):
+                        os.replace(DB_FILE + suffix, f"{DB_FILE}{suffix}.corrupt-{stamp}")
+                try:
+                    self.db = LibraryDB(DB_FILE, {"playlists": PLAYLISTS_FILE, "favorites": FAVORITES_FILE,
+                                                  "history": HISTORY_FILE})
+                    log.warning("banco recriado; cópia do antigo em %s.corrupt-%s", DB_FILE, stamp)
+                except Exception:
+                    log.error("não foi possível recriar o banco; usando JSON", exc_info=True)
+                    self.db = None
 
     def _db_load(self, what):
         """Playlists/favoritas/histórico: do SQLite; sem banco, dos .json (ou do .bak deixado pela migração)."""
@@ -4676,8 +5060,8 @@ class MusicPlayerApp(Gtk.Window):
             try:
                 return {"playlists": self.db.load_playlists, "favorites": self.db.load_favorites,
                         "history": self.db.load_history}[what]()
-            except Exception as exc:
-                print(f"[{APP_NAME}] falha ao ler o banco ({what}): {exc}", file=sys.stderr)
+            except Exception:
+                log.error("falha ao ler o banco (%s); usando JSON", what, exc_info=True)
                 self.db = None
         path, default = {"playlists": (PLAYLISTS_FILE, {}), "favorites": (FAVORITES_FILE, []),
                          "history": (HISTORY_FILE, [])}[what]
@@ -4697,18 +5081,28 @@ class MusicPlayerApp(Gtk.Window):
                 else:
                     self.db.save_history(data)
                 return
-            except Exception as exc:
-                print(f"[{APP_NAME}] falha ao gravar no banco, usando JSON: {exc}", file=sys.stderr)
-        tmp_path = path + ".tmp"
+            except Exception:
+                log.error("falha ao gravar no banco; usando JSON", exc_info=True)
+        # Nome temporário único (threads de varredura/enriquecimento e a principal podem gravar o mesmo
+        # arquivo) + lock + fsync: sem JSON intercalado e sem arquivo vazio após queda de energia.
+        tmp_path = None
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                if compact:
-                    json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-                else:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, path)
+            with _JSON_WRITE_LOCK:
+                fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                                                dir=os.path.dirname(path) or ".")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    if compact:
+                        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+                    else:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path)
+                tmp_path = None
         except Exception:
-            if os.path.exists(tmp_path):
+            log.warning("falha ao gravar %s", path, exc_info=True)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
                 except OSError:
@@ -4830,13 +5224,20 @@ class MusicPlayerApp(Gtk.Window):
         return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
     def _extract_id(self, uri):
-        m = re.search(r"v=([^&]+)", uri)
-        if m:
-            return m.group(1)
-        m = re.search(r"youtu\.be/([a-zA-Z0-9_-]+)", uri)
-        if m:
-            return m.group(1)
-        return None
+        """ID de vídeo do YouTube de um link youtube.com/youtu.be; None para qualquer outra coisa
+        (links de outros sites não podem virar \"watch?v=<id>\")."""
+        try:
+            p = urllib.parse.urlsplit((uri or "").strip())
+        except ValueError:
+            return None
+        host = (p.hostname or "").lower()
+        if host not in _YT_HOSTS:
+            return None
+        if host == "youtu.be":
+            cand = p.path.strip("/").split("/")[0]
+        else:
+            cand = (urllib.parse.parse_qs(p.query).get("v") or [""])[0]
+        return cand if valid_video_id(cand) else None
 
     # ---------- Normalização de texto e nomes ----------
     @staticmethod
@@ -4889,9 +5290,13 @@ class MusicPlayerApp(Gtk.Window):
 
     def _notify(self, title, message, icon="audio-x-generic"):
         try:
-            subprocess.Popen(["notify-send", "-a", APP_NAME, "-i", icon or "audio-x-generic", title, message], stderr=subprocess.DEVNULL)
+            # títulos vêm da rede: neutraliza tags (alguns servidores de notificação interpretam markup)
+            safe_msg = str(message).replace("<", "&lt;").replace(">", "&gt;")
+            proc = subprocess.Popen(["notify-send", "-a", APP_NAME, "-i", icon or "audio-x-generic", title, safe_msg],
+                                    stderr=subprocess.DEVNULL)
+            threading.Thread(target=proc.wait, daemon=True).start()      # colhe o processo (sem zumbi)
         except Exception:
-            pass
+            log.debug("notify-send indisponível", exc_info=True)
 
     def _check_ytdlp_update(self):
         """Atualiza o yt-dlp em segundo plano, no máximo 1x por dia (antes: a cada abertura, competindo
@@ -4901,13 +5306,16 @@ class MusicPlayerApp(Gtk.Window):
             if now - float(self.config.get("ytdlp_checked", 0) or 0) < 86400:
                 return
             self.config["ytdlp_checked"] = now
-            self._schedule_config_save()
-            subprocess.run(["yt-dlp", "-U"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            GLib.idle_add(self._schedule_config_save)      # agenda na thread principal (esta é uma thread de fundo)
+            res = subprocess.run(["yt-dlp", "-U"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            if res.returncode != 0:      # instalação por pacote/pip não se atualiza sozinha: normal
+                log.debug("yt-dlp -U terminou com código %s", res.returncode)
         except Exception:
-            pass
+            log.debug("verificação de atualização do yt-dlp falhou", exc_info=True)
 
     def _start_ytdlp_check(self):
         threading.Thread(target=self._check_ytdlp_update, daemon=True).start()
+        threading.Thread(target=prune_cover_cache, args=(COVERS_DIR,), daemon=True).start()   # manutenção em 2º plano
         return False
 
     # ---------- Gerenciamento de Playlists ----------
@@ -5139,18 +5547,13 @@ class MusicPlayerApp(Gtk.Window):
             if item.get("path"):
                 data, _ = self._local_cover_cached(item)
             else:
-                url = f"https://i.ytimg.com/vi/{item['id']}/mqdefault.jpg"
+                url = yt_thumb_url(item.get("id"))
+                if not url:
+                    return
                 data = self._art_cache.get(url)
                 if data is None:
-                    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-                    with urllib.request.urlopen(req, timeout=6) as resp:
-                        data = resp.read()
-                    while len(self._art_cache) >= 300:
-                        try:
-                            del self._art_cache[next(iter(self._art_cache))]
-                        except (StopIteration, KeyError, RuntimeError):
-                            break
-                    self._art_cache[url] = data
+                    data = http_get(url, max_bytes=HTTP_MAX_IMAGE, timeout=6)
+                    self._art_cache_put(url, data)
             if not data:
                 return
             loader = GdkPixbuf.PixbufLoader()
@@ -5319,7 +5722,10 @@ class MusicPlayerApp(Gtk.Window):
         dialog.destroy()
 
         if response == Gtk.ResponseType.OK and name:
-            self.playlists[name] = list(self.queue)
+            if name in self.playlists and not self._confirm_action(
+                    f"Já existe a playlist '{name}'. Substituir o conteúdo dela pela fila atual?"):
+                return
+            self.playlists[name] = [dict(t) for t in self.queue]
             self._save_json(PLAYLISTS_FILE, self.playlists)
             self.render_playlists()
             self.show_toast(f"Fila salva como '{name}'!")
@@ -5486,21 +5892,17 @@ class MusicPlayerApp(Gtk.Window):
                     url = f"{DEEZER_API}/search?q={urllib.parse.quote(query)}&limit=30"
                     dz["tracks"] = self._http_json(url, timeout=6).get("data", []) or []
                 except Exception:
-                    pass
+                    log.debug("busca no Deezer falhou", exc_info=True)
 
             dz_thread = threading.Thread(target=_dz_worker, daemon=True)
             dz_thread.start()
 
         try:
-            out = subprocess.check_output(
-                ["yt-dlp", target, "--flat-playlist", "-j", "--no-warnings"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=30,
-            )
+            out = self._run_ytdlp_search(target)
         except Exception as e:
+            log.info("busca falhou: %s", e)
             if token == self.search_token:
-                GLib.idle_add(self._search_failed, str(e))
+                GLib.idle_add(self._search_failed, self._search_error_text(e))
             return
 
         if dz_thread:
@@ -5516,12 +5918,14 @@ class MusicPlayerApp(Gtk.Window):
                 continue
 
             vid_id = data.get("id") or self._extract_id(data.get("url", ""))
-            if not vid_id:
+            if not valid_video_id(vid_id):       # resultado de outro site/playlist: não toca como YouTube
                 continue
 
             title = data.get("title") or "Sem título"
             uploader = data.get("uploader") or data.get("channel") or ""
             dur_s = data.get("duration") or 0
+            if not isinstance(dur_s, (int, float)):
+                dur_s = 0
 
             match = self._match_deezer_track(title, uploader, dur_s, dz["tracks"])
             if match:
@@ -5546,6 +5950,37 @@ class MusicPlayerApp(Gtk.Window):
 
         if token == self.search_token:
             GLib.idle_add(self._populate_results, items)
+
+    def _run_ytdlp_search(self, target):
+        """yt-dlp --flat-playlist em processo rastreado: uma busca nova cancela a anterior (antes cada
+        busca rápida deixava um yt-dlp rodando por até 30 s) e playlists enormes são limitadas."""
+        prev = getattr(self, "_search_proc", None)
+        if prev is not None and prev.poll() is None:
+            with contextlib.suppress(OSError):
+                prev.kill()
+        proc = subprocess.Popen(
+            ["yt-dlp", "--flat-playlist", "--playlist-end", "50", "-j", "--no-warnings",
+             "--socket-timeout", "15", "--", target],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+        self._search_proc = proc
+        try:
+            out, _ = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+        if proc.returncode != 0:
+            raise RuntimeError(f"yt-dlp saiu com código {proc.returncode}")
+        return out
+
+    @staticmethod
+    def _search_error_text(exc):
+        """Mensagem para o usuário (sem expor a linha de comando do subprocesso)."""
+        if isinstance(exc, FileNotFoundError):
+            return "yt-dlp não encontrado. Instale-o para buscar músicas."
+        if isinstance(exc, subprocess.TimeoutExpired):
+            return "A busca demorou demais. Tente de novo."
+        return "A busca falhou. Verifique a conexão ou tente outro termo."
 
     def _match_deezer_track(self, yt_title, yt_uploader, yt_duration, dz_tracks):
         """Casa um vídeo do YouTube com uma faixa do Deezer (nome limpo + artista certo)."""
@@ -5669,10 +6104,14 @@ class MusicPlayerApp(Gtk.Window):
 
     def add_to_queue(self, item, notify=True):
         item = self._normalize_track(item)
+        fits, removed = self._make_room(1)
+        if not fits:
+            self.show_toast(f"A fila está cheia ({self.QUEUE_MAX} faixas).")
+            return
         self.queue.append(item)
         self._save_queue()
 
-        if self._queue_rows_in_sync():
+        if not removed and self._queue_rows_in_sync():
             row = self._create_queue_row(len(self.queue) - 1, item)
             self.queue_list.add(row)
             row.show_all()
@@ -5682,11 +6121,17 @@ class MusicPlayerApp(Gtk.Window):
 
     def add_items_bulk(self, items, notify=True):
         norm_items = [self._normalize_track(it) for it in items]
+        fits, removed = self._make_room(len(norm_items))
+        if fits < len(norm_items):
+            self.show_toast(f"Fila no limite de {self.QUEUE_MAX} faixas: {len(norm_items) - fits} não adicionada(s).")
+            norm_items = norm_items[:fits]
+        if not norm_items:
+            return
         start_idx = len(self.queue)
         self.queue.extend(norm_items)
         self._save_queue()
 
-        if self._queue_rows_in_sync():
+        if not removed and self._queue_rows_in_sync():
             for i, item in enumerate(norm_items, start=start_idx):
                 row = self._create_queue_row(i, item)
                 self.queue_list.add(row)
@@ -5814,8 +6259,13 @@ class MusicPlayerApp(Gtk.Window):
             return
         
         idxs = sorted((r.get_index() for r in rows), reverse=True)
-        playing_item = self.queue[self.current_index] if 0 <= self.current_index < len(self.queue) else None
-        
+        cur = self.current_index
+        playing = 0 <= cur < len(self.queue)
+        # Posição da faixa tocando depois da remoção, por ÍNDICE (comparar o dict achava a 1ª cópia
+        # quando a mesma faixa aparecia mais de uma vez na fila).
+        removed_current = playing and cur in set(idxs)
+        shift = sum(1 for i in idxs if i < cur)
+
         for row in rows:
             self.queue_list.remove(row)
 
@@ -5825,9 +6275,9 @@ class MusicPlayerApp(Gtk.Window):
 
         self._save_queue()
 
-        if playing_item is not None and playing_item in self.queue:
-            self.current_index = self.queue.index(playing_item)
-        elif playing_item is not None:
+        if playing and not removed_current:
+            self.current_index = cur - shift
+        elif playing:
             self.current_index = -1
             self.mpv.stop()
             self._set_mpv_idle(True)
@@ -6126,6 +6576,7 @@ class MusicPlayerApp(Gtk.Window):
         return title.strip(" -–—|")
 
     def search_current_lyrics(self):
+        self._lyrics_for_token = self._play_token
         if 0 <= self.current_index < len(self.queue):
             item = self.queue[self.current_index]
             if item.get("webradio"):
@@ -6142,50 +6593,40 @@ class MusicPlayerApp(Gtk.Window):
                 return
             threading.Thread(
                 target=self._fetch_lyrics_thread,
-                args=(item["title"], item.get("uploader", "")),
+                args=(item.get("title", ""), item.get("uploader", ""), self._play_token),
                 daemon=True,
             ).start()
         else:
             self._update_lyrics_ui("Nenhuma música tocando no momento.")
 
-    def _fetch_lyrics_thread(self, raw_title, uploader):
+    def _fetch_lyrics_thread(self, raw_title, uploader, token):
         clean_t = self._clean_title(raw_title)
         query = f"{uploader} {clean_t}".strip() if uploader and uploader.lower() not in clean_t.lower() else clean_t
 
-        lyrics_found = None
-        try:
-            url = f"https://lrclib.net/api/search?q={urllib.parse.quote(query)}"
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                for res in data:
-                    if res.get("plainLyrics"):
-                        lyrics_found = res["plainLyrics"]
-                        break
-                    elif res.get("syncedLyrics"):
-                        lyrics_found = re.sub(r"\[\d+:\d+\.\d+\]\s*", "", res["syncedLyrics"])
-                        break
-        except Exception:
-            pass
-
-        if not lyrics_found and query != clean_t:
+        def _lrclib(q):
             try:
-                url = f"https://lrclib.net/api/search?q={urllib.parse.quote(clean_t)}"
-                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    for res in data:
-                        if res.get("plainLyrics"):
-                            lyrics_found = res["plainLyrics"]
-                            break
-                        elif res.get("syncedLyrics"):
-                            lyrics_found = re.sub(r"\[\d+:\d+\.\d+\]\s*", "", res["syncedLyrics"])
-                            break
+                data = http_json(f"https://lrclib.net/api/search?q={urllib.parse.quote(q)}", timeout=8)
+                for res in data if isinstance(data, list) else []:
+                    if not isinstance(res, dict):
+                        continue
+                    if isinstance(res.get("plainLyrics"), str) and res["plainLyrics"]:
+                        return res["plainLyrics"]
+                    if isinstance(res.get("syncedLyrics"), str) and res["syncedLyrics"]:
+                        return re.sub(r"\[\d+:\d+\.\d+\]\s*", "", res["syncedLyrics"])
             except Exception:
-                pass
+                log.debug("lrclib falhou para %r", q, exc_info=True)
+            return None
 
+        lyrics_found = _lrclib(query)
+        if not lyrics_found and query != clean_t:
+            lyrics_found = _lrclib(clean_t)
+
+        if token != self._play_token:        # a faixa mudou enquanto buscava: descarta (evita letra trocada)
+            return
         meta = self._fetch_track_metadata(clean_t, uploader)
-        GLib.idle_add(self._apply_lyrics_result, lyrics_found, clean_t, meta)
+        if token != self._play_token:
+            return
+        GLib.idle_add(self._apply_lyrics_result, lyrics_found, clean_t, meta, token)
 
     def _local_lyrics_thread(self, item, token):
         """Faixa offline: tags/.lrc do próprio arquivo primeiro; só vai à internet se faltar algo."""
@@ -6215,7 +6656,7 @@ class MusicPlayerApp(Gtk.Window):
             except Exception:
                 pass
         if token == self._play_token:
-            GLib.idle_add(self._apply_lyrics_result, lyrics, title, meta)
+            GLib.idle_add(self._apply_lyrics_result, lyrics, title, meta, token)
 
     def _fetch_track_metadata(self, title, uploader):
         """Artista, álbum, ano e capa exibidos na aba Letra (via Deezer)."""
@@ -6244,7 +6685,9 @@ class MusicPlayerApp(Gtk.Window):
         except Exception:
             return empty
 
-    def _apply_lyrics_result(self, lyrics_found, clean_t, meta):
+    def _apply_lyrics_result(self, lyrics_found, clean_t, meta, token=None):
+        if token is not None and token != self._play_token:
+            return False
         self._update_lyrics_ui(lyrics_found or f"Letra não encontrada para:\n'{clean_t}'")
         self.lyrics_title_label.set_markup(f"<b>{GLib.markup_escape_text(clean_t)}</b>")
         self.lyrics_artist_label.set_text(meta.get("artist") or "")
@@ -6272,25 +6715,27 @@ class MusicPlayerApp(Gtk.Window):
         try:
             data = self._art_cache.get(url)
             if data is None:
-                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-                with urllib.request.urlopen(req, timeout=6) as resp:
-                    data = resp.read()
-                while len(self._art_cache) >= 300:          # descarta a mais antiga, não o cache todo
-                    try:
-                        del self._art_cache[next(iter(self._art_cache))]
-                    except (StopIteration, KeyError, RuntimeError):
-                        break
-                self._art_cache[url] = data
+                data = http_get(url, max_bytes=HTTP_MAX_IMAGE, timeout=6)
+                self._art_cache_put(url, data)
             pixbuf = self._decode_scaled(data, size, height or size)
             GLib.idle_add(image_widget.set_from_pixbuf, pixbuf)
         except Exception:
-            pass
+            log.debug("capa não carregada: %s", url, exc_info=True)
+
+    def _art_cache_put(self, url, data):
+        """Cache de capas limitado por quantidade E por bytes (descarta as mais antigas primeiro)."""
+        with self._art_lock:
+            old = self._art_cache.pop(url, None)
+            if old is not None:
+                self._art_bytes -= len(old)
+            self._art_cache[url] = data
+            self._art_bytes += len(data)
+            while self._art_cache and (len(self._art_cache) > 300 or self._art_bytes > 48 * 1024 * 1024):
+                self._art_bytes -= len(self._art_cache.pop(next(iter(self._art_cache))))
 
     # ---------- Aba Descobrir (Com Cancelamento) ----------
     def _http_json(self, url, timeout=8):
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return http_json(url, timeout=timeout)
 
     def _http_json_many(self, urls, timeout=8):
         """Baixa várias URLs JSON em paralelo (threads curtas, sem bloquear a UI)."""
@@ -7251,18 +7696,47 @@ class MusicPlayerApp(Gtk.Window):
                 m.set_art(src_path, key)
         return False
 
+    QUEUE_MAX = 2000          # limite da fila (cada mudança regrava o queue.json e a lista é montada em widgets)
+
+    def _make_room(self, n):
+        """Garante espaço para n faixas: descarta primeiro as já tocadas (início da fila). Devolve
+        (quantas cabem, quantas foram descartadas do início)."""
+        removed = 0
+        while len(self.queue) + n > self.QUEUE_MAX and self.current_index > 0:
+            self.queue.pop(0)
+            self.current_index -= 1
+            removed += 1
+        if removed:
+            self._invalidate_preload()
+            self.render_queue()
+        return max(0, min(n, self.QUEUE_MAX - len(self.queue))), removed
+
     def play_item(self, item):
         item = self._normalize_track(item)
+        key = track_key(item)
+        # Duplo clique repetido no mesmo resultado não empilha cópias: reaproveita a entrada se ela é a
+        # última da fila ou a que já está tocando.
+        for idx in {len(self.queue) - 1, self.current_index}:
+            if 0 <= idx < len(self.queue) and track_key(self.queue[idx]) == key:
+                self.current_index = idx
+                self.play_current()
+                return
+        fits, _ = self._make_room(1)
+        if not fits:
+            self.show_toast(f"A fila está cheia ({self.QUEUE_MAX} faixas).")
+            return
         self.add_to_queue(item, notify=False)
         self.current_index = len(self.queue) - 1
         self.play_current()
 
     def _media_source(self, item):
         """Caminho do arquivo (faixa offline) ou URL do YouTube. None se o arquivo sumiu."""
-        if item.get("stream_url"):          # rádio web: a URL do stream vai direto ao mpv
-            return item["stream_url"]
+        if item.get("stream_url"):          # rádio web: a URL do stream vai direto ao mpv (só http/https)
+            return safe_http_url(item["stream_url"]) or None
         if item.get("path"):
             return item["path"] if os.path.isfile(item["path"]) else None
+        if not valid_video_id(item.get("id")):
+            return None
         return f"https://www.youtube.com/watch?v={item['id']}"
 
     def play_current(self, gapless=False):
@@ -7273,8 +7747,12 @@ class MusicPlayerApp(Gtk.Window):
         item = self.queue[self.current_index]
         url = self._media_source(item)
         if url is None:
-            self.mostrar_mensagem(f"Arquivo não encontrado: {item['title']} (pasta movida ou disco desconectado?)")
-            self.show_toast("Arquivo offline não encontrado. Pulando.")
+            if item.get("path"):
+                self.mostrar_mensagem(f"Arquivo não encontrado: {item['title']} (pasta movida ou disco desconectado?)")
+                self.show_toast("Arquivo offline não encontrado. Pulando.")
+            else:
+                self.mostrar_mensagem(f"Faixa inválida ignorada: {item['title']}")
+                self.show_toast("Faixa inválida. Pulando.")
             self._highlight_current_row()
             self._missing_skips += 1
             if self._missing_skips <= len(self.queue):
@@ -7317,8 +7795,12 @@ class MusicPlayerApp(Gtk.Window):
         if item.get("path"):
             threading.Thread(target=self._load_local_thumbnail, args=(item, self._play_token), daemon=True).start()
         else:
-            threading.Thread(target=self._fetch_thumbnail, args=(item["id"], item["title"]), daemon=True).start()
-        self.search_current_lyrics()
+            threading.Thread(target=self._fetch_thumbnail, args=(item["id"], item["title"], self._play_token), daemon=True).start()
+        # Letra e metadados online só quando o painel de Letra está aberto (antes: toda faixa tocada
+        # disparava consultas ao LRCLIB e ao Deezer mesmo com o painel fechado). Ao abrir o painel, busca.
+        self._lyrics_for_token = None
+        if self.side_revealer.get_reveal_child() and self.side_stack.get_visible_child_name() == "lyrics":
+            self.search_current_lyrics()
         self._sync_artist_tabs(self._guess_artist(item))
         self._radio_refill()
 
@@ -7371,52 +7853,89 @@ class MusicPlayerApp(Gtk.Window):
 
         return False
 
-    def _fetch_thumbnail(self, video_id, title):
-        url = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
+    def _write_runtime_file(self, name, data):
+        """Grava data em RUNTIME_DIR/name de forma atômica (temporário + rename) numa pasta privada.
+        Devolve o caminho, ou None se falhar."""
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=name + ".", dir=RUNTIME_DIR)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            final = os.path.join(RUNTIME_DIR, name)
+            os.replace(tmp, final)
+            return final
+        except OSError:
+            log.debug("não foi possível gravar %s", name, exc_info=True)
+            if tmp:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp)
+            return None
+
+    def _fetch_thumbnail(self, video_id, title, token=None):
+        """Capa da faixa (YouTube). token: se a faixa já mudou, descarta o resultado e a notificação
+        (antes, pular faixas rápido trocava a capa pela de uma faixa antiga e notificava todas)."""
+        def current():
+            return token is None or token == self._play_token
+        url = yt_thumb_url(video_id)
         icon_path = None
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = resp.read()
-
-            thumb_path = os.path.join(tempfile.gettempdir(), f"{APP_ID}_now_playing.jpg")
-            try:
-                with open(thumb_path, "wb") as f:
-                    f.write(data)
-                icon_path = thumb_path
-            except OSError:
-                icon_path = None
-
+            if not url:
+                raise ValueError("id de vídeo inválido")
+            data = http_get(url, max_bytes=HTTP_MAX_IMAGE, timeout=5)
+            icon_path = self._write_runtime_file(f"now_playing_{os.getpid()}.jpg", data)
             pixbuf = self._decode_scaled(data, 64, 48)
-            GLib.idle_add(self.thumbnail_img.set_from_pixbuf, pixbuf)
+            if current():
+                GLib.idle_add(self.thumbnail_img.set_from_pixbuf, pixbuf)
         except Exception:
-            GLib.idle_add(self.thumbnail_img.set_from_icon_name, "audio-x-generic", Gtk.IconSize.DIALOG)
+            log.debug("miniatura indisponível (%s)", video_id, exc_info=True)
+            if current():
+                GLib.idle_add(self.thumbnail_img.set_from_icon_name, "audio-x-generic", Gtk.IconSize.DIALOG)
         finally:
-            GLib.idle_add(self._notify, APP_NAME, f"Tocando: {title}", icon_path or "audio-x-generic")
-            GLib.idle_add(self._mpris_art, icon_path, video_id)
+            if current():
+                GLib.idle_add(self._notify, APP_NAME, f"Tocando: {title}", icon_path or "audio-x-generic")
+                GLib.idle_add(self._mpris_art, icon_path, video_id)
 
     def _local_cover_cached(self, item):
         """(bytes, caminho_do_cache) da capa de uma faixa offline. Cache por álbum/pasta em COVERS_DIR."""
         path = item.get("path", "")
         os.makedirs(COVERS_DIR, exist_ok=True)
-        key = re.sub(r"\W+", "_", f"{os.path.dirname(path)}_{item.get('album') or os.path.basename(path)}")[-120:]
-        cache = os.path.join(COVERS_DIR, key + ".jpg")
-        if os.path.isfile(cache):
-            with open(cache, "rb") as fh:
-                return fh.read(), cache
+        # chave por hash (sem colisão por truncamento de caminhos longos) do álbum/pasta
+        ident = f"{os.path.dirname(path)}\0{item.get('album') or os.path.basename(path)}"
+        cache = os.path.join(COVERS_DIR, hashlib.sha1(ident.encode("utf-8", "replace")).hexdigest()[:24] + ".jpg")
+        try:
+            fresh = os.path.getmtime(cache) >= os.path.getmtime(path)     # arquivo retagueado: refaz a capa
+        except OSError:
+            fresh = os.path.isfile(cache)
+        if fresh:
+            try:
+                with open(cache, "rb") as fh:
+                    return fh.read(), cache
+            except OSError:
+                pass
         data = local_cover_bytes(path)
+        if data and len(data) > 2 * HTTP_MAX_IMAGE:
+            data = None
         if not data:
             url = item.get("cover_url") or (getattr(self, "lib_index", {}).get(path) or {}).get("cover_url")
             if url:
                 try:
-                    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-                    with urllib.request.urlopen(req, timeout=8) as resp:
-                        data = resp.read()
+                    data = http_get(url, max_bytes=HTTP_MAX_IMAGE, timeout=8)
                 except Exception:
+                    log.debug("capa online indisponível: %s", url, exc_info=True)
                     data = None
         if data:
-            with open(cache, "wb") as fh:
-                fh.write(data)
+            tmp = None
+            try:
+                fd, tmp = tempfile.mkstemp(prefix="cover.", suffix=".tmp", dir=COVERS_DIR)
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+                os.replace(tmp, cache)
+            except OSError:
+                log.debug("cache de capa não gravado", exc_info=True)
+                if tmp:
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp)
+                return data, None
             return data, cache
         return None, None
 
@@ -7452,8 +7971,9 @@ class MusicPlayerApp(Gtk.Window):
             if token == self._play_token:
                 GLib.idle_add(self.thumbnail_img.set_from_icon_name, "audio-x-generic", Gtk.IconSize.DIALOG)
         finally:
-            GLib.idle_add(self._notify, APP_NAME, f"Tocando: {item.get('title', '')}", icon_path or "audio-x-generic")
-            GLib.idle_add(self._mpris_art, icon_path, item.get("id") or item.get("path"))
+            if token == self._play_token:
+                GLib.idle_add(self._notify, APP_NAME, f"Tocando: {item.get('title', '')}", icon_path or "audio-x-generic")
+                GLib.idle_add(self._mpris_art, icon_path, item.get("id") or item.get("path"))
 
     def _set_lyrics_cover(self, pixbuf, token):
         if token == self._play_token:
@@ -7495,7 +8015,12 @@ class MusicPlayerApp(Gtk.Window):
 
     def on_mpv_time_change(self, pos):
         self._mpris_pos = pos or 0
-        self._stats_tick()
+        try:
+            self._stats_tick()
+        except Exception:      # estatística nunca pode interromper barra de progresso, gapless e watchdog
+            if not getattr(self, "_stats_warned", False):
+                self._stats_warned = True
+                log.warning("estatísticas de escuta com erro (ignorado)", exc_info=True)
         if pos and self.track_duration and self.track_duration - pos <= PRELOAD_MAX_S:
             self.on_mpv_time_remaining(self.track_duration - pos)     # pré-carregamento da próxima faixa (gapless)
         if pos and pos > 0.5 and not self._track_started:
@@ -7631,23 +8156,21 @@ class MusicPlayerApp(Gtk.Window):
                 data, _ = self._local_cover_cached(item)
                 size = (48, 48)
             elif self._is_live(item):
-                fav = item.get("favicon") or ""
-                if not fav.startswith(("http://", "https://")):
+                fav = safe_http_url(item.get("favicon") or "")
+                if not fav:
                     return
-                data, size = None, (48, 48)
-                req = urllib.request.Request(fav, headers={"User-Agent": USER_AGENT})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = resp.read(2_000_000)
+                size = (48, 48)
+                data = http_get(fav, max_bytes=2_000_000, timeout=5)
             else:
                 size = (64, 48)
-                req = urllib.request.Request(f"https://i.ytimg.com/vi/{item['id']}/mqdefault.jpg",
-                                             headers={"User-Agent": USER_AGENT})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = resp.read()
+                url = yt_thumb_url(item.get("id"))
+                if not url:
+                    return
+                data = http_get(url, max_bytes=HTTP_MAX_IMAGE, timeout=5)
             if data and self._play_token == 0:         # se já tocou algo, quem manda é a nova faixa
                 GLib.idle_add(self.thumbnail_img.set_from_pixbuf, self._decode_scaled(data, *size))
         except Exception:
-            pass
+            log.debug("capa da faixa restaurada indisponível", exc_info=True)
 
     def toggle_playback(self):
         """Play/Pause: se nada está carregado, toca a faixa que estava tocando ao fechar (ou a primeira da fila)."""
@@ -7663,7 +8186,10 @@ class MusicPlayerApp(Gtk.Window):
         self.mpv.pause_toggle()
 
     def on_track_finished(self):
-        if self.is_repeat:
+        if self.is_repeat and self.queue and self.current_index + 1 >= len(self.queue) \
+                and not (self.is_shuffle and len(self.queue) > 1):
+            # "Repetir fila": acabou a última faixa, volta ao início (com 1 faixa só, repete essa)
+            self.current_index = 0
             self.play_current()
             return False
         # Gapless: o mpv já passou sozinho para a faixa pré-carregada; só sincroniza a interface.
@@ -7829,6 +8355,8 @@ class MusicPlayerApp(Gtk.Window):
 
     def _radio_fetch_mix(self, seed_id):
         """Mix automático do YouTube para um vídeo (a mesma 'rádio' do site), via yt-dlp. Lista normalizada."""
+        if not valid_video_id(seed_id):
+            return []
         urls = (f"https://www.youtube.com/watch?v={seed_id}&list=RD{seed_id}",
                 f"https://music.youtube.com/watch?v={seed_id}&list=RDAMVM{seed_id}")
         for url in urls:
@@ -7959,6 +8487,18 @@ class MusicPlayerApp(Gtk.Window):
             self._check_playback_stall(self._play_token)
         return False
 
+    def on_track_error(self, detail):
+        """end-file com erro: recupera já (tenta de novo / pula) em vez de esperar o watchdog de 12 s
+        por tentativa (até ~36 s para pular uma faixa indisponível). Erros de uma faixa pré-carregada
+        enquanto a atual ainda toca são ignorados."""
+        if self._closing or self._track_started or not (0 <= self.current_index < len(self.queue)):
+            return False
+        log.info("falha ao abrir a faixa atual: %s", detail)
+        self._gapless_guard = None        # evita que o aviso de 'ocioso' conte a mesma falha de novo
+        self._cancel_stall_watchdog()
+        self._check_playback_stall(self._play_token)
+        return False
+
     # ---------- Ações de Botões e Sliders ----------
     def on_play_pause(self, button):
         self.toggle_playback()
@@ -7979,6 +8519,9 @@ class MusicPlayerApp(Gtk.Window):
             self.play_current()
         elif self.current_index + 1 < len(self.queue):
             self.current_index += 1
+            self.play_current()
+        elif self.is_repeat:
+            self.current_index = 0               # "Repetir fila": do fim volta ao início
             self.play_current()
         elif self._radio is not None:
             self._radio_pending_next = True      # toca a primeira faixa nova assim que chegar
@@ -8180,8 +8723,8 @@ class MusicPlayerApp(Gtk.Window):
         dialog = Gtk.FileChooserDialog(title="Salvar MP3", parent=self, action=Gtk.FileChooserAction.SAVE)
         dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
         dialog.add_button("Salvar", Gtk.ResponseType.OK)
-        safe_title = re.sub(r'[\\/*?:"<>|]', "", item["title"])
-        dialog.set_current_name(f"{safe_title}.mp3")
+        dialog.set_do_overwrite_confirmation(True)           # não sobrescreve sem perguntar
+        dialog.set_current_name(f"{safe_filename(item['title'])}.mp3")
         response = dialog.run()
         path = dialog.get_filename() if response == Gtk.ResponseType.OK else None
         dialog.destroy()
@@ -8196,6 +8739,8 @@ class MusicPlayerApp(Gtk.Window):
     def _download_thread(self, item, path):
         out_template = path[:-4] if path.lower().endswith(".mp3") else path
         try:
+            if not shutil.which("ffmpeg"):
+                raise RuntimeError("ffmpeg não encontrado (necessário para gerar o MP3)")
             final = self._download_track_mp3(
                 item,
                 out_template,
@@ -8208,6 +8753,7 @@ class MusicPlayerApp(Gtk.Window):
             else:
                 GLib.idle_add(self._download_fail, "Erro no download.")
         except Exception as e:
+            log.warning("download falhou", exc_info=True)
             GLib.idle_add(self._download_fail, f"Erro: {e}")
         finally:
             GLib.timeout_add_seconds(3, self._download_hide)
@@ -8259,6 +8805,9 @@ class MusicPlayerApp(Gtk.Window):
         if not folder:
             return
 
+        if not shutil.which("ffmpeg"):
+            self.mostrar_mensagem("ffmpeg não encontrado: ele é necessário para converter os downloads em MP3.")
+            return
         self.progress_download.set_fraction(0.0)
         self.progress_download.set_text(f"Baixando 0/{len(items)}...")
         self.progress_download.show()
@@ -8269,8 +8818,7 @@ class MusicPlayerApp(Gtk.Window):
         ok = 0
         for i, item in enumerate(items, start=1):
             item = self._normalize_track(item)
-            safe_title = re.sub(r'[\\/*?:"<>|]', "", item["title"])
-            out_template = os.path.join(folder, safe_title)
+            out_template = unique_base(os.path.join(folder, safe_filename(item["title"])), ".mp3")
             GLib.idle_add(self._update_download_progress, (i - 1) / total, f"Faixa {i}/{total} · Conectando ao YouTube...")
             try:
                 # O download ocupa 85% da "fatia" da faixa; o restante é conversão, capa e tags.
@@ -8287,7 +8835,7 @@ class MusicPlayerApp(Gtk.Window):
                 if final:
                     ok += 1
             except Exception:
-                pass
+                log.warning("download falhou: %s", item.get("title"), exc_info=True)
             GLib.idle_add(self._update_download_progress, i / total, f"Concluído {i}/{total}")
         GLib.idle_add(self._update_download_progress, 1.0,
                       "Todos os downloads foram concluídos!" if ok == total
@@ -8301,6 +8849,8 @@ class MusicPlayerApp(Gtk.Window):
         Os dados do Deezer são buscados em paralelo ao yt-dlp. Retorna o caminho do MP3 ou None.
         on_progress(pct 0..1) acompanha o download; on_phase(texto, estágio 0..1) avisa cada etapa
         seguinte (conversão, capa, tags), que não têm porcentagem."""
+        if not valid_video_id(item.get("id")):
+            return None
         url = f"https://www.youtube.com/watch?v={item['id']}"
         result = {}
 
@@ -8310,7 +8860,7 @@ class MusicPlayerApp(Gtk.Window):
                 result["meta"] = meta
                 result["cover"] = self._download_cover_bytes(meta.get("cover_url"))
             except Exception:
-                pass
+                log.debug("metadados do download indisponíveis", exc_info=True)
 
         lookup = threading.Thread(target=lookup_worker, daemon=True)
         lookup.start()
@@ -8325,13 +8875,33 @@ class MusicPlayerApp(Gtk.Window):
             "--embed-thumbnail",               # miniatura do YouTube (fallback caso o Deezer não case)
             "--convert-thumbnails", "jpg",
             "--newline",
-            "-o", f"{out_template}.%(ext)s",
+            "--socket-timeout", "20",          # rede parada vira erro em vez de pendurar
+            "--retries", "3",
+            "--fragment-retries", "3",
+            # '%' do título/pasta não pode virar campo do template do yt-dlp ("100% Hits %(title)s")
+            "-o", f"{out_template.replace('%', '%%')}.%(ext)s",
+            "--",
             url,
         ]
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                   errors="replace")
         self._dl_procs.add(process)
+        # Watchdog: yt-dlp sem nenhuma saída por 4 min (rede travada) é encerrado; sem isso o laço de
+        # leitura abaixo e toda a fila de downloads em lote ficavam presos para sempre.
+        last_output = [time.monotonic()]
+        finished = threading.Event()
+
+        def _watchdog():
+            while not finished.wait(5):
+                if process.poll() is None and time.monotonic() - last_output[0] > 240:
+                    log.warning("yt-dlp sem saída há 4 min; encerrando")
+                    with contextlib.suppress(OSError):
+                        process.kill()
+                    return
+        threading.Thread(target=_watchdog, daemon=True).start()
         phase = None
         for line in process.stdout:
+            last_output[0] = time.monotonic()
             match = re.search(r"\[download\]\s+(\d+\.\d+)%", line)
             if match:
                 on_progress(float(match.group(1)) / 100.0)
@@ -8351,7 +8921,10 @@ class MusicPlayerApp(Gtk.Window):
             process.wait(timeout=60)
         except subprocess.TimeoutExpired:
             process.kill()
+            with contextlib.suppress(Exception):
+                process.wait(timeout=5)
         finally:
+            finished.set()
             self._dl_procs.discard(process)
 
         final = out_template + ".mp3"
@@ -8372,7 +8945,7 @@ class MusicPlayerApp(Gtk.Window):
         try:
             self._embed_tags_mp3(final, meta, result.get("cover"))
         except Exception:
-            pass  # o MP3 já está salvo; tags e capa são um extra
+            log.warning("tags/capa não gravadas em %s (o MP3 foi salvo)", final, exc_info=True)
         return final
 
     def _lookup_download_meta(self, item):
@@ -8469,10 +9042,9 @@ class MusicPlayerApp(Gtk.Window):
         if not url:
             return None
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = resp.read(8 * 1024 * 1024)
+            data = http_get(url, max_bytes=HTTP_MAX_IMAGE, timeout=10)
         except Exception:
+            log.debug("capa para download indisponível: %s", url, exc_info=True)
             return None
         if data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n":
             return data
@@ -8611,6 +9183,8 @@ class MusicPlayerApp(Gtk.Window):
         # Atalhos ativados fora de campos de texto
         if not in_entry:
             if event.keyval == Gdk.KEY_space:
+                if isinstance(focused, Gtk.Button):      # Espaço ativa o botão focado (acessibilidade)
+                    return False
                 self.toggle_playback()
                 return True
 
@@ -8900,7 +9474,7 @@ class MusicPlayerApp(Gtk.Window):
         page.pack_start(self._about_heading("Aplicativos externos"), False, False, 0)
         for name, desc, tag in (
             ("mpv", "Motor de reprodução. Obrigatório; o app avisa se não estiver instalado.", "obrigatório"),
-            ("yt-dlp", "Busca e resolução dos streams e downloads. Obrigatório; o app tenta se atualizar (yt-dlp -U) a cada abertura.", "obrigatório"),
+            ("yt-dlp", "Busca e resolução dos streams e downloads. Obrigatório; o app tenta se atualizar (yt-dlp -U) no máximo uma vez por dia.", "obrigatório"),
             ("ffmpeg", "Usado pelo yt-dlp para converter o áudio em MP3 nos downloads. Não é verificado na inicialização.", "necessário para MP3"),
             ("notify-send (libnotify)", "Notificações do desktop ao trocar de faixa e concluir downloads. Opcional.", "opcional"),
         ):
@@ -9006,9 +9580,32 @@ class MusicPlayerApp(Gtk.Window):
             for k in ("plays", "seconds", "radio_seconds"):
                 if isinstance(raw.get(k), (int, float)):
                     st[k] = raw[k]
-            for k in ("artists", "tracks", "stations", "days"):
-                if isinstance(raw.get(k), dict):
-                    st[k] = raw[k]
+            def num(v):
+                return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+            def sub_entry(e, **defaults):
+                """Entrada aninhada validada: dict com os campos numéricos esperados (os demais viram texto)."""
+                if not isinstance(e, dict):
+                    return None
+                out = {}
+                for k, d in defaults.items():
+                    v = e.get(k, d)
+                    out[k] = (v if num(v) else d) if isinstance(d, (int, float)) else (v if isinstance(v, str) else d)
+                return out
+
+            # validação em profundidade: _stats_tick/_stats_flush/_render_profile fazem e["s"], e["n"],
+            # e.get(...) sem checar; um stats.json com tipos errados quebrava o progresso da reprodução
+            if isinstance(raw.get("days"), dict):
+                st["days"] = {k: float(v) for k, v in raw["days"].items() if isinstance(k, str) and num(v)}
+            if isinstance(raw.get("artists"), dict):
+                st["artists"] = {k: e for k, e in ((k, sub_entry(v, n=0, s=0.0)) for k, v in raw["artists"].items())
+                                 if isinstance(k, str) and e is not None}
+            if isinstance(raw.get("stations"), dict):
+                st["stations"] = {k: e for k, e in ((k, sub_entry(v, t="", s=0.0, n=0)) for k, v in raw["stations"].items())
+                                  if isinstance(k, str) and e is not None}
+            if isinstance(raw.get("tracks"), dict):
+                st["tracks"] = {k: e for k, e in ((k, sub_entry(v, n=0, t="", a="", i="", d="", p=""))
+                                                  for k, v in raw["tracks"].items()) if isinstance(k, str) and e is not None}
             for k, n in (("hours", 24), ("weekdays", 7)):
                 v = raw.get(k)
                 if isinstance(v, list) and len(v) == n and all(isinstance(x, (int, float)) for x in v):
@@ -9069,7 +9666,10 @@ class MusicPlayerApp(Gtk.Window):
 
     def _stats_flush_timer(self):
         self._stats_save_id = None
-        self._stats_flush()
+        try:
+            self._stats_flush()
+        except Exception:
+            log.warning("falha ao gravar estatísticas", exc_info=True)
         return False
 
     def _stats_flush(self):
@@ -9278,7 +9878,7 @@ class MusicPlayerApp(Gtk.Window):
         btn_folder = Gtk.Button(label="Abrir pasta de dados")
         btn_folder.set_image(Gtk.Image.new_from_icon_name("folder-symbolic", Gtk.IconSize.BUTTON))
         btn_folder.set_always_show_image(True)
-        btn_folder.connect("clicked", lambda b: self._open_url("file://" + CONFIG_DIR))
+        btn_folder.connect("clicked", lambda b: self._open_url(GLib.filename_to_uri(CONFIG_DIR, None)))
         btn_reset = Gtk.Button(label="Zerar estatísticas")
         btn_reset.get_style_context().add_class("destructive-action")
         btn_reset.connect("clicked", self._on_stats_reset)
@@ -9573,9 +10173,30 @@ class MusicPlayerApp(Gtk.Window):
         self.show_toast(f"Perfil exportado ({n_pl} playlists, {n_tr} faixas)")
         return True
 
+    def _auto_backup(self, label):
+        """Grava uma cópia dos dados do perfil em CONFIG_DIR/backups (mantém as 5 mais recentes)."""
+        try:
+            folder = os.path.join(CONFIG_DIR, "backups")
+            os.makedirs(folder, mode=0o700, exist_ok=True)
+            path = os.path.join(folder, f"{label}-{time.strftime('%Y%m%d-%H%M%S')}.json")
+            self._save_json(path, {
+                "format": BACKUP_FORMAT, "version": BACKUP_VERSION, "app_version": APP_VERSION,
+                "exported_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "profile": {"name": self.profile.get("name", "")},
+                "playlists": self.playlists, "history": self.history, "favorites": self.favorites,
+            })
+            olds = sorted(n for n in os.listdir(folder) if n.startswith(label + "-"))
+            for n in olds[:-5]:
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(folder, n))
+        except Exception:
+            log.warning("backup automático falhou", exc_info=True)
+
     def _read_backup(self, path):
         """Lê e valida um backup. Retorna (dados_limpos, None) ou (None, mensagem_de_erro)."""
         try:
+            if os.path.getsize(path) > 50 * 1024 * 1024:
+                return None, "O arquivo é grande demais para ser um backup da " + APP_NAME + "."
             with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
         except Exception as e:
@@ -9647,6 +10268,8 @@ class MusicPlayerApp(Gtk.Window):
         ask.destroy()
         if choice not in (1, 2):
             return False
+
+        self._auto_backup("pre-import")          # rede de segurança: "Substituir tudo" apaga os dados atuais
 
         if choice == 2:
             self.playlists = data["playlists"]
@@ -10022,13 +10645,12 @@ class MusicPlayerApp(Gtk.Window):
     def _load_webradio_thumbnail(self, item, token):
         """Logotipo da estação (favicon) no player e na aba Letra."""
         data = None
-        fav = item.get("favicon") or ""
-        if fav.startswith(("http://", "https://")):
+        fav = safe_http_url(item.get("favicon") or "")
+        if fav:
             try:
-                req = urllib.request.Request(fav, headers={"User-Agent": USER_AGENT})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = resp.read(2_000_000)
+                data = http_get(fav, max_bytes=2_000_000, timeout=5)
             except Exception:
+                log.debug("favicon indisponível: %s", fav, exc_info=True)
                 data = None
         shown = False
         if data and token == self._play_token:
@@ -10041,7 +10663,8 @@ class MusicPlayerApp(Gtk.Window):
         if token == self._play_token:
             if not shown:
                 GLib.idle_add(self.thumbnail_img.set_from_icon_name, "audio-x-generic", Gtk.IconSize.DIALOG)
-        GLib.idle_add(self._notify, APP_NAME, f"Rádio: {item.get('title', '')}", "audio-x-generic")
+        if token == self._play_token:
+            GLib.idle_add(self._notify, APP_NAME, f"Rádio: {item.get('title', '')}", "audio-x-generic")
 
     # ======================================================================
     # (a busca na biblioteca, SQLite FTS5, é a 1ª seção dos resultados da busca)
@@ -10049,55 +10672,76 @@ class MusicPlayerApp(Gtk.Window):
     # ---------- Encerramento ----------
     def on_destroy(self, widget):
         self._closing = True
-        try:
-            self.mpv.quit()      # música para na hora, antes de qualquer outra coisa
-        except Exception:
-            pass
-        self._cancel_stall_watchdog()
-        for pid_name in ("_queue_save_id", "_msg_timeout_id", "_msg_fade_id", "_dl_pulse_id", "_busy_pulse_id"):
-            sid = getattr(self, pid_name, None)
-            if sid:
-                try:
-                    GLib.source_remove(sid)
-                except Exception:
-                    pass
-                setattr(self, pid_name, None)
-        for proc in list(getattr(self, "_dl_procs", ())):   # não deixa yt-dlp órfão rodando depois de fechar
+
+        def safe(fn, *args, **kw):
+            """Cada etapa do encerramento é independente: uma falha (ex.: estatística corrompida) não
+            pode impedir de salvar o resto nem de fechar o app."""
             try:
-                if proc.poll() is None:
-                    proc.terminate()
+                return fn(*args, **kw)
             except Exception:
-                pass
-        self._art_pool.shutdown(wait=False)
-        self._preload_pool.shutdown(wait=False)
-        self._net_pool.shutdown(wait=False)
-        if self._config_save_id:
-            GLib.source_remove(self._config_save_id)
-            self._config_save_id = None
-        if getattr(self, "_stats_save_id", None):
-            GLib.source_remove(self._stats_save_id)
-            self._stats_save_id = None
-        self._stats_flush()
-        self._remember_last_played(schedule=False)   # faixa atual vai junto no config.json
-        if not self.is_maximized():  # maximizada, get_size() devolveria a tela toda e estragaria o "restaurar"
-            self.config["win_w"], self.config["win_h"] = self.get_size()
-        self._save_json(CONFIG_FILE, self.config)
-        self._save_json(QUEUE_FILE, self.queue, compact=True)
-        self._save_json(PLAYLISTS_FILE, self.playlists)
-        self._save_json(FAVORITES_FILE, self.favorites)
-        self._save_json(PROFILE_FILE, self.profile)
-        self._save_json(HISTORY_FILE, self.history, compact=True)
-        if self.db is not None:
-            self.db.close()          # espera as gravações pendentes e fecha o SQLite
-        if getattr(self, "mpris", None) is not None:
-            self.mpris.close()
-        Gtk.main_quit()
+                log.error("falha no encerramento (%s)", getattr(fn, "__name__", fn), exc_info=True)
+
+        def remove_source(name):
+            sid = getattr(self, name, None)
+            if sid:
+                with contextlib.suppress(Exception):
+                    GLib.source_remove(sid)
+                setattr(self, name, None)
+
+        try:
+            safe(self.mpv.quit)      # música para na hora, antes de qualquer outra coisa
+            safe(self._cancel_stall_watchdog)
+            for name in ("_queue_save_id", "_msg_timeout_id", "_msg_fade_id", "_dl_pulse_id", "_busy_pulse_id",
+                         "_config_save_id", "_stats_save_id"):
+                safe(remove_source, name)
+            for proc in list(getattr(self, "_dl_procs", ())) + [getattr(self, "_search_proc", None)]:
+                if proc is not None:                 # não deixa yt-dlp órfão rodando depois de fechar
+                    with contextlib.suppress(Exception):
+                        if proc.poll() is None:
+                            proc.terminate()
+            # cancel_futures: sem isso o Python espera a fila inteira de capas/rede terminar ao sair
+            for pool in (self._art_pool, self._preload_pool, self._net_pool):
+                try:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except TypeError:            # Python < 3.9 não tem cancel_futures
+                    safe(pool.shutdown, wait=False)
+                except Exception:
+                    log.debug("falha ao encerrar pool", exc_info=True)
+            safe(self._stats_flush)
+            safe(self._remember_last_played, schedule=False)   # faixa atual vai junto no config.json
+            if not self.is_maximized():  # maximizada, get_size() devolveria a tela toda e estragaria o "restaurar"
+                safe(lambda: self.config.update(zip(("win_w", "win_h"), self.get_size())))
+            safe(self._save_json, CONFIG_FILE, self.config)
+            safe(self._save_json, QUEUE_FILE, self.queue, compact=True)
+            safe(self._save_json, PLAYLISTS_FILE, self.playlists)
+            safe(self._save_json, FAVORITES_FILE, self.favorites)
+            safe(self._save_json, PROFILE_FILE, self.profile)
+            safe(self._save_json, HISTORY_FILE, self.history, compact=True)
+            if self.db is not None:
+                safe(self.db.close)          # espera as gravações pendentes e fecha o SQLite
+            if getattr(self, "mpris", None) is not None:
+                safe(self.mpris.close)
+        finally:
+            Gtk.main_quit()
 
 
 if __name__ == "__main__":
     GLib.set_prgname(APP_ID)
     GLib.set_application_name(APP_NAME)
     Gtk.Window.set_default_icon_name(APP_ID)
+    _instance_lock = _acquire_instance_lock()      # mantém a referência: fechar o arquivo soltaria o bloqueio
+    if _instance_lock is None:
+        # Duas instâncias disputariam config/fila/estatísticas e o mpv: avisa e sai.
+        print(f"[{APP_NAME}] já está em execução.", file=sys.stderr)
+        try:
+            _dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK,
+                                     text=f"A {APP_NAME} já está aberta.")
+            _dlg.format_secondary_text("Use a janela que já está em execução (ou feche-a antes de abrir outra).")
+            GLib.timeout_add_seconds(10, lambda: _dlg.response(Gtk.ResponseType.OK) or False)   # não fica preso
+            _dlg.run()
+        except Exception:
+            pass
+        sys.exit(0)
     _reap_orphan_mpv()
     app = MusicPlayerApp()
     _install_exit_handlers(app)
