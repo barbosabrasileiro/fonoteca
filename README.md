@@ -74,16 +74,30 @@ flowchart LR
 
 ## ⚡ Instalação
 
-### 🧙 Opção 1 · Instalador gráfico (recomendada)
+Dois passos. O instalador cuida do resto: dependências, `yt-dlp` oficial, ícone e atalho no menu.
 
-Dois passos, copiando e colando no terminal. O instalador cuida do resto: dependências, `yt-dlp` oficial, ícone e atalho no menu.
+### 🐧 Ubuntu · Debian · Mint
 
-**1️⃣ Instale `git` e `python3`** (o mínimo para baixar e rodar o instalador). Copie só o comando da sua distro:
+**1️⃣ Instale `git` e `python3`:**
 
-**Ubuntu / Debian / Mint**
 ```bash
 sudo apt install git python3
 ```
+
+**2️⃣ Baixe a Fonoteca e abra o instalador**, depois é só seguir o "avançar, avançar, concluir":
+
+```bash
+git clone https://github.com/barbosabrasileiro/fonoteca.git && cd fonoteca && python3 fonoteca-installer.py
+```
+
+Pronto! Abra **Fonoteca** no menu de aplicativos. 🎉
+
+<details>
+<summary><b>Outras distros</b></summary>
+
+<br>
+
+Troque só o passo 1 e depois use o mesmo comando do passo 2.
 
 **Fedora**
 ```bash
@@ -95,104 +109,12 @@ sudo dnf install git python3
 sudo pacman -S git python
 ```
 
-> Já tem os dois? Pule para o passo 2. Para conferir: `git --version && python3 --version`
-
-**2️⃣ Baixe a Fonoteca e abra o instalador**, depois é só seguir o "avançar, avançar, concluir":
-
-```bash
-git clone https://github.com/barbosabrasileiro/fonoteca.git && cd fonoteca && python3 fonoteca-installer.py
-```
-
-Pronto! Abra **Fonoteca** no menu de aplicativos. 🎉
-
-<details>
-<summary><b>Prefere não usar o git?</b></summary>
-
-<br>
-
-Baixe o [ZIP do projeto](https://github.com/barbosabrasileiro/fonoteca/archive/refs/heads/main.zip), extraia e rode o instalador dentro da pasta:
-
-```bash
-unzip main.zip && cd fonoteca-main
-python3 fonoteca-installer.py
-```
-
-</details>
-
-<details>
-<summary><b>Sem ambiente gráfico? O instalador também roda no terminal</b></summary>
-
-<br>
-
-Funciona em **apt, dnf, pacman, zypper, xbps e apk**:
-
-```bash
-python3 fonoteca-installer.py --install     # instalar
-python3 fonoteca-installer.py --update      # atualizar
-python3 fonoteca-installer.py --diagnose    # diagnosticar
-python3 fonoteca-installer.py --uninstall   # desinstalar
-python3 fonoteca-installer.py --cli         # menu interativo
-```
+O instalador também reconhece openSUSE, Void e Alpine.
 
 </details>
 
 > [!TIP]
 > O instalador fica no menu como *Instalador da Fonoteca* e na barra lateral do app, em **Corrigir e Atualizar a Fonoteca**.
-
-### 🛠️ Opção 2 · Manual
-
-<details>
-<summary><b>Ubuntu / Debian / Mint</b></summary>
-
-```bash
-sudo apt update
-sudo apt install python3 python3-gi python3-gi-cairo gir1.2-gtk-3.0 mpv ffmpeg python3-mutagen
-pipx install yt-dlp        # ou: python3 -m pip install -U yt-dlp
-```
-
-</details>
-
-<details>
-<summary><b>Fedora</b></summary>
-
-```bash
-sudo dnf install python3 python3-gobject gtk3 mpv ffmpeg-free python3-mutagen
-pipx install yt-dlp
-```
-
-</details>
-
-<details>
-<summary><b>Arch / Manjaro</b></summary>
-
-```bash
-sudo pacman -S python python-gobject gtk3 mpv ffmpeg python-mutagen yt-dlp
-```
-
-</details>
-
-Depois, rode direto do clone:
-
-```bash
-python3 fonoteca.py
-```
-
-<details>
-<summary><b>📋 Dependências em resumo</b></summary>
-
-<br>
-
-| Pacote | Papel | Status |
-|---|---|---|
-| `python3` ≥ 3.8 + `python3-gi` (GTK3) | Interface | **Obrigatório** |
-| `mpv` | Motor de áudio | **Obrigatório** |
-| `yt-dlp` | Busca e stream online | **Obrigatório** |
-| `ffmpeg` | Conversão para MP3 e capas | Recomendado |
-| `python3-mutagen` | Leitura rápida de tags e capas | Recomendado |
-| `python3-gi-cairo` | Arrastar faixas na fila | Recomendado |
-| `libnotify` (`notify-send`) | Notificações do desktop | Opcional |
-
-</details>
 
 ---
 
