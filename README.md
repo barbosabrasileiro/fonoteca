@@ -37,7 +37,6 @@ Player **leve e nativo para Linux** · Python + GTK3 + mpv · sem Electron, sem 
 Ela junta o melhor de dois mundos: a **sua biblioteca offline** e a **vastidão do streaming**, em um app que abre rápido e respeita o tema do seu desktop.
 
 |   |   |
-|---|---|
 | 🎵 **Biblioteca híbrida** | Arquivos locais (tags e capas) + milhões de faixas online. Banco **SQLite com FTS5**: a busca na sua biblioteca é instantânea. |
 | ⏭️ **Gapless entre faixas** | A próxima faixa é resolvida em segundo plano e encadeada no mpv, sem silêncio entre as músicas. |
 | 🎛️ **Equalizador de 10 bandas** | ±12 dB e presets prontos: *Flat, Rock, Pop, Bass Boost, Vocal e Jazz*. Abre com `Ctrl+E`. |
