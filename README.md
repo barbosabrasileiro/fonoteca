@@ -20,7 +20,7 @@ Player **leve e nativo para Linux** · Python + GTK3 + mpv · sem Electron, sem 
 
 [**⚡ Instalar**](#-instalação) &nbsp;·&nbsp;
 [**🎧 Como usar**](#-como-usar) &nbsp;·&nbsp;
-[**⌨️ Atalhos**](#️-atalhos) &nbsp;·&nbsp;
+[**🎹 Atalhos**](#-atalhos) &nbsp;·&nbsp;
 [**🩺 Problemas?**](#-resolução-de-problemas) &nbsp;·&nbsp;
 [**🤝 Contribuir**](#-contribuindo)
 
@@ -45,7 +45,7 @@ Ela junta o melhor de dois mundos: a **sua biblioteca offline** e a **vastidão 
 | 📻 **Rádios web** | Milhares de estações ao vivo via Radio-Browser, por nome, país ou gênero. |
 | 🎤 **Letras** | Painel lateral com a letra da faixa (LRCLIB ou a embutida no arquivo). |
 | 🧠 **Descoberta** | Biografia (Wikipédia), discografia, faixas populares, artistas parecidos e ranking **Em alta** por país (Deezer). |
-| ⬇️ **Downloads em MP3** | Com capa e tags ID3 gravadas, direto na sua coleção. |
+| ⬇️ **Downloads em MP3** | Para conteúdo que você tem o direito de baixar, com capa e tags ID3 gravadas. Veja o [aviso legal](#-aviso-legal-e-direitos-autorais). |
 | 📊 **Perfil e estatísticas** | Nível, mais ouvidas, horários e últimos 14 dias. Tudo calculado **só no seu computador**. |
 | 🖥️ **Integração com o sistema** | **MPRIS2**: teclas de mídia, widget do painel e notificações. |
 
@@ -151,7 +151,7 @@ Curta com `♡` (ou tecla `L`), crie playlists com **+ Playlist** ou salve a fil
 
 ---
 
-## ⌨️ Atalhos
+## 🎹 Atalhos
 
 | Tecla | Ação | | Tecla | Ação |
 |:---:|---|---|:---:|---|
@@ -256,6 +256,20 @@ Nenhum exige chave de API ou login.
 
 ---
 
+## 📜 Aviso legal e direitos autorais
+
+> [!IMPORTANT]
+> A Fonoteca **não hospeda, não distribui e não fornece** músicas, vídeos, letras ou qualquer outro conteúdo protegido. Ela é apenas um player que se conecta a serviços e ferramentas de terceiros (como `yt-dlp`, `mpv`, Deezer, LRCLIB e Radio-Browser), sob o controle e a responsabilidade de quem a usa.
+
+- 🚫 **Este projeto não incentiva, não apoia e não tem como objetivo a pirataria.**
+- ⬇️ O recurso de download existe para conteúdo que **você tem o direito de baixar**: obras de sua autoria, em domínio público, com licença que permita (como Creative Commons) ou com autorização de quem detém os direitos.
+- 📜 **Você é o único responsável** por respeitar a legislação de direitos autorais do seu país (no Brasil, a Lei nº 9.610/1998) e os termos de uso de cada serviço acessado, inclusive o YouTube.
+- 🛠️ Os autores e contribuidores **não se responsabilizam** por qualquer uso indevido do software, conforme a licença GPL-3.0 (sem garantia de qualquer tipo).
+
+Se você é titular de direitos e acredita que algo neste repositório os viola, [abra uma issue](https://github.com/barbosabrasileiro/fonoteca/issues) para que possamos analisar.
+
+---
+
 ## 🤝 Contribuindo
 
 Bugs, ideias e *pull requests* são muito bem-vindos!
@@ -271,7 +285,7 @@ Depois, abra um **Pull Request**. ⭐ Se a Fonoteca toca no seu coração, deixe
 ## 📝 Licença
 
 Software livre sob a **[GNU GPL v3.0 ou posterior](LICENSE)**, sem qualquer garantia.
-`mpv` e `yt-dlp` são programas independentes, com licenças próprias. Biografias da Wikipédia sob CC BY-SA 4.0. Este projeto não é afiliado a YouTube, Google, Deezer, Wikimedia ou ao projeto mpv; todas as marcas pertencem aos seus donos.
+`mpv` e `yt-dlp` são programas independentes, com licenças próprias. Biografias da Wikipédia sob CC BY-SA 4.0. Este projeto não é afiliado a YouTube, Google, Deezer, Wikimedia ou ao projeto mpv; todas as marcas pertencem aos seus donos. Leia o [aviso legal](#-aviso-legal-e-direitos-autorais) sobre direitos autorais.
 
 <div align="center">
 
