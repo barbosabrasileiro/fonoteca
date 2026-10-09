@@ -76,29 +76,31 @@ flowchart LR
 
 ### 🧙 Opção 1 · Instalador gráfico (recomendada)
 
-Três passos, copiando e colando no terminal. O instalador cuida do resto: dependências, `yt-dlp` oficial, ícone e atalho no menu.
+Dois passos, copiando e colando no terminal. O instalador cuida do resto: dependências, `yt-dlp` oficial, ícone e atalho no menu.
 
-**1️⃣ Instale `git` e `python3`** (o mínimo para baixar e rodar o instalador; escolha a linha da sua distro):
+**1️⃣ Instale `git` e `python3`** (o mínimo para baixar e rodar o instalador). Copie só o comando da sua distro:
 
+**Ubuntu / Debian / Mint**
 ```bash
-sudo apt install git python3     # Ubuntu / Debian / Mint
-sudo dnf install git python3     # Fedora
-sudo pacman -S git python        # Arch / Manjaro
+sudo apt install git python3
+```
+
+**Fedora**
+```bash
+sudo dnf install git python3
+```
+
+**Arch / Manjaro**
+```bash
+sudo pacman -S git python
 ```
 
 > Já tem os dois? Pule para o passo 2. Para conferir: `git --version && python3 --version`
 
-**2️⃣ Baixe a Fonoteca:**
+**2️⃣ Baixe a Fonoteca e abra o instalador**, depois é só seguir o "avançar, avançar, concluir":
 
 ```bash
-git clone https://github.com/barbosabrasileiro/fonoteca.git
-cd fonoteca
-```
-
-**3️⃣ Abra o instalador** e siga o "avançar, avançar, concluir":
-
-```bash
-python3 fonoteca-installer.py
+git clone https://github.com/barbosabrasileiro/fonoteca.git && cd fonoteca && python3 fonoteca-installer.py
 ```
 
 Pronto! Abra **Fonoteca** no menu de aplicativos. 🎉
