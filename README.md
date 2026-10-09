@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/fonoteca.png" alt="Ícone da Fonoteca" width="140" onerror="this.src='https://raw.githubusercontent.com/barbosabrasileiro/fonoteca/main/assets/fonoteca.png'">
+<img src="fonoteca.png" alt="Ícone da Fonoteca" width="140">
 
 # Fonoteca
 
