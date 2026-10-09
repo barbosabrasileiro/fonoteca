@@ -32,7 +32,7 @@ Player **leve e nativo para Linux** · Python + GTK3 + mpv · sem Electron, sem 
 
 ---
 
-## ✨ Por que a Fonoteca?
+## O que faz que a Fonoteca?
 
 Ela junta o melhor de dois mundos: a **sua biblioteca offline** e a **vastidão do streaming**, em um app que abre rápido e respeita o tema do seu desktop.
 
