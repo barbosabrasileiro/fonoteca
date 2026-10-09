@@ -19,7 +19,7 @@ Player **leve e nativo para Linux** · Python + GTK3 + mpv · sem Electron, sem 
 <br>
 
 [**⚡ Instalar**](#-instalação) &nbsp;·&nbsp;
-[**🎮 Como usar**](#-como-usar) &nbsp;·&nbsp;
+[**🎧 Como usar**](#-como-usar) &nbsp;·&nbsp;
 [**⌨️ Atalhos**](#️-atalhos) &nbsp;·&nbsp;
 [**🩺 Problemas?**](#-resolução-de-problemas) &nbsp;·&nbsp;
 [**🤝 Contribuir**](#-contribuindo)
@@ -118,7 +118,7 @@ O instalador também reconhece openSUSE, Void e Alpine.
 
 ---
 
-## 🎮 Como usar
+## 🎧 Como usar
 
 <table>
 <tr>
