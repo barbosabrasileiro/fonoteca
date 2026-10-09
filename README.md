@@ -76,26 +76,66 @@ flowchart LR
 
 ### 🧙 Opção 1 · Instalador gráfico (recomendada)
 
-Assistente "avançar, avançar, concluir" que instala as dependências, o `yt-dlp` oficial, o ícone e o atalho no menu.
+Três passos, copiando e colando no terminal. O instalador cuida do resto: dependências, `yt-dlp` oficial, ícone e atalho no menu.
+
+**1️⃣ Instale `git` e `python3`** (o mínimo para baixar e rodar o instalador; escolha a linha da sua distro):
+
+```bash
+sudo apt install git python3     # Ubuntu / Debian / Mint
+sudo dnf install git python3     # Fedora
+sudo pacman -S git python        # Arch / Manjaro
+```
+
+> Já tem os dois? Pule para o passo 2. Para conferir: `git --version && python3 --version`
+
+**2️⃣ Baixe a Fonoteca:**
 
 ```bash
 git clone https://github.com/barbosabrasileiro/fonoteca.git
 cd fonoteca
+```
+
+**3️⃣ Abra o instalador** e siga o "avançar, avançar, concluir":
+
+```bash
 python3 fonoteca-installer.py
 ```
 
-> [!TIP]
-> Funciona em **apt, dnf, pacman, zypper, xbps e apk**. Sem ambiente gráfico (ou sem GTK ainda)? O mesmo instalador roda no terminal:
->
-> ```bash
-> python3 fonoteca-installer.py --install     # instalar
-> python3 fonoteca-installer.py --update      # atualizar
-> python3 fonoteca-installer.py --diagnose    # diagnosticar
-> python3 fonoteca-installer.py --uninstall   # desinstalar
-> python3 fonoteca-installer.py --cli         # menu interativo
-> ```
+Pronto! Abra **Fonoteca** no menu de aplicativos. 🎉
 
-Depois é só abrir **Fonoteca** no menu de aplicativos. O instalador também fica no menu, como *Instalador da Fonoteca*, e na barra lateral do app em **Corrigir e Atualizar a Fonoteca**.
+<details>
+<summary><b>Prefere não usar o git?</b></summary>
+
+<br>
+
+Baixe o [ZIP do projeto](https://github.com/barbosabrasileiro/fonoteca/archive/refs/heads/main.zip), extraia e rode o instalador dentro da pasta:
+
+```bash
+unzip main.zip && cd fonoteca-main
+python3 fonoteca-installer.py
+```
+
+</details>
+
+<details>
+<summary><b>Sem ambiente gráfico? O instalador também roda no terminal</b></summary>
+
+<br>
+
+Funciona em **apt, dnf, pacman, zypper, xbps e apk**:
+
+```bash
+python3 fonoteca-installer.py --install     # instalar
+python3 fonoteca-installer.py --update      # atualizar
+python3 fonoteca-installer.py --diagnose    # diagnosticar
+python3 fonoteca-installer.py --uninstall   # desinstalar
+python3 fonoteca-installer.py --cli         # menu interativo
+```
+
+</details>
+
+> [!TIP]
+> O instalador fica no menu como *Instalador da Fonoteca* e na barra lateral do app, em **Corrigir e Atualizar a Fonoteca**.
 
 ### 🛠️ Opção 2 · Manual
 
