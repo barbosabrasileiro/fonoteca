@@ -74,7 +74,7 @@ flowchart LR
 
 ## ⚡ Instalação
 
-Dois passos. O instalador cuida do resto: dependências, `yt-dlp` oficial, ícone e atalho no menu.
+Abra o **Terminal**: pressione <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>T</kbd> ou procure por "Terminal" no menu de aplicativos. Depois, copie cada comando abaixo, cole com <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>V</kbd> e aperte <kbd>Enter</kbd>.
 
 ### 🐧 Ubuntu · Debian · Mint
 
