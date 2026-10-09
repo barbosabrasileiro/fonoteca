@@ -39,7 +39,7 @@ Ela junta o melhor de dois mundos: a **sua biblioteca offline** e a **vastidão 
 |   |   |
 |---|---|
 | 🎵 **Biblioteca híbrida** | Arquivos locais (tags e capas) + milhões de faixas online. Banco **SQLite com FTS5**: a busca na sua biblioteca é instantânea. |
-| ⏭️ **Gapless de verdade** | A próxima faixa é resolvida em segundo plano e encadeada no mpv, sem silêncio entre as músicas. |
+| ⏭️ **Gapless entre faixas** | A próxima faixa é resolvida em segundo plano e encadeada no mpv, sem silêncio entre as músicas. |
 | 🎛️ **Equalizador de 10 bandas** | ±12 dB e presets prontos: *Flat, Rock, Pop, Bass Boost, Vocal e Jazz*. Abre com `Ctrl+E`. |
 | ♾️ **Mix infinito** | Um clique e a fila se abastece sozinha com faixas parecidas com a que está tocando. |
 | 📻 **Rádios web** | Milhares de estações ao vivo via Radio-Browser, por nome, país ou gênero. |
